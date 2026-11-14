@@ -265,6 +265,11 @@ export function ready(graph) {
   return { ready: ok, not_ready: notReady };
 }
 
+/** 占有（範囲）・枠（同時の数）とみなす状態の集合。配列でなければ既定（in_progress だけ。従来の挙動）。知らない状態名は無視する */
+function statusSet(v) {
+  return new Set(Array.isArray(v) ? v.filter((x) => STATUSES.includes(x)) : ['in_progress']);
+}
+
 function normWorkers(limits) {
   const w = limits && limits.workers;
   if (Number.isInteger(w) && w >= 0) return { workers: w, note: null };
@@ -272,10 +277,12 @@ function normWorkers(limits) {
 }
 
 /** 今すぐ同時に動かしてよい節の組。resources が重なる節は同じ組に入れない（id の小さい方を優先。決定論的） */
-export function schedule(graph, limits) {
+export function schedule(graph, limits, opts = {}) {
   const { workers, note } = normWorkers(limits);
-  const running = graph.ids.filter((id) => graph.byId.get(id).status === 'in_progress');
-  const slots = Math.max(0, workers - running.length);
+  const occ = statusSet(opts.occupy);
+  const slotSt = statusSet(opts.slotStatuses);
+  const running = graph.ids.filter((id) => occ.has(graph.byId.get(id).status));
+  const slots = Math.max(0, workers - graph.ids.filter((id) => slotSt.has(graph.byId.get(id).status)).length);
   const reasons = {};
   if (note) reasons._limits = note;
   const chosen = [];
@@ -307,7 +314,7 @@ export function recommend(graph, limits, opt = {}) {
   reasons.push(`${THRESHOLDS.note}（AdaptOrch の既定 θω=${THRESHOLDS.theta_omega}, θγ=${THRESHOLDS.theta_gamma}, θδ=${THRESHOLDS.theta_delta}）`);
   const out = (topology, workers) => ({ topology, workers: Math.min(workers, cap), reasons, thresholds: THRESHOLDS, metrics: m });
 
-  const sched = schedule(graph, { workers: cap });
+  const sched = schedule(graph, { workers: cap }, { occupy: opt.occupy, slotStatuses: opt.slotStatuses });
   const batch = sched.batches[0] || [];
   const unmerged = graph.ids.filter((id) => graph.byId.get(id).status !== 'merged');
   const highReady = batch.filter((id) => graph.byId.get(id).risk === 'high');
@@ -332,7 +339,8 @@ export function recommend(graph, limits, opt = {}) {
 }
 
 // ---- ガード ------------------------------------------------------------------
-// ctx = { nodes, batch（着手の組: id の配列）, limits }。「この着手の組は許されるか」
+// ctx = { nodes, batch（着手の組: id の配列）, limits, occupy?, slotStatuses? }。「この着手の組は許されるか」
+//   occupy: 範囲の重なりを見る相手の状態（既定 in_progress だけ）。slotStatuses: 同時の数に数える状態（既定 in_progress だけ）。runstate が review・held を足して使う
 // 生の nodes を受けるので、形が壊れていても各ガードは落ちない（形は TG-NODE-SHAPE が止める）
 
 const goodNodes = (nodes) => (Array.isArray(nodes) ? nodes.filter((n) => n && typeof n === 'object' && typeof n.id === 'string') : []);
@@ -407,7 +415,8 @@ export const GUARDS = {
     const m = byIdOf(ctx.nodes);
     const b = [...new Set(batchOf(ctx))].filter((id) => m.has(id));
     const inBatch = new Set(b);
-    const running = [...m.values()].filter((n) => n.status === 'in_progress' && !inBatch.has(n.id)).map((n) => n.id);
+    const occ = statusSet(ctx.occupy);
+    const running = [...m.values()].filter((n) => occ.has(n.status) && !inBatch.has(n.id)).map((n) => n.id);
     const L = [...b.map((id) => ({ id, t: 'b' })), ...running.map((id) => ({ id, t: 'r' }))];
     L.forEach((x) => {
       const r = m.get(x.id).resources;
@@ -438,7 +447,8 @@ export const GUARDS = {
     if (!Number.isInteger(w) || w < 0) return 'limits.workers が不正（拒否する）';
     const m = byIdOf(ctx.nodes);
     const inBatch = new Set(batchOf(ctx));
-    const running = [...m.values()].filter((n) => n.status === 'in_progress' && !inBatch.has(n.id)).length;
+    const slotSt = statusSet(ctx.slotStatuses);
+    const running = [...m.values()].filter((n) => slotSt.has(n.status) && !inBatch.has(n.id)).length;
     const total = batchOf(ctx).length + running;
     return total > w ? `同時の数が上限を超える: ${total} > ${w}（作業中 ${running} を含む）` : null;
   },

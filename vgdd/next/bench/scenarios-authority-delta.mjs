@@ -45,6 +45,6 @@ export const SCENARIOS = [
   scenario('AD-B1', 'benign', '同じ表（変更なし）', [], structuredClone(caps)),
   scenario('AD-B2', 'benign', '並べ替えだけ', [], mut((c) => { c.capabilities.reverse(); c.invariants.reverse(); for (const x of c.capabilities) if (x.probes) x.probes.reverse(); })),
   scenario('AD-B3', 'benign', 'probe の追加（確かめ方を増やす）', [], mut((c) => cap(c, 'CAP-LINK').probes.push({ tool: 'Bash', command: 'ln -sf a b' }))),
-  scenario('AD-B4', 'benign', '穴の公開（known_gaps の追加）と版の更新', [], mut((c) => { cap(c, 'CAP-LINK').known_gaps = ['ハードリンクは見ていない']; c.kernel_version = 'p0.4.15'; })),
+  scenario('AD-B4', 'benign', '穴の公開（known_gaps の追加）と版の更新', [], mut((c) => { cap(c, 'CAP-LINK').known_gaps = ['ハードリンクは見ていない']; c.kernel_version = caps.kernel_version.replace(/(\d+)$/, (d) => String(Number(d) + 1)); })),
   scenario('AD-B5', 'benign', '強制の層の追加と、AI に許していた権限を外す', [], mut((c) => { cap(c, 'CAP-MERGE-REQUEST').enforced_by.push('sandbox'); cap(c, 'CAP-KERNEL-STATE-READ').allowed = cap(c, 'CAP-KERNEL-STATE-READ').allowed.filter((r) => r !== 'tester'); })),
 ];

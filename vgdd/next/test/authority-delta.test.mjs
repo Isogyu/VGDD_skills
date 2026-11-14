@@ -12,6 +12,12 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REAL = path.resolve(HERE, '../../kernel/capabilities.json');
 const CLI = path.resolve(HERE, '../bin/authority-delta.mjs');
 const caps = JSON.parse(fs.readFileSync(REAL, 'utf8'));
+// 法律の版を決め打ちにしない（版が上がるたびに試験が落ちないように、今の版から作る）
+const VER = /^p(\d+)\.(\d+)\.(\d+)$/.exec(caps.kernel_version);
+assert.ok(VER && Number(VER[3]) >= 1, `kernel_version の形：${caps.kernel_version}`);
+const VER_UP = `p${VER[1]}.${VER[2]}.${Number(VER[3]) + 1}`;
+const VER_DOWN = `p${VER[1]}.${VER[2]}.${Number(VER[3]) - 1}`;
+const VER_SUFFIX = `${caps.kernel_version}a`;
 const mut = (fn) => { const c = structuredClone(caps); fn(c); return c; };
 const cap = (c, id) => c.capabilities.find((x) => x.id === id);
 const inv = (c, id) => c.invariants.find((x) => x.id === id);
@@ -83,7 +89,7 @@ const CASES = [
   ['不変条件の title の書き換え', (c) => { inv(c, 'INV-01').title = '行政 AI は原則として権限を拡張しない'; }, 'indeterminate'],
   ['layers の変更', (c) => { c.layers.hook = '別の意味'; }, 'indeterminate'],
   ['schema の変更', (c) => { c.schema = 'vgdd.capabilities.v2'; }, 'indeterminate'],
-  ['kernel_version だけの変更', (c) => { c.kernel_version = 'p0.4.15'; }, 'neutral'],
+  ['kernel_version だけの変更', (c) => { c.kernel_version = VER_UP; }, 'neutral'],
   ['最上位の note だけの変更', (c) => { c.note = '言い換え'; }, 'neutral'],
   ['規則にない最上位の項目', (c) => { c.overrides = { worker: 'all' }; }, 'indeterminate'],
 ];
@@ -193,7 +199,7 @@ test('ガード：それぞれ自分の種類の変更だけで止まる（直�
   only(mut((c) => { delete cap(c, 'CAP-MAIN-INTEGRATE').known_gaps; }), 'AD-NO-INDETERMINATE');
   // 陽性の対照：締めるだけ・影響なしは全ガードを通る
   assert.ok(check({ oldCaps: caps, newCaps: mut((c) => cap(c, 'CAP-LINK').probes.push({ tool: 'Bash', command: 'ln a b' })) }).ok);
-  assert.ok(check({ oldCaps: caps, newCaps: mut((c) => { c.kernel_version = 'p0.4.15'; }) }).ok);
+  assert.ok(check({ oldCaps: caps, newCaps: mut((c) => { c.kernel_version = VER_UP; }) }).ok);
   // 知らないガード名は違反として扱う
   assert.equal(check({ oldCaps: caps, newCaps: caps }, ['AD-NOPE']).ok, false);
   assert.equal(Object.keys(GUARDS).length, 6);
@@ -232,11 +238,11 @@ test('F1：kernel_version の系統の変更・下げ・形の崩れは indeterm
   assert.equal(v('p0.3.9'), 'indeterminate'); // 系統を戻す（無効になった承認が復活しうる）
   assert.equal(v('p0.5.0'), 'indeterminate'); // 系統の付け替え
   assert.equal(v('p9.9.0'), 'indeterminate');
-  assert.equal(v('p0.4.13'), 'indeterminate'); // 同じ系統の中の下げ
+  assert.equal(v(VER_DOWN), 'indeterminate'); // 同じ系統の中の下げ
   assert.equal(v('p0.4'), 'indeterminate');
   assert.equal(v(undefined), 'indeterminate');
-  assert.equal(v('p0.4.15'), 'neutral');
-  assert.equal(v('p0.4.14a'), 'neutral');
+  assert.equal(v(VER_UP), 'neutral');
+  assert.equal(v(VER_SUFFIX), 'neutral');
   assert.equal(check({ oldCaps: caps, newCaps: mut((c) => { c.kernel_version = 'p0.3.9'; }) }).violations[0].guard, 'AD-NO-INDETERMINATE');
 });
 
