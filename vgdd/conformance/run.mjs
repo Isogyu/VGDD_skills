@@ -8,7 +8,9 @@
 // 使い方（オーナーか立法補佐が sandbox の外で実行する。依存なし、Node 22 以上）:
 //   node vgdd/conformance/run.mjs                 … リポジトリの原本（vgdd/）を試す
 //   node vgdd/conformance/run.mjs --impl z3       … 実際に動いている Z3 の写し（~/tsubuyaki-z3/hooks・bin）を試す
-//   node vgdd/conformance/run.mjs --impl z3 --record … 結果の1行を Z3 の evidence/conformance.jsonl に残す（p0.4.3。Kernel の状態の写しに出る。オーナーが実行）
+//   node vgdd/conformance/run.mjs --impl z3 --record … 結果の1行を Z3 の evidence/conformance.jsonl に残す（p0.4.3。Kernel の状態の写しに出る。オーナーが実行）。
+//       p0.4.15：--impl z3 のときだけ、--only・--z3-name・--repo-name と一緒でないときだけ、書き先と試した写しの Z3 が同じときだけ。ほかは終了 64（何も書かない）。
+//       立法補佐・審査者が試すときは、HOME と VGDD_Z3_DIR を一時ディレクトリに向け、--record を付けない
 //   node vgdd/conformance/run.mjs --json out.json … 結果を JSON にも書く
 //   node vgdd/conformance/run.mjs --observe <repo> … 加えて、実際のリポジトリの票の status の変更を作者ごとに数える（観測。合否なし）
 //   node vgdd/conformance/run.mjs --z3-name <名前> … 試験用の偽の Z3 のフォルダの名前（既定 tsubuyaki-z3。p0.4.15。別の名前の Z3 でも同じ結果になることを確かめる）
@@ -49,7 +51,6 @@ const ONLY = opt('--only') ? new Set(opt('--only').split(',').map((x) => x.trim(
 const KNOWN_GROUPS = ['C1', 'A', 'C2', 'C3', 'G', 'ST', 'ST16', 'K', 'H', 'N', 'L', 'B', 'W', 'OC', 'P', 'INV'];
 if (ONLY && (ONLY.size === 0 || [...ONLY].some((g) => !KNOWN_GROUPS.includes(g)))) { console.error(`--only に知らない群がある（使える群：${KNOWN_GROUPS.join(',')}）`); process.exit(2); }
 const runs = (g) => !ONLY || ONLY.has(g);
-if (ONLY && args.includes('--record')) { console.error('--only と --record は一緒に使えない（一部の群だけの結果を記録しない）'); process.exit(2); }
 const VG = path.resolve(HERE, '..');
 // p0.4.8：--impl z3 で試す写しの場所も、--record の書き先と同じく VGDD_Z3_DIR を優先する（既定と違う場所の導入で、別の写しを試さない）
 const Z3REAL = process.env.VGDD_Z3_DIR || path.join(os.homedir(), 'tsubuyaki-z3');
@@ -59,6 +60,20 @@ const IMPL = impl === 'z3'
   ? { policy: path.join(Z3REAL, 'hooks/policy.mjs'), verify: path.join(Z3REAL, 'hooks/verify-chain.mjs'), bin: path.join(Z3REAL, 'bin'),
       agents: path.join(DEPLOYED_REPO, '.claude/agents') } // 起動で実際に使う定義
   : { policy: path.join(VG, 'hooks/policy.mjs'), verify: path.join(VG, 'hooks/verify-chain.mjs'), bin: path.join(VG, 'scripts'), agents: path.join(VG, 'agents') };
+// p0.4.15（再審査 R1。審査の途中に、--impl repo の試験の結果が本物の Z3 の conformance.jsonl に書かれた事故があった）：
+//   --record は、(a) --impl z3 のときだけ、(b) --only・--z3-name・--repo-name と一緒でないときだけ、(c) 書き先の Z3 が、試した写しのある Z3
+//   （フックとスクリプトがある場所）と同じときだけ受ける。それ以外は、試験を1件も動かす前に終了 64 で拒む（何も書かない）
+const RECORD = args.includes('--record');
+if (RECORD) {
+  const why = impl !== 'z3' ? '--impl z3 でない（試験用の写しの結果は記録しない）'
+    : ONLY || opt('--z3-name') || opt('--repo-name') ? '--only・--z3-name・--repo-name と一緒（一部・既定と違う名前の試験の結果は記録しない）'
+    : (() => { const real = (p) => { try { return fs.realpathSync(p); } catch { return null; } };
+        const dest = real(process.env.VGDD_Z3_DIR || path.join(os.homedir(), 'tsubuyaki-z3')); const tried = real(Z3REAL);
+        if (!dest || !tried || dest !== tried) return '書き先の Z3 と、試した写しのある Z3 が同じ場所でない';
+        if (!fs.existsSync(path.join(tried, 'hooks/policy.mjs')) || !fs.existsSync(path.join(tried, 'evidence'))) return '書き先の Z3 に、試した写し（hooks/policy.mjs）か証拠の置き場所（evidence/）がない';
+        return null; })();
+  if (why) { console.error(`--record を拒否（何も書かない）：${why}`); process.exit(64); }
+}
 // p0.4.8：試す実装の場所だけを出して終わる（ST17 が使う。中身は場所だけ）
 if (args.includes('--print-impl')) { console.log(JSON.stringify({ impl, ...IMPL })); process.exit(0); }
 const CAPS = JSON.parse(fs.readFileSync(path.join(VG, 'kernel/capabilities.json'), 'utf8'));
@@ -2033,7 +2048,10 @@ function groupP2() {
   // PT12（審査 m2 と §12 の例）：既定の名前の Z3 で、プロジェクトが既定と違う場所（~/tsubuyaki-other/app）にあっても、兄弟から .. で戻る形・~// ・~/./・"$HOME"/・~名前/ のグロブを疑う
   { const f = fixture('p12', { z3Name: DEFAULT_Z3_NAME, repoRel: 'tsubuyaki-other/app' }); const at = [['executive_head', null, f.main], ['worker', 'worker', f.wt]];
     const run = (cmds, want) => { const bad = []; for (const [role, a, cwd] of at) for (const c of cmds) { const cmd = c.replaceAll('{main}', f.main); const g = hook(f, { tool: 'Bash', input: { command: cmd }, agent_type: a, cwd }); if (g.decision !== want) bad.push(`${role}: ${cmd.replaceAll(f.base, '…')} → ${g.decision}`); } return bad; };
-    const d = run(['ls ~/tsubuyaki-other/../tsub*/STOP', 'ls ~/tsubuyaki-worklog/../tsub*', 'ls {main}/../tsub*', 'ls ~//tsub*', 'ls ~/./tsub*', 'ls "$HOME"/tsub*', 'ls ~someone/tsub*', 'ls ~/tsubuyaki-worklog*', 'cat ~/tsubuyaki-other/app/../../tsub*/STOP', 'ls ../../tsub*/STOP', 'cat src/../../../tsub*/STOP'], 'deny');
+    const d = run(['ls ~/tsubuyaki-other/../tsub*/STOP', 'ls ~/tsubuyaki-worklog/../tsub*', 'ls {main}/../tsub*', 'ls ~//tsub*', 'ls ~/./tsub*', 'ls "$HOME"/tsub*', 'ls ~someone/tsub*', 'ls ~/tsubuyaki-worklog*', 'cat ~/tsubuyaki-other/app/../../tsub*/STOP'], 'deny');
+    // 相対の .. は今の場所で解決する（再審査 N2）。行政の長（main）からは Z3 の親に届くので拒否、作業員の worktree からは届かないので通る
+    const dRel = ['ls ../../tsub*/STOP', 'cat src/../../../tsub*/STOP'].filter((c) => hook(f, { tool: 'Bash', input: { command: c }, cwd: f.main }).decision !== 'deny');
+    d.push(...dRel.map((c) => `executive_head: ${c} → allow`));
     const a = run(['cat ~/tsubuyaki-other/app/src/lib/a.ts', 'ls ~/tsubuyaki-other/preparation', 'cat ~/tsubuyaki-worklog/app/README.md'], 'allow');
     record('P', 'PT12', '既定の名前の Z3 で、正当な兄弟（プロジェクトと既定のリポジトリの場所）から .. で戻る語、.. の段の後の先頭4字のグロブ（../../tsub*）、~//・~/./・"$HOME"/・~名前/ の後のグロブ、兄弟の名前の後ろのグロブを疑って拒否し、兄弟の配下の読み取りは通す',
       d.length === 0 && a.length === 0, [...d, ...a].slice(0, 3).join(' / ')); }
@@ -2108,6 +2126,56 @@ function groupP2() {
     const nrOk = nr.length > 0 && nr.every((l) => /--repo "\$REPO"/.test(l));
     record('P', 'PT18', 'release.sh は監査の sandbox（sandboxed-run.sh）のすべての呼び出しに --repo を渡し（VGDD_REPO なしで確かめる）、night-runner.sh の呼び出しにも --repo "$REPO" がある（ソースの検査）',
       relOk && nrOk, `release=${r.status} 呼び出し ${lines.length} 件 --repo=${relOk} night-runner=${nrOk}（${nr.length} 行）`); }
+}
+
+// ---- P（続き。p0.4.15 の再審査 R1・N1・N2・N4 の判例） --------------------------------------------------------------------
+function groupP3() {
+  // PT19（再審査 R1）：--record は --impl z3 で、一部・既定と違う名前でなく、書き先と試した写しの Z3 が同じときだけ。ほかは試験の前に終了 64 で何も書かない
+  { const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'vgdd-conf-p19-'))); const home = path.join(base, 'home'); fs.mkdirSync(home, { recursive: true });
+    const env0 = { ...process.env, HOME: home }; delete env0.VGDD_Z3_DIR;
+    const runR = (a, env = env0) => sh(process.execPath, [path.join(HERE, 'run.mjs'), ...a], { env, timeout: 900000 });
+    const emptyZ = path.join(base, 'empty-z3'); fs.mkdirSync(path.join(emptyZ, 'evidence'), { recursive: true });
+    const neg = [['--record'], ['--impl', 'repo', '--record'], ['--repo-name', 'x/app', '--record'], ['--only', 'C1', '--record'], ['--impl', 'z3', '--z3-name', 'acme-kernel-z3', '--record'], ['--impl', 'z3', '--only', 'C1', '--record']]
+      .map((a) => [a.join(' '), runR(a).status]);
+    const negZ = runR(['--impl', 'z3', '--repo', home, '--record'], { ...env0, VGDD_Z3_DIR: emptyZ }).status;   // 写し（hooks/policy.mjs）のない Z3
+    const untouched = !fs.existsSync(path.join(home, 'tsubuyaki-z3')) && !fs.existsSync(path.join(emptyZ, 'evidence/conformance.jsonl'));
+    const negOk = neg.every(([, c]) => c === 64) && negZ === 64 && untouched;
+    let pos = '外側の実行で確かめる'; let posOk = true;
+    if (!process.env.VGDD_CONF_IN_RECORD_TEST) {
+      // 陽性の対照：導入の道具で一時のホームに置いた Z3 に、--impl z3 --record が1行だけ書く（入れ子の実行は、この陽性の対照を繰り返さない）
+      const b = bareRepo('p19b'); const zz = path.join(b.base, 'tsubuyaki-z3');
+      const ins = fs.existsSync(setupBin()) ? sh(process.execPath, [setupBin(), 'install', '--repo', b.repo, '--z3', zz, '--law', VG], { env: { ...process.env, HOME: b.base }, timeout: 120000 }).status : null;
+      const r = ins === 0 ? sh(process.execPath, [path.join(HERE, 'run.mjs'), '--impl', 'z3', '--repo', b.repo, '--record'], { env: { ...process.env, HOME: b.base, VGDD_Z3_DIR: zz, VGDD_CONF_IN_RECORD_TEST: '1' }, timeout: 1200000, maxBuffer: 64 * 1024 * 1024 }) : { status: null };
+      const lines = (() => { try { return fs.readFileSync(path.join(zz, 'evidence/conformance.jsonl'), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } })();
+      posOk = lines.length === 1 && lines[0].impl === 'z3' && lines[0].fixture_names === 'default' && lines[0].repo_arg === true && lines[0].total > 0;
+      pos = `install=${ins} 実行=${r.status} 行=${lines.length} impl=${lines[0]?.impl} 件数=${lines[0]?.total}`;
+    }
+    record('P', 'PT19', '--record は --impl z3 で、--only・--z3-name・--repo-name がなく、書き先と試した写しの Z3 が同じときだけ受ける。--record だけ・--impl repo・--repo-name・--only・--z3-name・写しのない Z3 では、試験の前に終了 64 で何も書かない（一時のホームの tsubuyaki-z3 も作らない）。陽性の対照：一時の Z3 に --impl z3 --record が1行を書く',
+      negOk && posOk, `拒否=${neg.map(([a, c]) => `${a}→${c}`).join(' / ')} 写しのない Z3→${negZ} 何も作らない=${untouched} 陽性：${pos}`); }
+  // PT20（再審査 N1）：兄弟として除くのは、決まった文字だけの語。展開すると .. になる形（中括弧・グロブ・引用符）は除かない。既定の配置の同じ形（前からの穴）も止める
+  { const bad = []; const good = [];
+    for (const proj of ['tsubuyaki-other', 'tsubuyaki-worklog']) {
+      const f = fixture(`p20${proj.slice(-5)}`, { z3Name: DEFAULT_Z3_NAME, repoRel: `${proj}/app` }); write(path.join(f.main, 'src/lib/a.ts'), 'x\n');
+      const h = (c, at = null, cwd = f.main) => hook(f, { tool: 'Bash', input: { command: c }, agent_type: at, cwd }).decision;
+      for (const c of [`ls ~/${proj}/{..,x}/tsub*`, `ls ~/${proj}/.?/tsub*`, `ls ~/${proj}/.*/tsub*`, `cat ~/${proj}/'..'/tsub*/STOP`, `cat ~/${proj}/".."/tsub*/STOP`, `ls ~/${proj}/\\.\\./tsub*`, `ls ~/${proj}/app/../../tsubuyaki-z\\3`]) if (h(c) !== 'deny') bad.push(c);
+      for (const [c, at, cwd] of [[`cat ~/${proj}/app/../app/src/lib/a.ts`], [`echo "~/${proj}/app"`], [`ls ~/${proj}/app/.claude/worktrees/w1/src`, 'worker', f.wt], [`cat ~/${proj}/app/src/lib/a.ts`]]) if (h(c, at || null, cwd || f.main) !== 'allow') good.push(c);
+    }
+    record('P', 'PT20', '兄弟（プロジェクトと既定のリポジトリの場所）の後に、展開すると .. になる形（{..,x}・.?・.*・\'..\'・".."・\\.\\.・z\\3）があれば拒否する（既定の配置でも）。決まった文字だけの、兄弟の配下を指す語は通す（陽性の対照）',
+      bad.length === 0 && good.length === 0, `通った：${bad.join(' ‖ ') || 'なし'} 止まった：${good.join(' ‖ ') || 'なし'}`); }
+  // PT21（再審査 N2）：.. の規則は、Z3 に届きうる語だけを疑う（今の場所で解決して正規化。cd があれば .. の並びの直後の段だけ）。名前に tsub を含むファイルの相対パスは通す
+  { const f = fixture('p21', { z3Name: DEFAULT_Z3_NAME, repoRel: 'tsubuyaki-worklog/app' }); write(path.join(f.main, 'src/lib/tsubuyaki.ts'), 'x\n'); write(path.join(f.wt, 'src/lib/tsubuyaki.ts'), 'x\n');
+    const h = (c, at = null, cwd = f.main) => hook(f, { tool: 'Bash', input: { command: c }, agent_type: at, cwd }).decision;
+    const allow = [['cd src/lib && cat ../lib/tsubuyaki.ts'], ['cat ../../../src/lib/tsubuyaki.ts', 'worker', f.wt], ['cat ~/tsubuyaki-worklog/app/../app/src/lib/a.ts'], ['cat docs/tsubuyaki-spec.md ../tsubuyaki-notes.md'], ['cat ../lib/tsubuyaki.ts', 'worker', path.join(f.wt, 'src/lib')], ['cat ../../tsubuyaki-worklog/app/src/lib/a.ts']]
+      .filter(([c, at, cwd]) => h(c, at || null, cwd || f.main) !== 'allow').map(([c]) => c);
+    const deny = [['ls ../../tsub*'], ['cd src && ls ../../../tsub*'], ['cat ../../tsubuyaki-z\\3/STOP'], ['ls ../../../../../tsub*/STOP', 'worker', f.wt], ['cat ../../t\'\'subuyaki-z3/STOP'], ['ls ../{..,x}/tsub*']]
+      .filter(([c, at, cwd]) => h(c, at || null, cwd || f.main) !== 'deny').map(([c]) => c);
+    record('P', 'PT21', '.. の規則は Z3 に届きうる語だけを疑う：../../tsub*・cd の後の ../../../tsub*・../../tsubuyaki-z\\3・worktree から 5 段戻る ../tsub*・中括弧を拒否し、名前に tsub を含むファイルの相対パス（../lib/tsubuyaki.ts など）・兄弟の配下へ戻るパスは通す',
+      allow.length === 0 && deny.length === 0, `止まった：${allow.join(' ‖ ') || 'なし'} 通った：${deny.join(' ‖ ') || 'なし'}`); }
+  // PT22（再審査 N4）：~<名前> のホームの形は語の始まりのときだけ（git diff HEAD~1/tsubuyaki を取り違えない）
+  { const f = fixture('p22', { z3Name: DEFAULT_Z3_NAME, repoRel: 'tsubuyaki-worklog/app' });
+    const h = (c) => hook(f, { tool: 'Bash', input: { command: c }, cwd: f.main }).decision;
+    const ok = h('git diff HEAD~1/tsubuyaki') === 'allow' && h('git log HEAD~2/tsubuyaki-notes') === 'allow' && h('ls ~someone/tsub*') === 'deny' && h('cat "~x/tsubuyaki"') === 'deny';
+    record('P', 'PT22', 'ホームの形 ~<名前> は語の始まりのときだけ：git diff HEAD~1/tsubuyaki は通り、ls ~someone/tsub* は拒否する', ok, ''); }
 }
 
 // ---- 権限の表の自己検査（どの権限にも確かめ方がある） ------------------------------------------
@@ -2245,7 +2313,7 @@ try {
   if (runs('B')) groupB();
   if (runs('W')) groupW();
   if (runs('OC')) groupOC();
-  if (runs('P')) { groupP(); groupP2(); }
+  if (runs('P')) { groupP(); groupP2(); groupP3(); }
   if (runs('INV')) groupINV();
   if (!ONLY) { groupMeta(); groupInvMeta(); }
   else console.log(`\n（--only ${[...ONLY].join(',')}：一部の群だけを動かした。M・INV の自己検査をしていないので、この結果は適合の主張に使えない）`);
@@ -2260,12 +2328,12 @@ for (const r of results) { byGroup[r.group] ??= { pass: 0, fail: 0 }; byGroup[r.
 console.log(`\n${ONLY ? `【一部だけ：--only ${[...ONLY].join(',')}。適合の主張に使えない】` : ''}合計 ${results.length} 件：合格 ${results.length - failed.length}、不合格 ${failed.length}　${Object.entries(byGroup).map(([g, c]) => `${g} ${c.pass}/${c.pass + c.fail}`).join('　')}`);
 // p0.4.3：--record で結果の1行を Z3 の conformance.jsonl に残す（Kernel の状態の写しが「最後の適合性テスト」として出す）。
 //   Z3 に書けるのはオーナーだけなので、実行するのもオーナー（sandbox の外）。件数と合否と実装と日時だけ
-if (args.includes('--record')) {
-  const z3 = process.env.VGDD_Z3_DIR || Z3REAL;
+if (RECORD) {
+  const z3 = Z3REAL;   // 上で、書き先と試した写しの場所が同じことを確かめた
   // p0.4.4（Codex の再監査 #7）：試した実装の指紋（法律のスクリプトとフックの中身の SHA-256）を残す。状態の写しは、稼働中の Z3 の実装と同じ指紋の記録だけを検証済みとする（指紋そのものは写しに出さない）
   const implSha = implShaFor(IMPL.bin, IMPL.policy);
   fs.appendFileSync(path.join(z3, 'evidence/conformance.jsonl'), JSON.stringify({ schema: 'vgdd.conformance-record.v1', at: new Date(Date.now() + 9 * 3600e3).toISOString().replace(/\.\d+Z$/, '+09:00'), impl, kernel_version: CAPS.kernel_version, passed: results.length - failed.length, total: results.length,
-    impl_sha256: implSha,
+    impl_sha256: implSha, fixture_names: 'default', repo_arg: !!opt('--repo'),   // p0.4.15：試した場所の印（試験用の名前は既定だけ。--repo を与えたか）
     invariants: Object.fromEntries((CAPS.invariants || []).map((i) => [i.id, i.status === 'not_applicable' ? 'n/a' : (results.find((x) => x.id === `${i.id}:meta`)?.ok ? 'pass' : 'fail')])) }) + '\n');
 }
 if (opt('--json')) fs.writeFileSync(opt('--json'), JSON.stringify({ schema: 'vgdd.conformance-report.v1', impl, kernel_version: CAPS.kernel_version, at: new Date().toISOString(), z3_name: Z3_NAME, repo_name: REPO_NAME, only: ONLY ? [...ONLY] : null, partial: !!ONLY, totals: byGroup, results, observed }, null, 2) + '\n');

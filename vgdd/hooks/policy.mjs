@@ -418,11 +418,12 @@ const tok = (body) => new RegExp(START_OF_WORD + body + END_OF_WORD);
 //   p0.4.15 の審査（m2・m3・§12 の例）で強めた点：兄弟を除くのは、語（区切りまで）が兄弟そのものか兄弟の配下を指し、`..` の段を含まないときだけ
 //   （`~/tsubuyaki-worklog/../tsub*`・`~/tsubuyaki-worklog*` は疑う）。ホームの形に `~<名前>`・引用符つきの `"$HOME"` を含め、
 //   ホームの形と名前の間の `//`・`/./` も同じに見る。Z3 が 2 段目（~/<段>/<名前>）なら、途中の段のグロブ（~/*/<先頭4字>…）も疑う
-function z3Tokens(projectDir) {
+function z3Tokens(projectDir, cwd, hasCd) {
   const zAbs = path.resolve(Z3); const zReal = realish(Z3);
   const names = [...new Set([path.basename(zAbs), path.basename(zReal)])];
   const toks = names.map((n) => ({ re: new RegExp(escapeRe(n)), noRead: true, label: 'Z3 保護領域' }));
-  const HOME_FORMS = ['~[A-Za-z0-9._-]*', String.raw`"?\$HOME"?`, String.raw`"?\$\{HOME\}"?`, String.raw`\/Users\/[^/\s]+`];
+  // ~ だけは p0.4.14 と同じく前の境目を見ない。~<名前> は語の始まりのときだけ（`git diff HEAD~1/…` を取り違えない。再審査 N4）
+  const HOME_FORMS = [String.raw`(?:~|(?<=^|[\s"'\x60=/><|&;(])~[A-Za-z0-9._-]+)`, String.raw`"?\$HOME"?`, String.raw`"?\$\{HOME\}"?`, String.raw`\/Users\/[^/\s]+`];
   const homes = [...new Set([HOME, realish(HOME)])];
   const parents = [...new Set([path.dirname(zAbs), path.dirname(zReal)])];
   const anchors = new Set(HOME_FORMS);
@@ -446,21 +447,54 @@ function z3Tokens(projectDir) {
     const prefix = n.slice(0, Z3_NAME_MIN);
     const sibs = [...siblings].filter((s) => s.length > prefix.length && s.startsWith(prefix) && !names.some((m) => m.startsWith(s)));
     const re = new RegExp(`(?:${[...anchors].join('|')})(?:\\/\\.?(?=\\/))*\\/${escapeRe(prefix)}`, 'g');
+    // 兄弟として除くのは、語（空白・区切りまで。引用符やバックスラッシュも語に含める）が決まった文字（英数字と . _ / -）だけでできていて、
+    //   文字列として正規化（a/b/.. → a）した結果が親へ出ず、兄弟そのものか兄弟の配下を指すときだけ。グロブ・中括弧・引用符・バックスラッシュ・$ を含む語は、
+    //   展開すると .. になりうるので除かない（再審査 N1：`~/<兄弟>/{..,x}/tsub*`・`~/<兄弟>/.?/tsub*`・`~/<兄弟>/'..'/tsub*`）
     const excused = (str, at) => {
-      const word = (/^[^\s"'`;|&()<>]*/.exec(str.slice(at)) || [''])[0];
-      if (word.split('/').includes('..')) return false;
-      return sibs.some((x) => word === x || word.startsWith(x + '/'));
+      const word = (/^[^\s;|&()<>]*/.exec(str.slice(at)) || [''])[0].replace(/["'\x60]+$/, '');   // 外側の引用の閉じだけは除く
+      if (!/^[A-Za-z0-9._\/-]+$/.test(word)) return false;
+      const norm = path.posix.normalize(word);
+      if (norm === '..' || norm.startsWith('../')) return false;
+      return sibs.some((x) => norm === x || norm === x + '/' || norm.startsWith(x + '/'));
     };
     toks.push({ re: { test: (str) => { re.lastIndex = 0; let m; while ((m = re.exec(str))) { if (!excused(str, m.index + m[0].length - prefix.length)) return true; } return false; } }, noRead: true, label: 'Z3 保護領域（グロブの疑い）' });
-    // `..` の段の後ろに Z3 の名前の先頭4字で始まる段がある語も疑う（`../../tsub*`・`<リポジトリ>/../<先頭4字>*`。ホームの形を経なくても、親へ戻って Z3 に届きうる）
-    toks.push({ re: new RegExp(`(?:^|[\\s"'\x60=/><|&;(])\\.\\.\\/(?:[^\\s"'\x60;|&()<>/]*\\/)*${escapeRe(prefix)}`), noRead: true, label: 'Z3 保護領域（.. の後のグロブの疑い）' });
+    toks.push({ re: { test: (str) => dotdotSuspect(str, prefix, zAbs, zReal, cwd, hasCd) }, noRead: true, label: 'Z3 保護領域（.. の後のグロブの疑い）' });
   }
   return toks;
 }
+/**
+ * `..` の段を含む語が Z3 に届きうるか（再審査 N2）。語ごとに見る：
+ *   ・コマンドに cd がなければ、語を今の cwd で解決し、文字列として正規化する。グロブ・中括弧・引用符・バックスラッシュ（展開で形が変わる文字）が
+ *     なければ、正規化したパスが Z3 の中かだけを見る（`../lib/tsubuyaki.ts` は通る）。あれば、その文字の前までで決まるフォルダ D について、
+ *     D が Z3 の親で、次の段の文字（展開の前まで）が4字以上で Z3 の名前の先頭と同じなら疑う。D が Z3 のさらに上なら、次の段が Z3 への途中の段と合いうり、
+ *     残りに名前の先頭4字があれば疑う。展開で決まる部分に `..`・`.` で始まる段・中括弧があり、残りに先頭4字があれば疑う
+ *   ・cd があれば（今の場所が決まらない）、`..` の並びの直後の段が先頭4字で始まるときだけ疑う（`../../tsub*`。`../lib/tsubuyaki.ts` は疑わない）
+ */
+function dotdotSuspect(str, prefix, zAbs, zReal, cwd, hasCd) {
+  const words = str.split(/[\s;|&()<>]+/).map((w) => w.replace(/^[^=/~.$"']*=/, '')).filter((w) => /(^|\/)['"\\]*\.['"\\]*\.['"\\]*(\/|$)/.test(w));
+  for (const w0 of words) {
+    const w = w0.replace(/['"\\]/g, '');   // 引用符とバックスラッシュは取り除いた形が実際のパス（展開ではない）
+    if (hasCd || !cwd) { if (new RegExp(`(?:^|\\/)(?:\\.\\.\\/)+${escapeRe(prefix)}`).test(w)) return true; continue; }
+    let base; let rest;
+    const hm = /^(~|\$HOME|\$\{HOME\})(\/.*)?$/.exec(w);
+    if (hm) { base = HOME; rest = hm[2] || ''; } else if (w.startsWith('/')) { base = '/'; rest = w; } else if (w.startsWith('~')) return true; else { base = cwd; rest = '/' + w; }
+    const k = rest.search(/[*?[\]{}$`]/);
+    if (k === -1) { const p = path.resolve(base, '.' + rest); if (isInside(p, zAbs) || isInside(p, zReal)) return true; continue; }
+    const lit = rest.slice(0, k); const cut = lit.lastIndexOf('/');
+    const D = path.resolve(base, '.' + lit.slice(0, cut + 1)); const segLit = lit.slice(cut + 1); const after = rest.slice(cut + 1);
+    for (const z of [zAbs, zReal]) {
+      if (!isInside(z, D) || z === D) continue;
+      const zr = path.relative(D, z).split(path.sep);
+      if (zr.length === 1 ? segLit.length >= Z3_NAME_MIN && zr[0].startsWith(segLit) : zr[0].startsWith(segLit) && after.includes(prefix)) return true;
+    }
+    if (after.includes(prefix) && (/(^|\/)\.|[{}]/.test(after))) return true;
+  }
+  return false;
+}
 /** フックの Bash の照合に使う保護語の一覧（Z3 の場所と Kernel の設定から作る） */
-function bashProtectedTokens(projectDir) {
+function bashProtectedTokens(projectDir, cwd = null, hasCd = true) {
   const ro = KCONF.readonlyDirs.map((d) => ({ re: tok(String.raw`(\.\.\/)?` + escapeRe(path.basename(d))), noRead: false, label: (READONLY_LABELS[d] || [])[1] || '読み取り専用の領域（Kernel の設定の指定）' }));
-  return [...z3Tokens(projectDir), ...BASH_PROTECTED_TOKENS, ...ro];
+  return [...z3Tokens(projectDir, cwd, hasCd), ...BASH_PROTECTED_TOKENS, ...ro];
 }
 const BASH_PROTECTED_TOKENS = [
   { re: new RegExp(START_OF_WORD + String.raw`\.claude(\/|\b)`), noRead: false, label: '.claude' },
@@ -705,7 +739,8 @@ function judgeBash(command, git, agentType, cwd, projectDir, confine) {
     const c = judgeConfinedBash(pre, cwd, confine);
     if (c) return { decision: 'deny', reason: `Bash: ${c}` };
   }
-  const hits = bashProtectedTokens(projectDir).filter((t) => t.re.test(pre));
+  const hasCd = splitSegments(pre).some((sg) => /^\s*(cd|pushd|popd)\b/.test(sg)) || /(^|[\s;&|(])(cd|pushd|popd)\b/.test(pre);
+  const hits = bashProtectedTokens(projectDir, cwd, hasCd).filter((t) => t.re.test(pre));
   if (hits.length === 0) return { decision: 'allow', reason: '保護パスへの言及なし' };
   const labels = hits.map((h) => h.label).join('・');
   if (hits.some((h) => h.noRead)) {
