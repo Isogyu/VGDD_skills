@@ -44,12 +44,15 @@
 
 import { openChain, digest, canonical, Refused } from './lib/chain.mjs';
 import { authorityDelta, routeFor } from './authority-delta.mjs';
-import { parseActor, normActor, isOwner as vocabIsOwner, isJudicialRole, normLineage, differentLineage, policyLineOf as vocabPolicyLineOf, isPolicyLine, ROLES, refusal } from './lib/vocab.mjs';
+import { parseActor, normActor, isOwner as vocabIsOwner, isJudicialRole, normLineage, differentLineage, policyLineOf as vocabPolicyLineOf, isPolicyLine, ROLES, ROLE_TABLE, refusal } from './lib/vocab.mjs';
 
 export const RECORD_TYPE = 'vgdd.improvement.v1';
 export const TIERS = ['experience', 'playbook', 'composition', 'law', 'verifier', 'constitution'];
 /** 審査者になれる役割（vocab の表で判定する司法。完全一致） */
-export const JUDICIAL_ROLES = Object.freeze(ROLES.filter(isJudicialRole));
+/** 審査者になれる役割：vocab の表で判定する司法で、権限の表（capabilities.json）にある役割（in_capabilities）だけ。codex_security は権限の表に足す改正の後 */
+export const JUDICIAL_ROLES = Object.freeze(ROLES.filter((r) => isJudicialRole(r) && ROLE_TABLE[r].in_capabilities === true));
+/** 評価の証拠を出せる役割：裁判所の執行のスクリプト（gate_runner。適合性テストを動かす）と人のオーナー */
+export const EVALUATOR_ROLES = Object.freeze(['gate_runner', 'owner']);
 export const DEFAULT_MAX_OPEN = 5;
 const OPS = ['propose', 'amend', 'evaluate', 'review', 'adopt', 'reject', 'withdraw', 'rollback', 'dismiss_cr', 'epoch'];
 /**
@@ -58,7 +61,9 @@ const OPS = ['propose', 'amend', 'evaluate', 'review', 'adopt', 'reject', 'withd
  * あってそれに覆われるときだけ、構造の検査（遷移の表・id の順番・鎖）だけで状態に入れる。覆われない古い版の行は bad_record。
  * 限界：鎖を書ける者（オーナーの権限）は、古い版の印を付けた偽の行を移行の記録の前に作り直せる（鎖の限界と同じ根）。
  */
-export const RULES = 'im.v3';
+export const RULES = 'im.v4';
+// im.v4：別系統の要求を「採用の時に、提案者と別の系統の司法の APPROVED が 1 つ以上」に変えた（IM-CROSS-LINEAGE）。評価者は gate_runner と
+//   人のオーナーだけ（IM-EVALUATOR-ROLE）。審査者は権限の表にある司法だけ。再生で記録の行為者が正規形であることを確かめる。
 // im.v3：行為者・系統・司法の役割・法律の系統は lib/vocab.mjs の語彙。各行に設定の写し（cfg: { max_open }）を持ち、写しが開く側の設定と違う
 //   今の版の行は、移行の記録（epoch）に覆われるまで再生で拒む（開き方で過去の行の扱いを変えない）。今の権限の表と法律の系統は「設定」でなく
 //   書く時の事実（法律そのもの）なので、開く側の引数のまま（再生で確かめない。REPLAY_SKIP）。
@@ -311,6 +316,7 @@ export function replay(records, o = {}) {
       if (current) {
         const res = check(contextOf(m, { ok: true }, 'epoch', r.actor, null, { reason: r.reason }, REPLAY_CONFIG), guards);
         if (!res.ok) throw bad(r, res.violations.map((v) => v.guard).join('・'));
+        if (canonical(r.actor ?? null) !== canonical(normActor(r.actor))) throw bad(r, '行為者の綴りが正規化した形と違う');
         const c = isObj(r.covers) ? r.covers.count : null;
         if (!Number.isSafeInteger(c) || c !== i || r.covers.last_hash !== (c === 0 ? 'genesis' : records[c - 1].hash)) throw bad(r, '移行の記録の覆う範囲が、その前の行と一致しない');
       }
@@ -324,6 +330,8 @@ export function replay(records, o = {}) {
     const res = check(ctx, current ? guards : ['IM-TRANSITION']);
     if (!res.ok) throw bad(r, res.violations.map((v) => v.guard).join('・'));
     if (r.op === 'propose' && r.id !== nextIdOf(m)) throw bad(r, 'id が順番と違う');
+    // 記録された行為者は正規形でなければならない（別の綴り（全角・大文字）の行を、同じとみなして黙って通さない。runstate と同じ）
+    if (current && canonical(r.actor ?? null) !== canonical(normActor(r.actor))) throw bad(r, '行為者の綴りが正規化した形と違う');
     if (current && (r.op === 'propose' || r.op === 'amend') && (!ctx.candidate || r.digest !== ctx.candidate.digest)) throw bad(r, '指紋が中身と一致しない');
     if (r.op === 'adopt' && ctx.proposal && ctx.proposal.tier === 'law') {
       const caps = ctx.proposal.capabilities || {};
@@ -493,19 +501,30 @@ export const GUARDS = {
     return null;
   },
   // 評価の証拠は AI 以外（適合性テストを動かすスクリプト・人）が出す
-  'IM-EVALUATOR-NOT-AI': (ctx) => (ctx.op === 'evaluate' && isObj(ctx.actor) && ctx.actor.kind === 'ai' ? 'AI は評価の証拠を出せない（スクリプト・人が出す）' : null),
+  // 評価の証拠を出せるのは、裁判所の執行のスクリプト（gate_runner）と人のオーナーだけ（AI・行政の代行・回収・書記のスクリプトは出せない。
+  // experience の feedback・trace の link と同じく裁判所の側に限る）
+  'IM-EVALUATOR-ROLE': (ctx) => {
+    if (ctx.op !== 'evaluate') return null;
+    const a = normActor(ctx.actor);
+    if (!a) return null; // 形は IM-ACTOR-SHAPE
+    return (a.role === 'gate_runner' && a.kind === 'script') || isOwner(a) ? null : `評価の証拠を出せるのは gate_runner（script）か人のオーナーだけ（${a.role}・${a.kind} は出せない）`;
+  },
   // 審査者は司法の役割
   'IM-JUDICIAL-REVIEWER': (ctx) => {
     if (ctx.op !== 'review') return null;
     const a = normActor(ctx.actor) || {};
-    return isJudicialRole(a.role) && a.kind !== 'script' ? null : `審査は司法の役割（${JUDICIAL_ROLES.join('・')}）だけ`;
+    return JUDICIAL_ROLES.includes(a.role) && a.kind !== 'script' ? null : `審査は権限の表にある司法の役割（${JUDICIAL_ROLES.join('・')}）だけ`;
   },
-  // 審査者は提案者と別の系統（tier によらず例外なし。経験の汚染も同系統の見落としを突くため）
+  // 採用の時の要求（im.v4）：今の版・今の入力に、提案者と別の系統の司法の APPROVED が 1 つ以上要る（tier によらず例外なし。同系統の見落とし・共謀への備え）。
+  // 同じ系統の司法も審査はできる（例：Claude の提案の憲法審査は claude の constitutional_review）が、この要求を満たす数には入らない。
+  // CHANGES_REQUIRED は系統を問わず効く（IM-ADOPT-REQUIRES-APPROVAL・IM-CR-STICKY）。系統は vocab の知っている系統で比べ、司法の系統は役割で決まる。
+  // im.v3 までは「審査者は全員が提案者と別の系統」で、正直な同系統の憲法審査を拒み、系統を偽った申告だけが通る誘因になっていた
   'IM-CROSS-LINEAGE': (ctx) => {
-    if (ctx.op !== 'review' || !cur(ctx)) return null;
-    // 系統は vocab の知っている系統で比べる（anthropic・openai のような別名は形の検査で拒まれ、ここでも違う系統とみなさない）
-    const pl = lineageOf(cur(ctx).proposer); const al = lineageOf(ctx.actor);
-    return differentLineage(al, pl) ? null : `審査者が提案者と同じ系統（${pl}）か、系統が読めない`;
+    if (ctx.op !== 'adopt' || !cur(ctx)) return null;
+    const pl = lineageOf(cur(ctx).proposer);
+    const fresh = freshApproved(cur(ctx));
+    if (fresh.length === 0) return null; // APPROVED が 1 つもないことは IM-ADOPT-REQUIRES-APPROVAL が見る
+    return fresh.some((r) => differentLineage(lineageOf(r.actor), pl)) ? null : `提案者（${pl}）と別の系統の司法の APPROVED が今の版にない（同じ系統の審査だけでは採用できない）`;
   },
   // 評価・審査・採用は提案の今の指紋に結び付ける
   'IM-DIGEST-BOUND': (ctx) => {

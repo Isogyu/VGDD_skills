@@ -53,7 +53,7 @@ import {
 
 export const RECORD_TYPE = 'vgdd.runstate.v1';
 /** 規則の版。ガードの規則を変えるたびに上げる。各行に rules として記録する（improvement.mjs と同じ。epoch で古い行を覆う） */
-export const RULES = 'rs.v2';
+export const RULES = 'rs.v3'; // rs.v3：RS-PROTECTED を作業に入る出来事にも広げ、RS-WORK-ITEM-ID を新しい id だけにした（独立した審査 E-7・E-8）
 export const MAX_EVENTS = 20000;
 /** 人（human）の出来事のために取っておく枠。人以外の出来事は、MAX_EVENTS - HUMAN_RESERVE に達したら拒む（行政が使い切ってオーナーの stop・epoch を塞がない） */
 export const HUMAN_RESERVE = 2000;
@@ -558,7 +558,10 @@ export const GUARDS = {
     if (!ev || ev.op !== 'plan') return null;
     const match = makeWorkItemId(cfg.work_item);
     if (!match) return 'config の票の ID の宣言が読めない';
-    const ids = [...ev.nodes.map((d) => d.id), ...ev.nodes.flatMap((d) => d.depends_on), ...(ev.supersede || []).flatMap((p) => [p.old, p.new])];
+    // 確かめるのは新しく足す節の id と、まだない節への依存だけ。既存の節への参照（depends_on・supersede の old）は存在の確認だけにする
+    // （宣言を変えた後も、旧い宣言の節に依存し、置き換えられる。独立した審査 E-8）。存在は RS-PLAN-GRAPH・RS-PLAN-SUPERSEDE が見る
+    const known = (id) => ctx.state.nodes.has(id);
+    const ids = [...ev.nodes.map((d) => d.id), ...ev.nodes.flatMap((d) => d.depends_on).filter((id) => !known(id)), ...(ev.supersede || []).map((p) => p.new)];
     const bad = [...new Set(ids.filter((id) => !match(id)))];
     return bad.length ? `節の id が票の ID の宣言（${cfg.work_item.prefix} と ${cfg.work_item.digits.join('〜')} 桁）に合わない: ${bad.slice(0, 5).join(', ')}` : null;
   },
@@ -571,10 +574,14 @@ export const GUARDS = {
   },
   // 保護された範囲（config.protected。領域パックの protected の写し）と重なる節は、計画に入れない（統治の核を触る節を実行の記録に入れさせない）。
   // オーナーの plan も同じ（統治の核の変更は、実行の記録でなく法律の改正の手続きで行う）
+  // 計画の後に config で保護を足しても、計画済みの節を動かさない：start・unblock・rule の return（作業に入る出来事）でも、節の範囲を今の protected と比べる
+  // （独立した審査 E-7）。重なる節は、オーナーが置き換えるか protected を見直す
   'RS-PROTECTED': (ctx) => {
-    const { ev, cfg } = gp(ctx);
-    if (!ev || ev.op !== 'plan' || !Array.isArray(cfg.protected) || cfg.protected.length === 0) return null; // 扱えない形の範囲は RS-PLAN-RESOURCES が止める
-    for (const d of ev.nodes) for (const r of d.resources) for (const p of cfg.protected) if (parsePattern(r) && overlap(r.normalize('NFKC'), p)) return `節 ${d.id} の範囲 ${r.slice(0, 60)} が保護された範囲 ${p} と重なる`;
+    const { ev, node, cfg } = gp(ctx);
+    if (!ev || !Array.isArray(cfg.protected) || cfg.protected.length === 0) return null; // 扱えない形の範囲は RS-PLAN-RESOURCES が止める
+    const hit = (d) => { for (const r of d.resources) for (const p of cfg.protected) if (parsePattern(r) && overlap(r.normalize('NFKC'), p)) return `節 ${d.id} の範囲 ${r.slice(0, 60)} が保護された範囲 ${p} と重なる`; return null; };
+    if (ev.op === 'plan') { for (const d of ev.nodes) { const h = hit(d); if (h) return h; } return null; }
+    if (node && (ev.op === 'start' || ev.op === 'unblock' || (ev.op === 'rule' && ev.decision === 'return'))) return hit(node);
     return null;
   },
   'RS-PLAN-APPEND-ONLY': (ctx) => {

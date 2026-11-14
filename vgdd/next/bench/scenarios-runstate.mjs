@@ -294,6 +294,16 @@ A('RS-A151', '夜間の合格（held。統合はまだ）の verdict に merge �
 A('RS-A152', 'オーナーの rule の return（やり直し）に merge を付ける', ['RS-MERGE-REF'], { build: blockedDisagree, actor: OW, event: { op: 'rule', node: 'T-001', request: R1, decision: 'return', reason: 'やり直す', merge: M1 } });
 
 // ---- 良性 ----
+// ---- 独立した審査 E-7：計画の後に足した保護も、作業に入る出来事で見る ----
+const protLater = (r) => { plan(r, [N('T-001', [], ['vgdd/kernel/x'])]); approve(r, 'T-001'); go(r, OW, cfgEv({ concurrent_work: 2, protected: ['vgdd/**'], reason: '統治の核を保護する（締める）' })); };
+A('RS-A153', 'E-7：計画の後に保護を足しても、計画済みの節（vgdd/kernel/x）を start する', ['RS-PROTECTED'], { build: protLater, event: startEv('T-001') });
+A('RS-A154', 'E-7：保護に重なる blocked の節を unblock で作業に戻す', ['RS-PROTECTED'], {
+  build: (r) => { plan(r, [N('T-001', [], ['vgdd/x'])]); approve(r, 'T-001'); start(r, 'T-001'); submit(r, 'T-001'); verdict(r, 'T-001', R1, 'passed', SPLIT_MAJOR); go(r, OW, cfgEv({ concurrent_work: 2, protected: ['vgdd/**'], reason: '締める' })); },
+  actor: OW, event: { op: 'unblock', node: 'T-001', reason: '再開' } });
+A('RS-A155', 'E-7：保護に重なる blocked の節を rule の return で作業に戻す', ['RS-PROTECTED'], {
+  build: (r) => { plan(r, [N('T-001', [], ['vgdd/x'])]); approve(r, 'T-001'); start(r, 'T-001'); submit(r, 'T-001'); verdict(r, 'T-001', R1, 'passed', SPLIT_MAJOR); go(r, OW, cfgEv({ concurrent_work: 2, protected: ['vgdd/**'], reason: '締める' })); },
+  actor: OW, event: { op: 'rule', node: 'T-001', request: R1, decision: 'return', reason: 'やり直す' } });
+
 function benign(id, title, flow) {
   SCENARIOS.push({ id, kind: 'benign', title, run: (guardNames) => {
     try {
@@ -540,3 +550,10 @@ export function benchRun(n = 500, events = 5000) {
       apply_cold_ms: +applyCold.toFixed(1), apply_warm_median_ms: +warm[1].toFixed(1), next_ms: +nextMs.toFixed(1), next_start: nextR.start.length };
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }
+benign('RS-B27', 'E-8：票の ID の宣言を U- に変えた後、新しい節 U-101 が旧い宣言の節 T-001 に依存し、オーナーが T-002 を U-102 で置き換える', (w) => {
+  const r = w(); plan(r, [N('T-001'), N('T-002')]);
+  go(r, OW, cfgEv({ concurrent_work: 2, work_item: { prefix: 'U-', digits: [3, 4] }, reason: 'prefix を変える' }));
+  plan(r, [N('U-101', ['T-001'])]);
+  go(r, OW, { op: 'plan', nodes: [N('U-102')], supersede: [{ old: 'T-002', new: 'U-102' }] });
+  expect(r.state().nodes['T-002'].superseded_by === 'U-102', '置き換え');
+});

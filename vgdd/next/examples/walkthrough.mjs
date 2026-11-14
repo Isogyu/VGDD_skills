@@ -164,14 +164,17 @@ export function runWalkthrough({ dir = null, log = () => {} } = {}) {
   log(3, `next()：着手の組 ${next1.start.join('・')}、構成の勧め ${next1.recommend.topology}、待ち ${next1.waiting.map((w) => `${w.id}[${w.reasons.join(',')}]`).join(' ')}`);
 
   // =====================================================================
-  // 段 4　経験（着手の前の取り出し。最初は空）
+  // 段 4　着手と経験の取り出し（着手した作業員が、自分の行為者で取り出す。最初は空）
   // =====================================================================
   const exp = openExperience(files.experience, { workItem });
-  const retrieveFor = (task, text) => exp.retrieve({ audience: { role: 'worker', task }, query: { text, tags: ['test'], domain: pack.id }, limit: 5, maxChars: 3000 });
-  const r101 = retrieveFor('T-101', '境界値 試験 入力の上限');
-  const r102 = retrieveFor('T-102', '境界値 試験 入力の上限');
+  /** 取り出しは行為者が必須で、記録に残る（bridge.feedbackFromRun は、着手から申請までの間の、着手の行為者・assignee の取り出しだけを数える） */
+  const retrieveFor = (actor, task, text) => exp.retrieve({ actor, audience: { role: 'worker', task }, query: { text, tags: ['test'], domain: pack.id }, limit: 5, maxChars: 3000 });
+  rsApply(A.head, { op: 'start', node: 'T-101', spec_digest: specDigest['T-101'], lease_sec: 3600, assignee: A.worker1 });
+  rsApply(A.night, { op: 'start', node: 'T-102', spec_digest: specDigest['T-102'], lease_sec: 3600, assignee: A.worker2 });
+  const r101 = retrieveFor(A.worker1, 'T-101', '境界値 試験 入力の上限');
+  const r102 = retrieveFor(A.worker2, 'T-102', '境界値 試験 入力の上限');
   if (r101.items.length || r102.items.length || r101.rendered !== '') throw new Error('最初の取り出しが空でない');
-  log(4, `着手の前に作業員（worker）の役割で経験を取り出した：T-101・T-102 とも空（searchKind=${r101.searchKind}）`);
+  log(4, `T-101 は行政の長（昼）、T-102 は夜間の代行が着手（作業員は assignee）。着手した作業員が経験を取り出した：どちらも空（searchKind=${r101.searchKind}）`);
 
   // =====================================================================
   // 段 5　申請と判定（判定の refs と統合の参照を記録に残す）
@@ -190,9 +193,6 @@ export function runWalkthrough({ dir = null, log = () => {} } = {}) {
     return rsApply(A.gate, { op: 'verdict', node: t, request, audits: 'passed', verdicts, refs: refsFor(request, verdicts, findings), ...(merge ? { merge } : {}) });
   };
 
-  rsApply(A.head, { op: 'start', node: 'T-101', spec_digest: specDigest['T-101'], lease_sec: 3600, assignee: A.worker1 });
-  rsApply(A.night, { op: 'start', node: 'T-102', spec_digest: specDigest['T-102'], lease_sec: 3600, assignee: A.worker2 });
-  log(5, 'T-101 は行政の長（昼）、T-102 は夜間の代行が着手。作業員は assignee として記録する（行為者にはしない）');
   rsApply(A.head, { op: 'submit', node: 'T-101', request: req['T-101'][0] });
   const v1 = verdict('T-101', req['T-101'][0], [J('judge', 'claude', 'CHANGES_REQUIRED'), J('judge', 'codex', 'CHANGES_REQUIRED', true)], [['judge', 'codex', 'finding-1']]);
   if (v1.kind !== 'return' || v1.to !== 'in_progress') throw new Error(`1 回目の判定が差し戻しでない: ${JSON.stringify(v1)}`);
@@ -214,7 +214,7 @@ export function runWalkthrough({ dir = null, log = () => {} } = {}) {
   const scope = { domain: pack.id, roles: ['worker'], tags: ['test', 'boundary'] };
   const refl = [];
   for (const t of ['T-101', 'T-102']) {
-    const pv = provenanceFromVerdict(firstVerdictRow(t));
+    const pv = provenanceFromVerdict(firstVerdictRow(t), { records: rowsAfter5 });
     if (!pv.provenance.length) throw new Error(`出どころを作れない: ${pv.reason}`);
     refl.push(exp.add(A.gate, { text: findingText[t], scope, provenance: pv.provenance }));
   }
@@ -225,13 +225,12 @@ export function runWalkthrough({ dir = null, log = () => {} } = {}) {
   const promoted = exp.promote(A.owner, induced.id, { digest: exp.inspect(induced.id).digest });
   log(6, `3 件の reflection（別々の票）から induce → ${induced.id}。オーナーが昇格 → ${promoted.status}`);
 
-  const r103 = retrieveFor('T-103', '境界値 試験 入力の上限');
+  rsApply(A.head, { op: 'start', node: 'T-103', spec_digest: specDigest['T-103'], lease_sec: 3600, assignee: A.worker1 });
+  const r103 = retrieveFor(A.worker1, 'T-103', '境界値 試験 入力の上限');
   const first = r103.items[0];
   if (!first || first.id !== induced.id || first.status !== 'adopted') throw new Error('昇格した経験が先頭に出ない');
   if (!r103.rendered.includes('引用') || !r103.rendered.includes('```text')) throw new Error('経験が引用の形で出ない');
-  log(6, `T-103 の着手の前に retrieve：${r103.items.length} 件。先頭は ${first.id}（${first.trust}・${first.status}）`);
-
-  rsApply(A.head, { op: 'start', node: 'T-103', spec_digest: specDigest['T-103'], lease_sec: 3600, assignee: A.worker1 });
+  log(6, `T-103 の着手の後、作業員が retrieve：${r103.items.length} 件。先頭は ${first.id}（${first.trust}・${first.status}）`);
   rsApply(A.head, { op: 'submit', node: 'T-103', request: req['T-103'][0] });
   const v4 = verdict('T-103', req['T-103'][0], [J('judge', 'claude', 'APPROVED'), J('judge', 'codex', 'APPROVED')]);
   if (v4.kind !== 'pass') throw new Error('T-103 が合格でない');
@@ -241,8 +240,12 @@ export function runWalkthrough({ dir = null, log = () => {} } = {}) {
   if (!fbT103 || fbT103.outcome !== 'helpful') throw new Error(`T-103 の feedback の案が helpful でない: ${JSON.stringify(fbPlan)}`);
   const fb = exp.feedback(A.gate, { ...fbT103, item_ids: fbT103.item_ids.filter((id) => id === induced.id) });
   log(6, `bridge の feedbackFromRun（最初の判定 pass → helpful）→ 裁判所のスクリプトが feedback → ${induced.id} の helpful=${fb[0].helpful}`);
-  const judgeAsk = exp.retrieve({ audience: { role: 'judge', task: 'T-103' }, query: { text: '境界値', domain: pack.id } });
-  const securityAsk = exp.retrieve({ audience: { role: 'codex_security', task: 'T-102' }, query: { text: '境界値', domain: pack.id } });
+  const judgeAsk = exp.retrieve({ actor: A.worker1, audience: { role: 'judge', task: 'T-103' }, query: { text: '境界値', domain: pack.id } });
+  const securityAsk = exp.retrieve({ actor: A.worker1, audience: { role: 'codex_security', task: 'T-102' }, query: { text: '境界値', domain: pack.id } });
+  // 取り出しの申告の票（task）だけでは評価は付かない：判定がすでに出た T-101（最初は差し戻し）を、着手の範囲の外で指定して取り出しても数えない
+  const late = retrieveFor(A.worker1, 'T-101', '境界値 試験 入力の上限');
+  const lateFb = feedbackFromRun(openChain(files.run).read(), openChain(files.experience).read());
+  if (lateFb.feedback.some((f) => f.evidence.task === 'T-101') || !late.items.length) throw new Error('着手の範囲の外の取り出しが評価に数えられた');
   if (!judgeAsk.refused || judgeAsk.items.length || !securityAsk.refused || securityAsk.items.length) throw new Error('司法の役割に経験が渡った');
   refusals.push({ stage: 6, label: '司法（judge・codex_security）の役割への経験の取り出し（retrieve は例外でなく { refused, violations } を返す）', code: null, guards: judgeAsk.violations.map((v) => v.guard), hasViolations: true });
   log(6, '  拒まれた：司法（judge）と security の審査（codex_security）への retrieve → EX-RETRIEVE-JUDGE');
@@ -285,7 +288,8 @@ export function runWalkthrough({ dir = null, log = () => {} } = {}) {
   // =====================================================================
   // 段 8　改善提案
   // =====================================================================
-  const im = openImprovements(files.improvement, { currentCapabilities: caps });
+  let currentCaps = caps; // 今効いている権限の表（法律を採用したら、次の提案の旧版はそれになる）
+  const im = openImprovements(files.improvement, { currentCapabilities: () => currentCaps });
   const playbook = im.propose(A.head, {
     title: '作業員の手順：境界値の試験を先に書く', tier: 'playbook', target: { name: 'worker-playbook' },
     content: { step: '実装の前に、上限ちょうど・1 つ上の境界値の試験を書く', derived_from: [induced.id] }, rationale: `${refl[0].id}（T-101 の差し戻し）から`,
@@ -305,12 +309,17 @@ export function runWalkthrough({ dir = null, log = () => {} } = {}) {
   const lawLoose = im.propose(A.head, { title: '作業員に main への統合を許す', tier: 'law', target: { paths: [CAPS_PATH] }, content: { capabilities: looser }, capabilities: { old: caps, new: looser } });
   evalOf(lawLoose); reviewOf(lawLoose);
   if (dLoose.class !== 'loosening' || lawLoose.route.lane !== 'full_legislative') throw new Error('緩める変更が緩めると分類されない');
-  mustRefuse(8, '緩める法律の変更を、通常の審査（codex の judge）とオーナーの承認だけで採用', () => adoptOf(lawLoose.id));
-  mustRefuse(8, '憲法審査（実際は Claude 系統）の審査。提案者と同じ系統なので審査できない', () => reviewOf(im.get(lawLoose.id), A.constClaude));
+  mustRefuse(8, '緩める法律の変更を、通常の審査（codex の judge）とオーナーの承認だけで採用（憲法審査がない）', () => adoptOf(lawLoose.id));
+  mustRefuse(8, '憲法審査が系統を codex と偽る（憲法審査の系統は claude に決まっている）', () => reviewOf(im.get(lawLoose.id), { ...A.constClaude, lineage: 'codex' }));
   mustRefuse(8, '同じ系統の別名（anthropic）を名乗る憲法審査', () => reviewOf(im.get(lawLoose.id), { ...A.constClaude, lineage: 'anthropic' }));
-  const tighter = clone(caps); tighter.capabilities.find((c) => c.id === 'CAP-MAIN-INTEGRATE').probes.push({ tool: 'Bash', command: 'git push --force origin HEAD:main' });
-  const dTight = authorityDelta(caps, tighter);
-  const lawTight = im.propose(A.head, { title: 'main への強制 push の probe を足す', tier: 'law', target: { paths: [CAPS_PATH] }, content: { capabilities: tighter }, capabilities: { old: caps, new: tighter } });
+  reviewOf(im.get(lawLoose.id), A.constClaude); // 正直な憲法審査（claude）。別系統の要求は codex の judge の APPROVED が満たす
+  const adoptedLoose = adoptOf(lawLoose.id);
+  if (adoptedLoose.status !== 'adopted') throw new Error('緩める法律が、憲法審査＋別系統の審査＋オーナーで採用されない');
+  log(8, `緩める法律の変更は、憲法審査（claude）＋ codex の judge ＋オーナーの採用で正直に通った（${adoptedLoose.id}）`);
+  currentCaps = looser;
+  const tighter = clone(looser); tighter.capabilities.find((c) => c.id === 'CAP-MAIN-INTEGRATE').probes.push({ tool: 'Bash', command: 'git push --force origin HEAD:main' });
+  const dTight = authorityDelta(looser, tighter);
+  const lawTight = im.propose(A.head, { title: 'main への強制 push の probe を足す', tier: 'law', target: { paths: [CAPS_PATH] }, content: { capabilities: tighter }, capabilities: { old: looser, new: tighter } });
   evalOf(lawTight, { before: { total: 50, passed: 50 }, after: { total: 51, passed: 51 }, new_cases_fail_on_before: 1 }); reviewOf(lawTight);
   const adoptedTight = adoptOf(lawTight.id);
   if (dTight.class !== 'tightening' || adoptedTight.status !== 'adopted') throw new Error('締める変更が通常の経路で採用されない');
@@ -324,7 +333,9 @@ export function runWalkthrough({ dir = null, log = () => {} } = {}) {
   mustRefuse(9, 'runstate：行政の長が verdict', headRs({ op: 'verdict', node: 'T-104', request: sha40('x'), audits: 'passed', verdicts: [J('judge', 'claude', 'APPROVED'), J('judge', 'codex', 'APPROVED')] }));
   mustRefuse(9, 'runstate：行政の長が approve', headRs({ op: 'approve', node: 'T-104', spec_digest: specDigest['T-101'], policy_line: policyLine, def_digest: run.state().nodes['T-104'].def_digest }));
   mustRefuse(9, 'runstate：行政の長が release', headRs({ op: 'release', node: 'T-104', request: sha40('x') }));
-  mustRefuse(9, 'improvement：行政の長が採用', () => im.adopt(A.head, lawLoose.id, { digest: im.get(lawLoose.id).digest, policy_line: policyLine }));
+  const pending = im.propose(A.head, { title: '見本：保留の提案', tier: 'playbook', target: { name: 'pending' }, content: 'c' });
+  evalOf(pending); reviewOf(pending);
+  mustRefuse(9, 'improvement：行政の長が採用', () => im.adopt(A.head, pending.id, { digest: im.get(pending.id).digest, policy_line: policyLine }));
   mustRefuse(9, 'experience：行政の長が昇格', () => exp.promote(A.head, refl[0].id, { digest: exp.inspect(refl[0].id).digest }));
   mustRefuse(9, 'experience：行政の長が feedback', () => exp.feedback(A.head, { item_ids: [induced.id], outcome: 'helpful', evidence: { kind: 'verdict', ref: 'x', task: 'T-103' } }));
   mustRefuse(9, 'experience：夜間の代行（スクリプト）が feedback', () => exp.feedback(A.night, { item_ids: [induced.id], outcome: 'helpful', evidence: { kind: 'verdict', ref: 'x', task: 'T-103' } }));
@@ -343,7 +354,7 @@ export function runWalkthrough({ dir = null, log = () => {} } = {}) {
   return {
     root, files, caps, pack, packResult, workItem, jud, prot, policyLine, catalog, teamPlan, teamResult, teamRefusal, teamContext,
     run, rows, specDigest, approveHash, req, mergeSha, accId, next1, v1, v2, v3, v4,
-    exp, refl, induced, promoted, r101, r102, r103, fb, fbPlan, judgeAsk, securityAsk,
+    exp, refl, induced, promoted, r101, r102, r103, fb, fbPlan, lateFb, judgeAsk, securityAsk, adoptedLoose,
     tr, fromRun, cov, gaps1, gaps2, cov2, im, playbook, lawLoose, lawTight, dLoose, dTight, adoptedTight,
     verify, A, adaptations, refusals,
   };

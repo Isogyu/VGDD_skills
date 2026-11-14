@@ -58,6 +58,7 @@ describe('結合：3 つの票を開発の領域パックで進める（共通�
 
   it('段 1：領域パックが通り、票の ID の宣言・司法・保護の範囲が bridge で runstate の設定になる', () => {
     assert.equal(W.packResult.ok, true);
+    assert.equal(W.pack.id, 'software-dev');
     assert.deepEqual(W.workItem, { prefix: 'T-', digits: [3, 4] });
     for (const t of TICKETS) assert.equal(V.makeWorkItemId(W.workItem)(t.id), true);
     assert.deepEqual(W.jud.judiciary, [{ kind: 'judge', lineage: 'claude' }, { kind: 'judge', lineage: 'codex' }]);
@@ -66,99 +67,158 @@ describe('結合：3 つの票を開発の領域パックで進める（共通�
     assert.equal(W.policyLine, 'p0.4');
   });
 
-  it('段 2：編成案が通る（limits.concurrent_work は runstate と同じ意味）。裁判所は編成に入れられない', () => {
+  it('段 2：編成案が通る（limits.concurrent_work は runstate と同じ意味）。catalog は権限の表の roles から作る。裁判所は編成に入れられない', () => {
     assert.equal(W.teamResult.ok, true);
     assert.equal(W.teamResult.requires_approval, true);
     assert.equal(W.teamResult.effect, 'none');
+    assert.deepEqual(Object.keys(W.catalog).sort(), Object.keys(caps.roles).sort());
     assert.equal(W.teamContext.limits.concurrent_work, W.run.state().config.concurrent_work);
+    assert.equal(W.teamRefusal.ok, false);
     assert.ok(W.teamRefusal.violations.some((v) => v.guard === 'TM-HUMAN-SEAT'));
   });
 
   it('段 3：config・plan・approve の後、next() が着手の組（T-101・T-102）と待ち（T-103）を返す。節の id は票の ID のまま', () => {
     assert.deepEqual([...W.next1.start].sort(), ['T-101', 'T-102']);
+    assert.ok(['single', 'parallel', 'staged'].includes(W.next1.recommend.topology));
     assert.ok(W.next1.waiting.find((x) => x.id === 'T-103').reasons.every((r) => r.startsWith('waiting_dependency')));
-    assert.deepEqual(W.rows[0].actor, V.normActor(A.owner));
+    const first = W.rows[0];
+    assert.equal(first.op, 'config');
+    assert.deepEqual(first.actor, V.normActor(A.owner));
+    assert.deepEqual(first.judiciary, [{ kind: 'judge', lineage: 'claude' }, { kind: 'judge', lineage: 'codex' }]);
+    assert.equal(first.security_lineage, 'codex');
     const s = W.run.state();
+    assert.equal(s.config.policy_line, 'p0.4');
     assert.deepEqual(s.config.work_item, { prefix: 'T-', digits: [3, 4] });
     assert.deepEqual(s.nodes['T-101'].requirements, ['R-1']);
+    assert.equal(s.nodes['T-102'].security_review, true);
     assert.ok(W.refusals.some((r) => r.stage === 3 && r.guards.includes('RS-PROTECTED')));
   });
 
-  it('段 4：着手の前の retrieve は空', () => {
+  it('段 4：着手した作業員が自分の行為者で取り出す（最初は空）。取り出しの行に行為者が残る', () => {
     for (const r of [W.r101, W.r102]) { assert.deepEqual(r.items, []); assert.equal(r.rendered, ''); assert.equal(r.searchKind, 'lexical'); }
+    const rows = openChain(W.files.experience).read().filter((r) => r.op === 'retrieved');
+    assert.ok(rows.length >= 2);
+    for (const r of rows) assert.ok(V.sameActor(r.actor, A.worker1) || V.sameActor(r.actor, A.worker2));
   });
 
   it('段 5：T-101 は差し戻し → 再申請で合格、T-102 は security を含めて合格。作業員は assignee、統合の参照と申請の履歴が節に残る', () => {
     assert.equal(W.v1.kind, 'return');
+    assert.equal(W.v1.to, 'in_progress');
+    assert.equal(W.v1.node.returns, 1);
     assert.equal(W.v2.kind, 'pass');
     assert.equal(W.v3.kind, 'pass');
-    const n = W.run.state().nodes['T-101'];
-    assert.equal(n.status, 'merged');
+    const s = W.run.state();
+    for (const id of ['T-101', 'T-102', 'T-103']) assert.equal(s.nodes[id].status, 'merged');
+    const n = s.nodes['T-101'];
+    assert.equal(n.returns, 1);
+    assert.equal(n.attempts, 2, 'start の 1 回と、差し戻しでの作業員の起動し直し 1 回');
     assert.equal(n.merge, W.mergeSha['T-101']);
     assert.deepEqual(n.requests.map((x) => [x.request, x.kind]), [[W.req['T-101'][0], 'return'], [W.req['T-101'][1], 'pass']]);
-    assert.deepEqual(W.run.state().nodes['T-102'].assignee, V.normActor(A.worker2));
+    assert.deepEqual(s.nodes['T-102'].assignee, V.normActor(A.worker2));
+    const sec = W.rows.find((r) => r.op === 'verdict' && r.node === 'T-102');
+    assert.ok(sec.verdicts.some((v) => v.kind === 'security' && v.lineage === 'codex' && v.verdict === 'APPROVED'));
   });
 
-  it('段 6：判定の refs の指摘への参照から reflection（bridge.provenanceFromVerdict）→ induce → 昇格 → T-103 の前に引用の形で出る', () => {
+  it('段 6：判定の refs の指摘への参照から reflection（bridge.provenanceFromVerdict）→ induce → 昇格 → T-103 の着手の後に引用の形で出る', () => {
     assert.equal(W.refl.length, 3);
+    for (const r of W.refl) { assert.equal(r.layer, 'reflection'); assert.equal(r.trust, 'grounded'); assert.equal(r.provenance[0].kind, 'verdict_finding'); }
     assert.deepEqual(W.refl.map((r) => r.provenance[0].task), ['T-101', 'T-102', 'T-090']);
     assert.equal(W.refl[0].provenance[0].ref, `${V.verdictId(W.req['T-101'][0], 'codex-judge')}#finding-1`);
+    assert.equal(W.induced.layer, 'experience');
     assert.equal(W.promoted.status, 'adopted');
-    assert.equal(W.r103.items[0].id, W.induced.id);
+    const top = W.r103.items[0];
+    assert.equal(top.id, W.induced.id);
+    assert.equal(top.status, 'adopted');
     assert.match(W.r103.rendered, /囲みの中は\*\*引用\*\*/);
+    assert.ok(W.r103.rendered.includes('```text'));
+    assert.ok(W.r103.rendered.includes(W.induced.text.normalize('NFKC')));
+    assert.ok(W.r103.items.length >= 2, '候補のままの reflection も出る');
+    assert.ok(W.r103.rendered.includes('未検証の仮説'));
   });
 
-  it('段 6：bridge.feedbackFromRun の案（最初の判定 pass → helpful）で裁判所のスクリプトが feedback。司法と security の審査の役割には渡らない', () => {
+  it('段 6：経験が渡された票の判定から評価が付く（bridge.feedbackFromRun：着手から申請までの間の、着手した作業員の取り出しだけ）。司法と security には渡らない', () => {
     assert.equal(W.fb[0].helpful, 1);
+    assert.equal(W.fb[0].harmful, 0);
     const f = W.fbPlan.feedback.find((x) => x.evidence.task === 'T-103');
     assert.equal(f.outcome, 'helpful');
-    assert.ok(W.judgeAsk.refused && W.judgeAsk.items.length === 0);
+    assert.ok(f.item_ids.includes(W.induced.id));
+    assert.equal(W.exp.state().items.get(W.induced.id).helpful, 1);
+    // 判定の後に、申告の票（T-101・最初は差し戻し）を指定して取り出しても、評価には数えない（E-1）
+    assert.equal(W.lateFb.feedback.some((x) => x.evidence.task === 'T-101'), false);
+    assert.ok(W.lateFb.skipped.some((x) => x.task === 'T-101' && /着手から申請までの間にない/.test(x.reason)));
+    assert.ok(W.judgeAsk.refused && W.judgeAsk.items.length === 0 && W.judgeAsk.rendered === '');
     assert.ok(W.securityAsk.refused && W.securityAsk.items.length === 0);
   });
 
-  it('段 7：bridge.linksFromRun で取り込んだつながりで、3 要件とも全段がそろう。差し戻された 1 回目の申請が見える', () => {
-    for (const row of W.cov.rows) for (const k of ['ticket', 'spec', 'approval', 'request', 'audit', 'verdict', 'merge', 'acceptance']) assert.equal(row.stages[k], true, `${row.requirement}.${k}`);
+  it('段 7：bridge.linksFromRun で取り込んだつながりで、3 要件とも全段がそろい、障害はまだない。差し戻された 1 回目の申請が見える', () => {
+    for (const row of W.cov.rows) {
+      for (const k of ['ticket', 'spec', 'approval', 'request', 'audit', 'verdict', 'merge', 'acceptance']) assert.equal(row.stages[k], true, `${row.requirement}.${k}`);
+      assert.equal(row.stages.incident, false);
+    }
+    assert.deepEqual(W.cov.rows.map((r) => r.requirement), ['R-1', 'R-2', 'R-3']);
     const r1 = W.cov.rows[0];
     assert.deepEqual([r1.requests, r1.returned_requests, r1.approved_requests], [2, 1, 1]);
     assert.equal(r1.verdict_basis, 'required_kinds');
+    assert.equal(W.cov.rows[1].verdict_basis, 'required_kinds', 'T-102 は security_review つきで、必須の判定の種類に codex-security が入る');
     assert.equal(W.cov.integrity.ok, true);
     assert.deepEqual(W.fromRun.skipped, []);
   });
 
-  it('段 7：gaps は差し戻された 1 回目の申請の 2 件だけ。障害を足すと「対応の票がない」が出る', () => {
+  it('段 7：gaps は差し戻された 1 回目の申請の 2 件だけ。障害を足すと「対応の票がない」が出て、R-3 の障害に数えられる', () => {
     const first = W.req['T-101'][0];
-    assert.deepEqual(W.gaps1.gaps.map((g) => [g.code, g.id]), [['REQUEST_CHANGES_REQUIRED', first], ['REQUEST_NOT_MERGED', first]]);
+    assert.deepEqual(W.gaps1.gaps.map((g) => [g.code, g.kind, g.id]), [['REQUEST_CHANGES_REQUIRED', 'request', first], ['REQUEST_NOT_MERGED', 'request', first]]);
+    assert.equal(W.gaps1.undetermined_count, 0);
     assert.deepEqual(W.gaps2.gaps.map((g) => g.code).sort(), ['INCIDENT_NO_TICKET', 'REQUEST_CHANGES_REQUIRED', 'REQUEST_NOT_MERGED']);
+    assert.equal(W.gaps2.gaps.find((g) => g.code === 'INCIDENT_NO_TICKET').id, 'INC-001');
     assert.deepEqual(W.cov2.rows.find((r) => r.requirement === 'R-3').incidents, ['INC-001']);
+    assert.deepEqual(W.cov2.rows.find((r) => r.requirement === 'R-1').incidents, []);
   });
 
-  it('段 7：承認の指紋は apply の戻り値の digest と同じで、trace をたどると同じ値に戻る', () => {
+  it('段 7：承認の指紋は apply の戻り値の digest と同じで、trace をたどると上流（要件・目標）と下流（仕様・承認・申請・統合・受け入れ）に同じ値で戻る', () => {
     const t = W.tr.trace({ kind: 'ticket', id: 'T-101' }, { direction: 'both' });
+    assert.equal(t.found, true);
+    const upKinds = new Set(t.up.nodes.map((n) => n.kind));
+    assert.ok(upKinds.has('requirement') && upKinds.has('goal'));
     const ids = t.down.nodes.map((n) => n.id);
     for (const x of [W.specDigest['T-101'], W.approveHash['T-101'], ...W.req['T-101'], W.mergeSha['T-101'], W.accId['T-101']]) assert.ok(ids.includes(x), x);
     const row = W.rows.find((r) => r.op === 'approve' && r.node === 'T-101');
     assert.equal(W.approveHash['T-101'], V.asDigest(row.hash));
   });
 
-  it('段 8：手順の改善は裁判所のスクリプトの評価・codex の審査・オーナーの採用で通る', () => {
+  it('段 8：手順の改善は裁判所のスクリプトの評価・codex の審査・オーナーの採用で通る。経験から導いたことと試験の数の前後が残る', () => {
     const p = W.im.get(W.playbook.id);
+    assert.equal(p.tier, 'playbook');
     assert.equal(p.status, 'adopted');
-    assert.deepEqual(p.reviews.map((r) => [r.actor.role, r.actor.lineage]), [['codex_judge', 'codex']]);
+    assert.deepEqual(p.content.derived_from, [W.induced.id]);
+    assert.equal(p.route.lane, 'standard');
+    const ev = p.evaluations[0].evidence.conformance;
+    assert.ok(ev.after.total > ev.before.total);
+    assert.ok(ev.new_cases_fail_on_before >= 1);
+    assert.deepEqual(p.reviews.map((r) => [r.actor.role, r.actor.lineage, r.verdict]), [['codex_judge', 'codex', 'APPROVED']]);
     assert.deepEqual(p.evaluations[0].actor, V.normActor(A.gate));
     assert.equal(W.im.adoptionValid(p.id), true);
+    const t = W.tr.trace({ kind: 'improvement', id: W.playbook.id }, { direction: 'up' });
+    assert.ok(t.up.nodes.some((n) => n.kind === 'experience' && n.id === W.induced.id));
   });
 
-  it('段 8：緩める法律の変更は通常の経路で採用できず、同じ系統の憲法審査も別名の憲法審査も拒まれる。締める変更は採用できる', () => {
+  it('段 8（E-2）：Claude の提案者の緩める法律は、憲法審査なしでは採用できず、系統を偽る・別名の憲法審査は拒まれ、憲法審査（claude）＋ codex の judge ＋オーナーで正直に通る。締める変更は通常の経路', () => {
     assert.equal(W.dLoose.class, 'loosening');
-    assert.equal(W.im.get(W.lawLoose.id).status, 'reviewed');
+    assert.equal(W.lawLoose.route.lane, 'full_legislative');
     const g8 = W.refusals.filter((r) => r.stage === 8).map((r) => r.guards);
     assert.ok(g8[0].includes('IM-FULL-LEGISLATIVE'));
-    assert.ok(g8[1].includes('IM-CROSS-LINEAGE'));
-    assert.ok(g8[2].includes('IM-ACTOR-SHAPE'));
+    assert.ok(g8[1].includes('IM-ACTOR-SHAPE'), '系統を codex と偽る憲法審査');
+    assert.ok(g8[2].includes('IM-ACTOR-SHAPE'), '別名 anthropic');
+    const p = W.im.get(W.lawLoose.id);
+    assert.equal(p.status, 'adopted');
+    assert.deepEqual(p.reviews.map((r) => [r.actor.role, r.actor.lineage]).sort(), [['codex_judge', 'codex'], ['constitutional_review', 'claude']]);
+    assert.equal(W.dTight.class, 'tightening');
+    assert.equal(W.lawTight.route.lane, 'standard');
     assert.equal(W.im.get(W.lawTight.id).status, 'adopted');
   });
 
   it('段 9：同じ行為者のオブジェクトで、行政の長は verdict・approve・release・採用・昇格・feedback・つながりの記録をどれも起こせない', () => {
+    const labels = W.refusals.filter((r) => r.stage === 9).map((r) => r.label);
+    for (const needle of ['verdict', 'approve', 'release', '採用', '昇格', 'feedback', 'つながり']) assert.ok(labels.some((l) => l.includes(needle)), needle);
     const g = (needle) => W.refusals.find((r) => r.stage === 9 && r.label.includes(needle)).guards;
     assert.ok(g('verdict').includes('RS-ROLE-OP'));
     assert.ok(g('approve').includes('RS-ROLE-OP'));
@@ -172,6 +232,7 @@ describe('結合：3 つの票を開発の領域パックで進める（共通�
 
   it('段 9：停止の後は start が拒まれ、再開の後に続けられる。全部の記録の verify が ok（開き直しても同じ）', () => {
     assert.ok(W.refusals.some((r) => r.stage === 9 && r.guards.includes('RS-STOPPED')));
+    assert.equal(W.run.state().stopped, false);
     assert.equal(W.run.state().nodes['T-104'].status, 'in_progress');
     for (const k of ['run', 'experience', 'trace', 'improvement']) assert.equal(W.verify[k].ok, true, k);
     assert.equal(openRun(W.files.run).verify().ok, true);
@@ -238,10 +299,10 @@ describe('解消：行為者の表し方（role・kind・id・lineage）', () =>
     const ex = openExperience(path.join(scratch(), 'e.jsonl'));
     ex.add(A.gate, { text: '入力検証の観点を確かめる', scope: { domain: 'software-dev', roles: ['worker'], tags: ['a'] }, provenance: [{ kind: 'verdict_finding', ref: 'VRD-aaaaaaaaaaaa-codex-security#f-1', task: 'T-101' }] });
     for (const role of ['codex_security', ' Codex_Security ', 'judge', 'codex_judge', 'constitutional_review', 'gate_runner']) {
-      const got = ex.retrieve({ audience: { role }, query: { text: '入力検証', domain: 'software-dev' } });
+      const got = ex.retrieve({ actor: A.worker1, audience: { role }, query: { text: '入力検証', domain: 'software-dev' } });
       assert.equal(got.items.length, 0, role); assert.ok(got.refused, role);
     }
-    assert.equal(ex.retrieve({ audience: { role: 'worker' }, query: { text: '入力検証', domain: 'software-dev' } }).items.length, 1);
+    assert.equal(ex.retrieve({ actor: A.worker1, audience: { role: 'worker' }, query: { text: '入力検証', domain: 'software-dev' } }).items.length, 1);
     assert.ok(refused(() => ex.add(A.gate, { text: 'x', scope: { domain: 'software-dev', roles: ['codex_security'], tags: [] }, provenance: [{ kind: 'obs', ref: 'x', task: 'T-101' }] })).guards.includes('EX-SCOPE'));
   });
 
@@ -277,7 +338,9 @@ describe('解消：系統（lineage）の書式・正規化・別名', () => {
     const im = openImprovements(path.join(scratch(), 'i.jsonl'), { currentCapabilities: caps });
     const p = im.propose({ ...A.head, lineage: 'Claude' }, { title: 't', tier: 'playbook', target: { name: 'x' }, content: 'c' });
     im.evaluate(A.gate, p.id, { digest: p.digest, evidence: { conformance: { before: { total: 1, passed: 1 }, after: { total: 1, passed: 1 } } } });
-    assert.deepEqual(refused(() => im.review({ role: 'judge', kind: 'ai', id: 'j', lineage: 'claude' }, p.id, { digest: p.digest, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(p.id).digest })).guards, ['IM-CROSS-LINEAGE']);
+    im.review({ role: 'judge', kind: 'ai', id: 'j', lineage: 'claude' }, p.id, { digest: p.digest, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(p.id).digest });
+    // im.v4：同じ系統（Claude と claude は同じ）の審査は、採用の時の別系統の要求に数えない
+    assert.deepEqual(refused(() => im.adopt(A.owner, p.id, { digest: p.digest, policy_line: 'p0.4' })).guards, ['IM-CROSS-LINEAGE']);
     assert.deepEqual(parseActor({ ...A.head, lineage: 'CLAUDE' }).actor.lineage, 'claude');
   });
 
@@ -431,14 +494,14 @@ describe('解消：時刻の書式', () => {
 });
 
 describe('解消：規則の版・epoch・設定の持ち方', () => {
-  it('（前：experience だけ rules も epoch もなく type に操作名）全部の記録の行が type・rules・op を持ち、版は rs.v2・im.v3・tr.v3・ex.v1', () => {
+  it('（前：experience だけ rules も epoch もなく type に操作名）全部の記録の行が type・rules・op を持ち、版は rs.v3・im.v4・tr.v4・ex.v2', () => {
     const W = runWalkthrough({ dir: scratch() });
     const first = (f) => openChain(W.files[f]).read()[0];
-    assert.deepEqual([first('run').rules, first('run').op], ['rs.v2', 'config']);
-    assert.equal(first('improvement').rules, 'im.v3');
-    assert.equal(first('trace').rules, 'tr.v3');
+    assert.deepEqual([first('run').rules, first('run').op], ['rs.v3', 'config']);
+    assert.equal(first('improvement').rules, 'im.v4');
+    assert.equal(first('trace').rules, 'tr.v4');
     const e = first('experience');
-    assert.deepEqual([e.type, e.rules], ['vgdd.experience.v1', 'ex.v1']);
+    assert.deepEqual([e.type, e.rules], ['vgdd.experience.v1', 'ex.v2']);
     assert.equal(e.op, 'add', '操作名は op に入る（空の取り出しは記録しないので、最初の行は reflection の追加）');
   });
 
@@ -524,7 +587,7 @@ describe('解消：つながらない箇所', () => {
     assert.ok(v.violations.some((x) => x.guard === 'TM-TEMPLATE-EXISTS'));
   });
 
-  it('（残した限界）実際の憲法審査（Claude 系統）では Claude の提案者の緩める変更は採用できない。codex の系統を名乗る憲法審査は通る（系統は申告）', () => {
+  it('（前の限界 §5.3 の解消、E-2）Claude の提案者の緩める変更は、正直な憲法審査（claude）＋ codex の judge で採用できる。憲法審査が codex を名乗ると拒む', () => {
     const d = scratch();
     const loosen = structuredClone(caps);
     loosen.capabilities.find((c) => c.id === 'CAP-MAIN-INTEGRATE').allowed.push('worker');
@@ -537,8 +600,8 @@ describe('解消：つながらない箇所', () => {
       const cr = refused(() => rv({ ...A.constClaude, lineage }));
       return cr ? { cr, adopted: false } : { cr, adopted: im.adopt(A.owner, p.id, { digest: p.digest, policy_line: 'p0.4' }).status === 'adopted' };
     };
-    assert.deepEqual(runIt('claude').cr.guards, ['IM-CROSS-LINEAGE']);
-    assert.equal(runIt('codex').adopted, true);
+    assert.deepEqual(runIt('claude'), { cr: null, adopted: true });
+    assert.ok(runIt('codex').cr.guards.includes('IM-ACTOR-SHAPE'), '系統を偽る申告は通らない（誘因が正しい向き）');
   });
 });
 
@@ -561,8 +624,8 @@ describe('解消：API・拒否の出方', () => {
 
   it('retrieve の query.domain を省くと 0 件（変わらず。scope.domain との完全一致）', () => {
     const W = runWalkthrough({ dir: scratch() });
-    assert.ok(W.exp.retrieve({ audience: { role: 'worker', task: 'T-103' }, query: { text: '境界値', domain: 'software-dev' } }).items.length > 0);
-    assert.deepEqual(W.exp.retrieve({ audience: { role: 'worker', task: 'T-103' }, query: { text: '境界値' } }).items, []);
+    assert.ok(W.exp.retrieve({ actor: A.worker1, audience: { role: 'worker', task: 'T-103' }, query: { text: '境界値', domain: 'software-dev' } }).items.length > 0);
+    assert.deepEqual(W.exp.retrieve({ actor: A.worker1, audience: { role: 'worker', task: 'T-103' }, query: { text: '境界値' } }).items, []);
   });
 
   it('戻り値の形：runstate は { ok, seq, digest, node, kind, to }、improvement は提案の状態、experience は項目（feedback は配列）、trace はつながり', () => {

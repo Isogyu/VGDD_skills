@@ -13,7 +13,7 @@ import { validateDomainPack } from '../domain.mjs';
 import { replay as rsReplay, RECORD_TYPE as RS_TYPE } from '../runstate.mjs';
 import { digest } from './chain.mjs';
 import {
-  REVIEW_MODES, AI_LINEAGES, reviewModeOf, verdictId, auditId, asDigest, isArtifactRef, parseWorkItemSpec, isFindingRef, parseFindingRef,
+  REVIEW_MODES, AI_LINEAGES, reviewModeOf, verdictId, auditId, asDigest, parseWorkItemSpec, isFindingRef, parseFindingRef, parseTs, sameActor,
 } from './vocab.mjs';
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -164,12 +164,19 @@ export function linksFromRun(runRecords) {
 // ---------------------------------------------------------------------------
 
 /**
- * runstate の verdict の行から、experience の出どころ（provenance）の配列を作る（refs.findings の指摘への参照から）。
+ * runstate の verdict の行から、experience の出どころ（provenance）の配列を作る（refs.findings の指摘への参照から。vocab の形に合うものだけ）。
+ * opt.records（その行を含む記録の全体）を渡せば、記録を replay で確かめ、行がその記録の中にある（同じ hash）ときだけ作る。
+ * 渡さないときは、呼び出し側が再生で確かめた記録の行を渡す前提（この関数は単独の行の真偽を確かめられない。独立した審査 E-10）。
  * refs がなければ空と理由（判定の本文・番号は runstate の記録にない。作らずに理由を返す）。
  * @returns {{ provenance: {kind:'verdict_finding', ref:string, task:string}[], reason: string|null }}
  */
-export function provenanceFromVerdict(runRecord) {
+export function provenanceFromVerdict(runRecord, opt = {}) {
   if (!isObj(runRecord) || runRecord.type !== RS_TYPE || runRecord.op !== 'verdict') return { provenance: [], reason: 'runstate の verdict の行でない' };
+  if (isObj(opt) && opt.records !== undefined) {
+    const { st, reason } = checkRun(opt.records);
+    if (!st) return { provenance: [], reason };
+    if (!opt.records.some((r) => isObj(r) && r.hash === runRecord.hash && r.seq === runRecord.seq)) return { provenance: [], reason: 'verdict の行が、渡した記録の中にない' };
+  }
   const f = runRecord.refs && Array.isArray(runRecord.refs.findings) ? runRecord.refs.findings : [];
   if (!f.length) return { provenance: [], reason: 'verdict の refs に指摘への参照（findings）がない' };
   const out = f.filter(isFindingRef).map((ref) => ({ kind: 'verdict_finding', ref, task: runRecord.node }));
@@ -177,39 +184,67 @@ export function provenanceFromVerdict(runRecord) {
 }
 
 /**
- * 経験の feedback の入力の案を作る（決定論的）。
+ * 経験の feedback の入力の案を作る（決定論的）。評価は代理の指標なので、数える取り出しを狭く決める（独立した審査 E-1・E-9）。
  * 規則：
- *   1. experience の retrieved の行（op: 'retrieved'、task つき）ごとに、その票（task）に渡した経験の項目を集める（同じ票の取り出しは和集合）。
- *   2. その票の節の「最初の判定」＝ runstate の節の申請の履歴（requests。使えない審査 unavailable は入らない）の先頭を見る。
- *        pass・pass_minor_disagreement → helpful、return（差し戻し）→ harmful。
- *        それ以外（blocked_*・裁定・release・履歴なし）は決められないので出さない（skipped に理由）。
- *   3. 証拠は、その申請の判定の id（verdict の refs.verdicts の最初、なければ vocab の verdictId で judge の種類から作る）。
- *   経験の記録の時刻と実行の記録の時刻は別の鎖なので比べない（取り出した後の最初の判定かは確かめられない。限界）。
+ *   1. 票ごとに「評価の根拠にする申請」を決める：runstate の節の申請の履歴（requests。使えない審査 unavailable は入らない）の先頭。
+ *      履歴が上限で落ちた節（requests_dropped > 0）は、先頭が最初の判定と言えないので出さない。
+ *   2. 結果：その申請の結果が pass・pass_minor_disagreement → helpful、return（差し戻し）→ harmful。それ以外は決められないので出さない。
+ *   3. 数える取り出し：experience の retrieved の行のうち、
+ *      (a) task がその票で、(b) 時刻（行の at）が「その申請の submit の直前の start の時刻以降、その submit の時刻まで」にあり
+ *      （submit と同じ時刻（記録の時刻はミリ秒まで）の取り出しは数える。それより後は数えない）、
+ *      (c) 取り出した行為者（retrieved の actor）が、その start を起こした行為者か、その start の assignee と同じもの。
+ *      時刻が読めない・範囲の外・行為者が違う取り出しは数えず、skipped に理由を返す（申告の task だけでは評価を付けない）。
+ *   4. 証拠は、その申請の判定の id（verdict の refs.verdicts の最初、なければ vocab の verdictId で judge の種類から作る）。
+ *   限界：取り出した経験を作業員が実際に読んだか・使ったかは分からない。時刻は二つの鎖の書いた側の時刻で、同じ時計とは限らない。
  * @param {object[]} runRecords runstate の記録の行
  * @param {object[]} retrievedEvents experience の記録の行（op: 'retrieved' 以外は無視）
  * @returns {{ feedback: {item_ids:string[], outcome:'helpful'|'harmful', evidence:{kind:'verdict', ref:string, task:string}}[], skipped: {task:string|null, reason:string}[] }}
  */
 export function feedbackFromRun(runRecords, retrievedEvents) {
-  const feedback = []; const skipped = [];
   const { st, reason } = checkRun(runRecords);
-  if (!st) return { feedback, skipped: [{ task: null, reason }] };
+  if (!st) return { feedback: [], skipped: [{ task: null, reason }] };
+  return feedbackFromState(st, runRecords, retrievedEvents);
+}
+
+/**
+ * feedbackFromRun の本体（試験用に公開）。st は runstate.replay(runRecords) の結果（呼び出し側が同じ記録から作ったもの）。
+ * 規則は feedbackFromRun の説明のとおり
+ */
+export function feedbackFromState(st, runRecords, retrievedEvents) {
+  const feedback = []; const skipped = [];
+  if (!st || !(st.nodes instanceof Map) || !Array.isArray(runRecords)) return { feedback, skipped: [{ task: null, reason: '実行の状態・記録が読めない' }] };
   if (!Array.isArray(retrievedEvents)) return { feedback, skipped: [{ task: null, reason: 'retrievedEvents が配列でない' }] };
   const byTask = new Map();
   for (const e of retrievedEvents) {
     if (!isObj(e) || e.op !== 'retrieved' || typeof e.task !== 'string' || !Array.isArray(e.item_ids)) continue;
-    const s = byTask.get(e.task) || byTask.set(e.task, new Set()).get(e.task);
-    for (const id of e.item_ids) if (typeof id === 'string') s.add(id);
+    (byTask.get(e.task) || byTask.set(e.task, []).get(e.task)).push(e);
   }
+  const rows = runRecords.filter((r) => isObj(r) && r.type === RS_TYPE);
   for (const task of [...byTask.keys()].sort()) {
     const node = st.nodes.get(task);
     if (!node) { skipped.push({ task, reason: '実行の記録にこの票の節がない' }); continue; }
+    if (node.requests_dropped > 0) { skipped.push({ task, reason: `申請の履歴が上限で ${node.requests_dropped} 件落ちていて、最初の判定が決まらない` }); continue; }
     const first = node.requests[0];
     const outcome = first && (first.kind === 'pass' || first.kind === 'pass_minor_disagreement') ? 'helpful' : first && first.kind === 'return' ? 'harmful' : null;
     if (!outcome) { skipped.push({ task, reason: first ? `最初の判定の結果（${first.kind}）からは決められない` : 'まだ判定がない' }); continue; }
-    const row = runRecords.find((r) => isObj(r) && r.type === RS_TYPE && r.op === 'verdict' && r.node === task && r.request === first.request);
+    const si = rows.findIndex((r) => r.op === 'submit' && r.node === task && r.request === first.request);
+    let startRow = null;
+    for (let k = si - 1; k >= 0; k -= 1) if (rows[k].op === 'start' && rows[k].node === task) { startRow = rows[k]; break; }
+    const submitAt = si >= 0 ? parseTs(rows[si].at) : null; const startAt = startRow ? parseTs(startRow.at) : null;
+    if (submitAt === null || startAt === null) { skipped.push({ task, reason: '評価の根拠にする申請の start・submit の時刻が決まらない' }); continue; }
+    const items = new Set();
+    for (const e of byTask.get(task)) {
+      const at = parseTs(e.at);
+      if (at === null) { skipped.push({ task, reason: `取り出しの行（seq ${e.seq}）の時刻が読めない` }); continue; }
+      if (at < startAt || at > submitAt) { skipped.push({ task, reason: `取り出しの行（seq ${e.seq}）が、評価の根拠にする申請の着手から申請までの間にない` }); continue; }
+      if (!(sameActor(e.actor, startRow.actor) || (startRow.assignee && sameActor(e.actor, startRow.assignee)))) { skipped.push({ task, reason: `取り出しの行（seq ${e.seq}）の行為者が、その着手の行為者・assignee と違う` }); continue; }
+      for (const id of e.item_ids) if (typeof id === 'string') items.add(id);
+    }
+    if (!items.size) { skipped.push({ task, reason: '数えられる取り出しがない' }); continue; }
+    const row = rows.find((r) => r.op === 'verdict' && r.node === task && r.request === first.request);
     const refId = row && row.refs && Array.isArray(row.refs.verdicts) && row.refs.verdicts.length ? row.refs.verdicts[0].id : verdictId(first.request, 'judge');
-    if (!refId || !isArtifactRef(first.request)) { skipped.push({ task, reason: '証拠の判定の id を作れない' }); continue; }
-    feedback.push({ item_ids: [...byTask.get(task)].sort(), outcome, evidence: { kind: 'verdict', ref: refId, task } });
+    if (!refId) { skipped.push({ task, reason: '証拠の判定の id を作れない' }); continue; }
+    feedback.push({ item_ids: [...items].sort(), outcome, evidence: { kind: 'verdict', ref: refId, task } });
   }
   return { feedback, skipped };
 }

@@ -981,8 +981,8 @@ test('N4：仕様を変えて承認し直した票が、取り込みだけで解
   assert.deepEqual(chain.links.filter((l) => l.rel === 'supersedes').map((l) => [l.from.id.slice(7, 9), l.to.id.slice(7, 9)]), [['22', '11'], ['33', '22']]);
 });
 
-test('N5/N6：RULES は tr.v3。覆われた tr.v1 の行は、根幹の検査と v1 の書式で受け、綴りの衝突は外す。時刻のない v1 の行は記録の時刻で代用する', () => {
-  assert.equal(RULES, 'tr.v3');
+test('N5/N6：RULES は tr.v4。覆われた tr.v1 の行は、根幹の検査と v1 の書式で受け、綴りの衝突は外す。時刻のない v1 の行は記録の時刻で代用する', () => {
+  assert.equal(RULES, 'tr.v4');
   const { t, file } = open();
   const v1 = (x) => forge(file, { type: RECORD_TYPE, op: 'link', rules: 'tr.v1', actor: A.importer, ...x });
   v1({ link: L({ kind: 'release', id: 'REL-v1' }, 'deploys', R.mg) });                        // v1 の規則で正しい（v2 では大文字だけ）
@@ -1141,4 +1141,16 @@ test('語彙：evidence の時刻（at）と結論（result）は書く時に確
   assert.ok(ats.length > 0); for (const x of ats) { assert.ok(!/[+-]\d{4}$/.test(x), x); assert.notEqual(parseTs(x), null, x); }
   assert.equal(r.links.find((l) => l.from.kind === 'ruling').evidence.at, '2026-11-10T23:00:00+09:00');
   assert.deepEqual(open().t.linkMany(A.importer, r.links).refused, []);
+});
+
+test('E-6 判例（tr.v4）：再生で、記録の行為者が正規形でない行（全角の ＯＷＮＥＲ の取り消し・lineage のない行）を状態に入れない', () => {
+  const { file, t } = open();
+  t.link(A.importer, L(R.t1, 'satisfies', R.req));
+  forge(file, { type: RECORD_TYPE, op: 'retract', rules: RULES, cfg: CFG, actor: { kind: 'human', role: 'ＯＷＮＥＲ', id: 'ＯＷＮＥＲ', lineage: 'human' }, target_seq: 1, reason: '取り消す', at: '2026-11-14T09:00:00+09:00' });
+  forge(file, { type: RECORD_TYPE, op: 'link', rules: RULES, cfg: CFG, actor: { kind: 'script', role: 'trace_importer', id: 'trace-importer' }, link: L(R.t2, 'satisfies', R.req), at: '2026-11-14T09:00:00+09:00' });
+  const v = t.verify();
+  assert.equal(v.ok, false);
+  assert.equal(v.rejected_count, 2);
+  assert.ok(v.rejected_rows.every((x) => /正規化/.test(x.reason)));
+  assert.equal(t.state().links[0].retracted, null, '偽の取り消しは効かない');
 });

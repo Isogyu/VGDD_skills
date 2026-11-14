@@ -12,8 +12,8 @@
 // 保証できないこと：
 //   - 行為者・系統は申告である。ここが確かめるのは、名前が表にあり、役割と種類（human・ai・script）が表と合うことまで。
 //     本物かどうか（なりすましでないこと、本当にその系統のモデルか）は確かめられない。
-//   - ai の行為者の系統は、知っている系統（claude・codex）であることだけを確かめ、役割の既定の系統と同じであることは求めない
-//     （例：codex の系統の作業員・憲法審査を名乗れる）。既定の系統は、編成案（team）で型の系統として使う。
+//   - 司法・立法補佐の役割（lineage_fixed）の系統は表の系統に縛る。行政の役割（executive_head・worker・tester）の系統は、知っている AI の系統で
+//     あることだけを確かめる（codex の作業員を名乗れる）。どちらも申告で、本当にその系統のモデルかは確かめられない。
 
 import { Refused } from './chain.mjs';
 
@@ -30,6 +30,9 @@ const ROLE_KINDS = new Set([...KINDS, 'ai+script']);
 /**
  * 役割の表（正本）。名前は capabilities.json の roles を正とする（checkAgainstCapabilities で照合する）。
  *   branch：属する権力。kind：種類（capabilities.json の kind と同じ値）。lineage：既定の系統（ai は編成案の型の系統。人・スクリプトは固定）。
+ *   lineage_fixed：系統が役割で決まっているか（true なら、行為者の申告の系統は表の系統と一致しなければならない。省略すれば表の値で補う）。
+ *     司法の役割は起動の仕方で系統が決まる（judge・constitutional_review は claude -p、codex_judge・codex_security は codex exec。capabilities.json の
+ *     identity）。立法補佐も別のアカウントの Claude。行政の役割（executive_head・worker・tester）は起動する定義しだいなので決めない。
  *   in_capabilities：権限の表（capabilities.json）にある役割か。false のものは「権限の表にまだない役割」（下）。
  *
  * gate_runner は裁判所の執行（Judicial Integration Gate）で、branch は judicial だが判定はしない（kind: script）。
@@ -45,18 +48,18 @@ const ROLE_KINDS = new Set([...KINDS, 'ai+script']);
  */
 export const ROLE_TABLE = Object.freeze(Object.fromEntries(Object.entries({
   owner: { branch: 'sovereign', kind: 'human', lineage: 'human', in_capabilities: true },
-  legislative_assistant: { branch: 'legislative', kind: 'ai', lineage: 'claude', in_capabilities: true },
+  legislative_assistant: { branch: 'legislative', kind: 'ai', lineage: 'claude', in_capabilities: true, lineage_fixed: true },
   executive_head: { branch: 'executive', kind: 'ai', lineage: 'claude', in_capabilities: true },
   worker: { branch: 'executive', kind: 'ai', lineage: 'claude', in_capabilities: true },
   tester: { branch: 'executive', kind: 'ai', lineage: 'claude', in_capabilities: true },
-  judge: { branch: 'judicial', kind: 'ai', lineage: 'claude', in_capabilities: true },
-  codex_judge: { branch: 'judicial', kind: 'ai', lineage: 'codex', in_capabilities: true },
-  constitutional_review: { branch: 'judicial', kind: 'ai', lineage: 'claude', in_capabilities: true },
+  judge: { branch: 'judicial', kind: 'ai', lineage: 'claude', in_capabilities: true, lineage_fixed: true },
+  codex_judge: { branch: 'judicial', kind: 'ai', lineage: 'codex', in_capabilities: true, lineage_fixed: true },
+  constitutional_review: { branch: 'judicial', kind: 'ai', lineage: 'claude', in_capabilities: true, lineage_fixed: true },
   gate_runner: { branch: 'judicial', kind: 'script', lineage: 'script', in_capabilities: true },
   night_runner: { branch: 'executive', kind: 'script', lineage: 'script', in_capabilities: true },
   scribe: { branch: 'clerical', kind: 'ai+script', lineage: null, in_capabilities: true },
   // ---- 権限の表にまだない役割（上の説明） ----
-  codex_security: { branch: 'judicial', kind: 'ai', lineage: 'codex', in_capabilities: false },
+  codex_security: { branch: 'judicial', kind: 'ai', lineage: 'codex', in_capabilities: false, lineage_fixed: true },
   reaper: { branch: 'clerical', kind: 'script', lineage: 'script', in_capabilities: false },
   trace_importer: { branch: 'clerical', kind: 'script', lineage: 'script', in_capabilities: false },
 }).map(([k, v]) => [k, Object.freeze(v)])));
@@ -135,7 +138,8 @@ const ACTOR_KEYS = new Set(['role', 'kind', 'id', 'lineage']);
  *   - 欄は role・kind・id・lineage だけ（ほかは拒む。lineage は省略可）
  *   - role は表にある名前。kind は human・ai・script で、役割の表の kind と合うこと（ai+script の役割はどちらでも可）
  *   - id は NFKC・trim・小文字化の後 ^[a-z0-9][a-z0-9_.-]{0,63}$
- *   - lineage は、human なら 'human'、script なら 'script'（省略すれば補う）、ai なら必須で AI の系統（claude・codex）
+ *   - lineage は、human なら 'human'、script なら 'script'（省略すれば補う）、ai なら AI の系統（claude・codex）。
+ *     役割の表で系統が決まっている役割（lineage_fixed）は、表の系統だけ（省略すれば補う）。それ以外の ai は必須
  */
 export function parseActor(x) {
   const errors = [];
@@ -157,9 +161,11 @@ export function parseActor(x) {
     lineage = x.lineage === undefined ? kind : normLineage(x.lineage);
     if (lineage !== kind) { errors.push(`${kind} の lineage は '${kind}' だけ`); lineage = null; }
   } else if (kind === 'ai') {
-    lineage = x.lineage === undefined ? null : normLineage(x.lineage);
+    const fixed = role && ROLE_TABLE[role].lineage_fixed === true ? ROLE_TABLE[role].lineage : null;
+    lineage = x.lineage === undefined ? fixed : normLineage(x.lineage);
     if (lineage === null) errors.push(`ai の lineage は必須で、知っている AI の系統（${AI_LINEAGES.join('・')}）のどれか`);
     else if (!AI_LINEAGES.includes(lineage)) { errors.push(`ai は lineage '${lineage}' を名乗れない`); lineage = null; }
+    else if (fixed !== null && lineage !== fixed) { errors.push(`役割 ${role} の系統は ${fixed} に決まっている（${lineage} は名乗れない。系統の偽りで別系統の審査を装わせない）`); lineage = null; }
   }
   if (errors.length) return { ok: false, actor: null, errors };
   return { ok: true, actor: { role, kind, id, lineage }, errors: [] };

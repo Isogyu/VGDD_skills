@@ -15,9 +15,9 @@ export { GUARDS } from '../trace.mjs';
 // 行為者は lib/vocab.mjs の形 { role, kind, id, lineage }。ai は lineage（claude・codex）が必須。human・script の lineage は省略すれば補われる。
 // staff（オーナー以外の人）は vocab の役割の表に存在しえない行為者（judge の種類は ai）で、TR-ACTOR-SHAPE で拒まれる見本として残す
 export const A = {
-  importer: { kind: 'script', role: 'trace_importer', id: 'trace-importer' },
-  runner: { kind: 'script', role: 'gate_runner', id: 'gate-runner' },
-  owner: { kind: 'human', role: 'owner', id: 'owner' },
+  importer: { kind: 'script', role: 'trace_importer', id: 'trace-importer', lineage: 'script' },
+  runner: { kind: 'script', role: 'gate_runner', id: 'gate-runner', lineage: 'script' },
+  owner: { kind: 'human', role: 'owner', id: 'owner', lineage: 'human' },
   exec: { kind: 'ai', role: 'executive_head', id: 'claude-exec-1', lineage: 'claude' },
   worker: { kind: 'ai', role: 'worker', id: 'codex-worker-1', lineage: 'codex' },
   judge: { kind: 'ai', role: 'judge', id: 'claude-judge-1', lineage: 'claude' },

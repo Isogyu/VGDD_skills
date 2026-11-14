@@ -53,7 +53,7 @@ import {
 
 export const RECORD_TYPE = 'vgdd.trace.v1';
 /** 規則の版。ガードの規則を変えるたびに上げ、各行に rules として記録する。古い版の行はオーナーの移行の記録（epoch）に覆われるまで状態に入れない */
-export const RULES = 'tr.v3';
+export const RULES = 'tr.v4'; // tr.v4：再生で記録の行為者が正規形であることを確かめる（独立した審査 E-6）
 export const DEFAULT_MAX_LINKS = 20000;
 export const MAX_DEPTH = 64;
 export const DEFAULT_DEPTH = 16;
@@ -375,6 +375,8 @@ function replayWith(records, config, o, pk) {
     const rowCfg = i < covered && rowSpec ? { ...(r.rules === 'tr.v1' ? v1cfg : cfg), ticketMatch: makeWorkItemId(rowSpec) } : (!current && r.rules === 'tr.v1' ? v1cfg : cfg);
     const actor = snapshot(r.actor); const input = inputOf(r);
     if (!actorOk(actor)) { reject(r, '行為者の形が合わない'); return; }
+    // 記録された行為者は正規形でなければならない（全角・大文字の綴りの行を、同じとみなして黙って通さない。runstate と同じ。独立した審査 E-6）
+    if (current && canonical(actor) !== canonical(normActor(actor))) { reject(r, '行為者の綴りが正規化した形と違う'); return; }
     const ctx = { op: r.op, actor, input: snapshot(input), state: st, chain: { ok: true }, config: rowCfg };
     if (r.op === 'epoch') {
       const res = check(ctx, guards.filter((g) => g !== 'TR-RETRACT-TARGET'));

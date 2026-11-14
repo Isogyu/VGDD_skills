@@ -521,24 +521,24 @@ test('規則の版と epoch：古い版の行は、オーナーの移行の記�
     planAB(w); w.start('T-001');
     const recs = openChain(w.file).read();
     assert.ok(recs.every((r) => r.rules === RULES));
-    assert.throws(() => replay(recs, { rules: 'rs.v3' }), (e) => e.code === 'bad_record'); // 版が違う・移行の記録がない
+    assert.throws(() => replay(recs, { rules: 'rs.v9' }), (e) => e.code === 'bad_record'); // 版が違う・移行の記録がない
     const ch = openChain(w.file);
-    const mk = (actor, covers) => ch.append({ type: RECORD_TYPE, rules: 'rs.v3', op: 'epoch', event_id: `ep-${Math.random().toString(36).slice(2)}`, actor, covers, reason: '移行する' });
+    const mk = (actor, covers) => ch.append({ type: RECORD_TYPE, rules: 'rs.v9', op: 'epoch', event_id: `ep-${Math.random().toString(36).slice(2)}`, actor, covers, reason: '移行する' });
     // 行政の移行の記録・ハッシュの合わない移行の記録は覆わない
     mk(EX, { count: recs.length, last_hash: recs[recs.length - 1].hash });
-    assert.throws(() => replay(ch.read(), { rules: 'rs.v3' }), (e) => e.code === 'bad_record');
+    assert.throws(() => replay(ch.read(), { rules: 'rs.v9' }), (e) => e.code === 'bad_record');
   } finally { w.cleanup(); }
   const w2 = mkRun();
   try {
     planAB(w2); w2.start('T-001');
     const ch = openChain(w2.file);
     const recs = ch.read();
-    ch.append({ type: RECORD_TYPE, rules: 'rs.v3', op: 'epoch', event_id: 'ep-ok', actor: OWN, covers: { count: recs.length, last_hash: recs[recs.length - 1].hash }, reason: '規則を上げる' });
-    const st = replay(ch.read(), { rules: 'rs.v3' });
+    ch.append({ type: RECORD_TYPE, rules: 'rs.v9', op: 'epoch', event_id: 'ep-ok', actor: OWN, covers: { count: recs.length, last_hash: recs[recs.length - 1].hash }, reason: '規則を上げる' });
+    const st = replay(ch.read(), { rules: 'rs.v9' });
     assert.equal(st.nodes.get('T-001').status, 'in_progress'); assert.equal(st.epochs, 1); assert.equal(st.covered, recs.length);
     // 覆われなかった後ろの古い版の行は拒む
     ch.append({ type: RECORD_TYPE, rules: RULES, op: 'stop', event_id: 'late-old', actor: OW, reason: 'x' });
-    assert.throws(() => replay(ch.read(), { rules: 'rs.v3' }), (e) => e.code === 'bad_record');
+    assert.throws(() => replay(ch.read(), { rules: 'rs.v9' }), (e) => e.code === 'bad_record');
   } finally { w2.cleanup(); }
 });
 
@@ -1303,4 +1303,118 @@ test('rs.v2 start の assignee: 作業員（worker・tester）の行為者を記
     refused(() => w.go({ role: 'worker', kind: 'ai', id: 'w1', lineage: 'codex' }, { op: 'submit', node: 'T-001', request: R1 }), 'RS-ROLE-OP');
     assert.ok(w.reopen().verify().ok);
   } finally { w.cleanup(); }
+});
+
+// ---- 独立した審査 E の判例と、変異の試験で生き残った変異を殺す試験 ----
+const mR = (config = {}) => { const m = memoryRun({ config: { concurrent_work: 2, ...config } }); let n = 0; m.go = (a, e) => m.apply(a, { event_id: `x${++n}`, ...e }); return m; };
+const rsRefused = (fn) => { try { fn(); } catch (e) { assert.ok(e instanceof Refused, String(e)); return e.violations.map((v) => v.guard); } return null; };
+const cfgEv2 = (m, over) => ({ op: 'config', ...JSON.parse(JSON.stringify(m.state().config)), ...over });
+
+test('E-7 判例：計画の後に保護を足すと、計画済みの節の start・unblock・rule の return を拒む（オーナーは置き換えで出られる）', () => {
+  const m = mR();
+  m.go(EX, { op: 'plan', nodes: [{ id: 'T-101', depends_on: [], resources: ['vgdd/kernel/x'] }, { id: 'T-102', depends_on: [], resources: ['src/a/**'] }] });
+  for (const id of ['T-101', 'T-102']) m.go(OW, { op: 'approve', node: id, spec_digest: S1, policy_line: 'p0.4', def_digest: m.state().nodes[id].def_digest });
+  m.go(OW, cfgEv2(m, { protected: ['vgdd/**'], reason: '統治の核を保護する（締める変更）' }));
+  assert.ok(rsRefused(() => m.go(EX, { op: 'start', node: 'T-101', spec_digest: S1, lease_sec: 60 })).includes('RS-PROTECTED'));
+  assert.equal(m.go(EX, { op: 'start', node: 'T-102', spec_digest: S1, lease_sec: 60 }).to, 'in_progress', '重ならない節は通る（陽性の対照）');
+  // 出口：オーナーが重ならない範囲の節に置き換える
+  assert.equal(m.go(OW, { op: 'plan', nodes: [{ id: 'T-111', depends_on: [], resources: ['src/k/**'] }], supersede: [{ old: 'T-101', new: 'T-111' }] }).ok, true);
+});
+
+test('E-7：unblock と rule の return も保護と比べる', () => {
+  const m = mR();
+  m.go(EX, { op: 'plan', nodes: [{ id: 'T-101', depends_on: [], resources: ['vgdd/x'] }] });
+  m.go(OW, { op: 'approve', node: 'T-101', spec_digest: S1, policy_line: 'p0.4', def_digest: m.state().nodes['T-101'].def_digest });
+  m.go(EX, { op: 'start', node: 'T-101', spec_digest: S1, lease_sec: 60 });
+  m.go(EX, { op: 'submit', node: 'T-101', request: R1 });
+  m.go(CT, { op: 'verdict', node: 'T-101', request: R1, audits: 'passed', verdicts: [J('claude'), J('codex', 'CHANGES_REQUIRED', true)] });
+  assert.equal(m.state().nodes['T-101'].status, 'blocked');
+  m.go(OW, cfgEv2(m, { protected: ['vgdd/**'], reason: '締める' }));
+  assert.ok(rsRefused(() => m.go(OW, { op: 'rule', node: 'T-101', request: R1, decision: 'return', reason: '差し戻す' })).includes('RS-PROTECTED'));
+  assert.ok(rsRefused(() => m.go(OW, { op: 'unblock', node: 'T-101', reason: '再開' })).includes('RS-PROTECTED'));
+  assert.equal(m.go(OW, { op: 'rule', node: 'T-101', request: R1, decision: 'merge', reason: '通す' }).to, 'merged', '統合の裁定は作業に入らないので通る');
+});
+
+test('E-8 判例：票の ID の宣言を変えた後も、既存の節への依存・置き換えは存在の確認だけで通る。新しい節の id は今の宣言', () => {
+  const m = mR();
+  m.go(EX, { op: 'plan', nodes: [{ id: 'T-101', depends_on: [], resources: ['a/**'] }] });
+  m.go(OW, cfgEv2(m, { work_item: { prefix: 'U-', digits: [3, 4] }, reason: 'prefix を変える' }));
+  assert.equal(m.go(EX, { op: 'plan', nodes: [{ id: 'U-101', depends_on: ['T-101'], resources: ['b/**'] }] }).ok, true);
+  assert.equal(m.go(OW, { op: 'plan', nodes: [{ id: 'U-102', depends_on: [], resources: ['a/**'] }], supersede: [{ old: 'T-101', new: 'U-102' }] }).ok, true);
+  assert.ok(rsRefused(() => m.go(EX, { op: 'plan', nodes: [{ id: 'T-102', depends_on: [], resources: ['c/**'] }] })).includes('RS-WORK-ITEM-ID'));
+  assert.ok(rsRefused(() => m.go(EX, { op: 'plan', nodes: [{ id: 'U-103', depends_on: ['T-999'], resources: ['d/**'] }] })).includes('RS-WORK-ITEM-ID'), 'まだない節への依存は宣言で確かめる');
+});
+
+test('R26：event_id の一意性の鍵は役割ごと。行政が先に使った event_id で、オーナーの出来事を塞げない', () => {
+  const m = memoryRun({ config: { concurrent_work: 2 } });
+  m.apply(EX, { op: 'plan', event_id: 'same-1', nodes: [{ id: 'T-101', depends_on: [], resources: ['a/**'] }] });
+  const r = m.apply(OW, { op: 'plan', event_id: 'same-1', nodes: [{ id: 'T-102', depends_on: [], resources: ['b/**'] }] });
+  assert.equal(r.duplicate, false);
+  assert.deepEqual(m.state().order, ['T-101', 'T-102']);
+});
+
+test('R27・R28：役割と操作の表の総当たり（全部の操作 × 全部の役割）。起こせない組はすべて RS-ROLE-OP で拒む', async () => {
+  const V = await import('../lib/vocab.mjs');
+  const ALLOWED = {
+    config: ['owner'], clock_reset: ['owner'], plan: ['executive_head', 'owner'], approve: ['owner'], start: ['executive_head', 'night_runner'], submit: ['executive_head', 'night_runner'],
+    verdict: ['gate_runner'], release: ['owner'], rule: ['owner'], unblock: ['owner'], annul: ['owner'], expire: ['gate_runner', 'night_runner', 'reaper'], stop: ['owner'], resume: ['owner'], epoch: ['owner'],
+  };
+  const m = memoryRun({ config: { concurrent_work: 2 } });
+  let checked = 0;
+  for (const role of V.ROLES) {
+    const info = V.ROLE_TABLE[role];
+    const kind = info.kind === 'ai+script' ? 'script' : info.kind;
+    const actor = { role, kind, id: `x-${role.replace(/_/g, '-')}`, ...(kind === 'ai' && !info.lineage_fixed ? { lineage: 'claude' } : {}) };
+    assert.ok(parseActor(actor).ok, role);
+    for (const op of Object.keys(ALLOWED)) {
+      const ev = { op, event_id: 'zz', ...SAMPLE[op] };
+      assert.equal(parseEvent(ev).ok, true, op);
+      const r = check(makeCtx(m.st, actor, ev), ['RS-ROLE-OP']);
+      assert.equal(r.ok, ALLOWED[op].includes(role), `${role} × ${op}`);
+      checked += 1;
+    }
+  }
+  assert.equal(checked, V.ROLES.length * 15);
+  assert.deepEqual(Object.keys(ALLOWED).sort(), [...rsOps()].sort());
+});
+const SAMPLE = {
+  config: JSON.parse(JSON.stringify(DEFAULT_CONFIG)), clock_reset: { reason: 'r' }, plan: { nodes: [{ id: 'T-101', depends_on: [], resources: ['a/**'] }] },
+  approve: { node: 'T-101', spec_digest: S1, policy_line: 'p0.4', def_digest: S1 }, start: { node: 'T-101', spec_digest: S1, lease_sec: 60 }, submit: { node: 'T-101', request: R1 },
+  verdict: { node: 'T-101', request: R1, audits: 'passed', verdicts: [J('claude')] }, release: { node: 'T-101', request: R1 }, rule: { node: 'T-101', request: R1, decision: 'merge', reason: 'r' },
+  unblock: { node: 'T-101', reason: 'r' }, annul: { node: 'T-101', reason: 'r' }, expire: { node: 'T-101' }, stop: { reason: 'r' }, resume: { reason: 'r' }, epoch: { covers: { count: 0, last_hash: 'genesis' }, reason: 'r' },
+};
+const rsOps = () => ['config', 'clock_reset', 'plan', 'approve', 'start', 'submit', 'verdict', 'release', 'rule', 'unblock', 'annul', 'expire', 'stop', 'resume', 'epoch'];
+
+test('R25：config の必須の審査に、審査の種類に写せない系統（human・script・知らない系統）は書けない', () => {
+  const base = { op: 'config', event_id: 'c', ...JSON.parse(JSON.stringify(DEFAULT_CONFIG)) };
+  for (const l of ['human', 'script', 'gemini']) {
+    assert.equal(parseEvent({ ...base, judiciary: [{ kind: 'judge', lineage: 'claude' }, { kind: 'judge', lineage: l }] }).ok, false, l);
+    assert.equal(parseEvent({ ...base, security_lineage: l }).ok, false, l);
+  }
+  assert.equal(parseEvent(base).ok, true);
+});
+
+test('R14：申請の履歴は 100 件まで。超えたら古いものから落とし、落とした数を requests_dropped に数える', () => {
+  const m = mR({ max_returns: 3, max_attempts: 10 });
+  m.go(EX, { op: 'plan', nodes: [{ id: 'T-101', depends_on: [], resources: ['a/**'] }] });
+  m.go(OW, { op: 'approve', node: 'T-101', spec_digest: S1, policy_line: 'p0.4', def_digest: m.state().nodes['T-101'].def_digest });
+  let k = 0;
+  const req = () => (k += 1).toString(16).padStart(40, '0');
+  m.go(EX, { op: 'start', node: 'T-101', spec_digest: S1, lease_sec: 60 });
+  for (let guard = 0; guard < 400 && m.state().nodes['T-101'].requests.length + m.state().nodes['T-101'].requests_dropped < 105; guard += 1) {
+    const n = m.state().nodes['T-101'];
+    if (n.status === 'blocked') { m.go(OW, { op: 'unblock', node: 'T-101', reason: '続ける', extra_returns: 3, extra_attempts: 5 }); continue; }
+    if (n.status === 'ready') { m.go(EX, { op: 'start', node: 'T-101', spec_digest: S1, lease_sec: 60 }); continue; }
+    const q = req();
+    m.go(EX, { op: 'submit', node: 'T-101', request: q });
+    m.go(CT, { op: 'verdict', node: 'T-101', request: q, audits: 'failed', verdicts: [J('claude'), J('codex')] });
+  }
+  const n = m.state().nodes['T-101'];
+  assert.equal(n.requests.length, 100);
+  assert.ok(n.requests_dropped >= 5);
+});
+
+test('R05：RS-PROTECTED は範囲を NFKC にしてから比べる（全角の ｖｇｄｄ/x は vgdd/** と重なる）', () => {
+  const m = mR({ protected: ['vgdd/**'] });
+  assert.ok(rsRefused(() => m.go(EX, { op: 'plan', nodes: [{ id: 'T-101', depends_on: [], resources: ['ｖｇｄｄ/x'] }] })).includes('RS-PROTECTED'));
 });

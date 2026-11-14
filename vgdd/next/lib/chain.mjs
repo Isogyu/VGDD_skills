@@ -38,7 +38,8 @@ export function canonical(v) {
 /** 対象の指紋（承認・評価を対象に結び付けるために使う。INV-06 と同じ考え方） */
 export const digest = (v) => `sha256:${sha256(canonical(v))}`;
 
-export const nowIso = () => new Date(Date.now() + 9 * 3600e3).toISOString().replace(/\.\d+Z$/, '+09:00');
+/** 記録の時刻（日本時間・ミリ秒まで。別の鎖の行と前後を比べる bridge.feedbackFromRun のために、秒より細かく残す） */
+export const nowIso = () => new Date(Date.now() + 9 * 3600e3).toISOString().replace(/Z$/, '+09:00');
 
 const RESERVED = ['seq', 'at', 'prev', 'hash'];
 

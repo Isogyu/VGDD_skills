@@ -21,7 +21,7 @@ const A = {
   runner: { role: 'gate_runner', kind: 'script', id: 'conformance-runner', lineage: 'script' },
   judge: { role: 'judge', kind: 'ai', id: 'claude-judge-1', lineage: 'claude' },
   codexJudge: { role: 'codex_judge', kind: 'ai', id: 'codex-judge-1', lineage: 'codex' },
-  codexConst: { role: 'constitutional_review', kind: 'ai', id: 'codex-const-1', lineage: 'codex' },
+  codexConst: { role: 'constitutional_review', kind: 'ai', id: 'claude-const-1', lineage: 'claude' },
   owner: { role: 'owner', kind: 'human', id: 'owner', lineage: 'human' },
 };
 const GOOD = { before: { total: 100, passed: 98 }, after: { total: 102, passed: 100 }, new_cases_fail_on_before: 2 };
@@ -103,23 +103,33 @@ test('役割の分離：自己評価・提案者や評価者の審査・同じ�
 test('評価の証拠は AI が出せない', () => {
   const { im } = open();
   const p = im.propose(A.claude, playbook());
-  refusedBy(() => im.evaluate(A.codexWorker, p.id, { digest: p.digest, evidence: { conformance: GOOD } }), 'IM-EVALUATOR-NOT-AI');
+  refusedBy(() => im.evaluate(A.codexWorker, p.id, { digest: p.digest, evidence: { conformance: GOOD } }), 'IM-EVALUATOR-ROLE');
   // 人の評価は通る
   im.evaluate({ role: 'owner', kind: 'human', id: 'reviewer-human', lineage: 'human' }, p.id, { digest: p.digest, evidence: { conformance: GOOD } });
 });
 
-test('審査者：司法の役割だけ・提案者と別系統（経験の層でも例外なし）', () => {
+test('審査者：司法の役割だけ。採用には提案者と別系統の APPROVED が要る（im.v4。経験の層でも例外なし）', () => {
   const { im } = open();
   const p = im.propose(A.claude, playbook());
   im.evaluate(A.runner, p.id, { digest: p.digest, evidence: { conformance: GOOD } });
   const r = () => ({ digest: p.digest, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(p.id).digest });
   refusedBy(() => im.review({ role: 'tester', kind: 'ai', id: 't', lineage: 'codex' }, p.id, r()), 'IM-JUDICIAL-REVIEWER');
   refusedBy(() => im.review({ role: 'judge', kind: 'script', id: 's', lineage: 'x' }, p.id, r()), 'IM-JUDICIAL-REVIEWER');
-  refusedBy(() => im.review(A.judge, p.id, r()), 'IM-CROSS-LINEAGE');
+  // im.v4：同じ系統の司法も審査できるが、それだけでは採用できない
+  im.review(A.judge, p.id, r());
+  refusedBy(() => adopt(im, im.get(p.id)), 'IM-CROSS-LINEAGE');
   const e = im.propose(A.claude, { title: '経験の昇格', tier: 'experience', target: { item: 'EXP-12' }, content: { promote: 'EXP-12' } });
   im.evaluate(A.runner, e.id, { digest: e.digest, evidence: { conformance: GOOD } });
-  refusedBy(() => im.review(A.judge, e.id, { digest: e.digest, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(e.id).digest }), 'IM-CROSS-LINEAGE');
+  im.review(A.judge, e.id, { digest: e.digest, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(e.id).digest });
+  refusedBy(() => adopt(im, im.get(e.id)), 'IM-CROSS-LINEAGE');
   im.review(A.codexJudge, e.id, { digest: e.digest, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(e.id).digest });
+  assert.equal(adopt(im, im.get(e.id)).status, 'adopted', '別系統の APPROVED が加われば採用できる（陽性の対照）');
+  // 同じ系統の差し戻しは効く（系統を問わない）
+  const c = im.propose(A.claude, playbook({ title: '同系統の差し戻し' }));
+  im.evaluate(A.runner, c.id, { digest: c.digest, evidence: { conformance: GOOD } });
+  im.review(A.judge, c.id, { digest: c.digest, verdict: 'CHANGES_REQUIRED', findings: [], review_input_digest: im.reviewInputFor(c.id).digest });
+  im.review(A.codexJudge, c.id, { digest: c.digest, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(c.id).digest });
+  refusedBy(() => adopt(im, im.get(c.id)), 'IM-ADOPT-REQUIRES-APPROVAL');
 });
 
 test('審査の入力は機械の組み立てたものだけ（rationale を混ぜた入力・古い入力の審査は止まる）', () => {
@@ -508,7 +518,8 @@ test('N2：引き継いだ差し戻しの行き止まりは、オーナーの解
   { const { im, p } = crBase({ name: 'w' });
     const q = toReviewed(im, pbT({ name: 'w' }), { proposer: A.codexWorker, reviewers: [{ ...A.judge, id: 'claude-judge-2' }] });
     assert.equal(q.digest, p.digest); assert.deepEqual(q.inheritedCR, ['codex-judge-1']);
-    refusedBy(() => im.review(A.codexJudge, q.id, { digest: q.digest, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(q.id).digest }), 'IM-CROSS-LINEAGE');
+    // im.v4：同じ系統の codex の審査者も審査はできる（系統の衝突だけでは行き止まりにならない）。ここではオーナーの解除の出口を確かめる
+    assert.equal(IMOD.check(im.contextFor('review', A.codexJudge, q.id, { digest: q.digest, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(q.id).digest }), ['IM-CROSS-LINEAGE', 'IM-JUDICIAL-REVIEWER']).ok, true);
     refusedBy(() => adopt(im, q), 'IM-CR-STICKY');
     refusedBy(() => im.dismissChangesRequired(A.claude, q.id, { reviewer: 'codex-judge-1', reason: '解く' }), 'IM-OWNER-DECIDES');
     refusedBy(() => im.dismissChangesRequired(A.codexConst, q.id, { reviewer: 'codex-judge-1', reason: '解く' }), 'IM-OWNER-DECIDES');
@@ -622,21 +633,23 @@ test('im.v3 判例：claude の提案を、同じ系統の別名（anthropic・o
   const { im } = open();
   const p = toReviewed(im, playbook(), { reviewers: [A.codexJudge] });
   assert.equal(p.status, 'reviewed');
-  // 大文字の Claude は vocab で claude にそろうので、claude の提案に対しては同じ系統として拒む
+  // 大文字の Claude は vocab で claude にそろうので、claude の提案に対しては同じ系統：審査はできるが、採用の時の別系統の数に入らない
   const q = im.propose({ ...A.claude, id: 'claude-exec-5' }, playbook({ title: '別' }));
   im.evaluate(A.runner, q.id, { digest: q.digest, evidence: { conformance: GOOD } });
-  refusedBy(() => im.review({ ...A.judge, lineage: 'Claude' }, q.id, { digest: q.digest, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(q.id).digest }), 'IM-CROSS-LINEAGE');
+  im.review({ ...A.judge, lineage: 'Claude' }, q.id, { digest: q.digest, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(q.id).digest });
+  refusedBy(() => adopt(im, im.get(q.id)), 'IM-CROSS-LINEAGE');
 });
 
-test('im.v3：審査者は vocab の表で判定する司法の役割だけ（court・表にない名前・gate_runner は不可。codex_security は可）', () => {
+test('im.v4：審査者は権限の表にある判定する司法の役割だけ（court・表にない名前・gate_runner・権限の表にまだない codex_security は不可）', () => {
   const { im } = open();
   const p = im.propose(A.claude, playbook());
   im.evaluate(A.runner, p.id, { digest: p.digest, evidence: { conformance: GOOD } });
   const inp = () => ({ digest: p.digest, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(p.id).digest });
   refusedBy(() => im.review({ role: 'court', kind: 'ai', id: 'c', lineage: 'codex' }, p.id, inp()), 'IM-ACTOR-SHAPE');
   refusedBy(() => im.review({ role: 'gate_runner', kind: 'script', id: 'g' }, p.id, inp()), 'IM-JUDICIAL-REVIEWER');
-  assert.equal(im.review({ role: 'codex_security', kind: 'ai', id: 'sec-1', lineage: 'codex' }, p.id, inp()).status, 'reviewed');
-  assert.deepEqual([...IMOD.JUDICIAL_ROLES].sort(), ['codex_judge', 'codex_security', 'constitutional_review', 'judge']);
+  refusedBy(() => im.review({ role: 'codex_security', kind: 'ai', id: 'sec-1', lineage: 'codex' }, p.id, inp()), 'IM-JUDICIAL-REVIEWER');
+  assert.equal(im.review(A.codexJudge, p.id, inp()).status, 'reviewed');
+  assert.deepEqual([...IMOD.JUDICIAL_ROLES].sort(), ['codex_judge', 'constitutional_review', 'judge']);
 });
 
 test('im.v3：行に設定の写し（cfg.max_open）を残し、別の上限で開き直すと再生で拒む。オーナーの epoch の後は使える', () => {
@@ -652,4 +665,50 @@ test('im.v3：行に設定の写し（cfg.max_open）を残し、別の上限で
   assert.equal(im2.verify().ok, true);
   assert.equal(im2.propose(A.claude, playbook({ title: '移行の後' })).status, 'proposed');
   assert.equal(open().im.verify().ok, true);
+});
+
+// ---- im.v4：独立した審査 E の判例 ----
+test('E-2 判例：系統が役割で決まる司法は系統を偽れない。Claude の提案者の緩める法律は、憲法審査（claude）＋ codex の judge ＋オーナーで正直に通る', () => {
+  const { im } = open();
+  const loosen = structuredClone(caps); loosen.capabilities.find((c) => c.id === 'CAP-LAW-WRITE').allowed.push('worker');
+  const p = im.propose(A.claude, { title: '緩める', tier: 'law', target: { paths: ['vgdd/kernel/capabilities.json'] }, content: { capabilities: loosen }, capabilities: { old: caps, new: loosen } });
+  im.evaluate(A.runner, p.id, { digest: p.digest, evidence: { conformance: GOOD } });
+  const inp = () => ({ digest: p.digest, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(p.id).digest });
+  refusedBy(() => im.review({ ...A.judge, id: 'fake', lineage: 'codex' }, p.id, inp()), 'IM-ACTOR-SHAPE');
+  refusedBy(() => im.review({ ...A.codexConst, id: 'fake-const', lineage: 'codex' }, p.id, inp()), 'IM-ACTOR-SHAPE');
+  im.review(A.codexConst, p.id, inp());
+  refusedBy(() => adopt(im, im.get(p.id)), 'IM-CROSS-LINEAGE'); // 憲法審査（同じ系統）だけでは採用できない
+  im.review(A.codexJudge, p.id, inp());
+  assert.equal(adopt(im, im.get(p.id)).status, 'adopted');
+  // 省略した系統は表の値で補う（記録には決まった系統が残る）
+  assert.deepEqual(im.get(p.id).reviews.map((r) => r.actor.lineage), ['claude', 'codex']);
+});
+
+test('E-2：codex の提案者には claude の judge が別系統。codex の judge だけでは採用できない', () => {
+  const { im } = open();
+  const p = toReviewed(im, playbook(), { proposer: A.codexWorker, reviewers: [A.codexJudge] });
+  refusedBy(() => adopt(im, p), 'IM-CROSS-LINEAGE');
+  im.review(A.judge, p.id, { digest: p.digest, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(p.id).digest });
+  assert.equal(adopt(im, im.get(p.id)).status, 'adopted');
+});
+
+test('E-3 判例：評価の証拠は gate_runner と人のオーナーだけ（夜間の代行・回収・書記のスクリプトは出せない）', () => {
+  const { im } = open();
+  const p = im.propose(A.claude, playbook());
+  const ev = (who) => () => im.evaluate(who, p.id, { digest: p.digest, evidence: { conformance: GOOD } });
+  for (const who of [{ role: 'night_runner', kind: 'script', id: 'nr' }, { role: 'reaper', kind: 'script', id: 'rp' }, { role: 'scribe', kind: 'script', id: 'sc' }, { role: 'trace_importer', kind: 'script', id: 'ti' }, A.codexWorker]) refusedBy(ev(who), 'IM-EVALUATOR-ROLE');
+  assert.equal(ev(A.runner)().status, 'evaluated');
+  assert.equal(ev({ role: 'owner', kind: 'human', id: 'owner-2' })().status, 'evaluated');
+});
+
+test('E-6 判例：再生で、記録の行為者が正規形でない行（全角の ＯＷＮＥＲ）を拒む', () => {
+  const { im, file } = open();
+  const p = toReviewed(im);
+  const recs = fs.readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse);
+  const full = { type: 'vgdd.improvement.v1', rules: IMOD.RULES, cfg: { max_open: 5 }, op: 'reject', id: p.id, actor: { role: 'ＯＷＮＥＲ', kind: 'human', id: 'ＯＷＮＥＲ', lineage: 'human' }, reason: '却下', seq: recs.length + 1, at: '2026-11-14T09:00:00+09:00', prev: recs[recs.length - 1].hash };
+  const hash = sha256(canonical(full));
+  fs.appendFileSync(file, JSON.stringify({ ...full, hash }) + '\n'); fs.writeFileSync(`${file}.head`, JSON.stringify({ seq: full.seq, hash }) + '\n');
+  const v = im.verify();
+  assert.equal(v.ok, false);
+  assert.match(v.detail, /正規化/);
 });

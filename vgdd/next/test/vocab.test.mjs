@@ -157,3 +157,20 @@ test('拒否の形：Refused(guard_violation) と violations の配列', () => {
   assert.deepEqual([...V.VERDICTS], ['APPROVED', 'CHANGES_REQUIRED', 'UNAVAILABLE']);
   assert.deepEqual([...V.AUDIT_RESULTS], ['passed', 'failed', 'not_run']);
 });
+
+test('E-2：系統が役割で決まる役割（司法・立法補佐）は、表の系統だけを名乗れる（省略は補う）。審査の種類・runstate の必須の審査・team の型の系統と一貫している', async () => {
+  const fixed = V.ROLES.filter((r) => V.ROLE_TABLE[r].lineage_fixed);
+  assert.deepEqual(fixed.sort(), ['codex_judge', 'codex_security', 'constitutional_review', 'judge', 'legislative_assistant']);
+  assert.deepEqual(V.normActor({ role: 'judge', kind: 'ai', id: 'j' }), { role: 'judge', kind: 'ai', id: 'j', lineage: 'claude' });
+  assert.equal(V.normActor({ role: 'judge', kind: 'ai', id: 'j', lineage: 'codex' }), null);
+  assert.equal(V.normActor({ role: 'constitutional_review', kind: 'ai', id: 'c', lineage: 'codex' }), null);
+  assert.equal(V.normActor({ role: 'codex_judge', kind: 'ai', id: 'c', lineage: 'claude' }), null);
+  assert.ok(V.normActor({ role: 'worker', kind: 'ai', id: 'w', lineage: 'codex' }), '行政の役割の系統は縛らない');
+  assert.equal(V.normActor({ role: 'worker', kind: 'ai', id: 'w' }), null, '縛らない役割の系統は必須');
+  for (const m of V.REVIEW_MODES) if (m.role) assert.equal(V.ROLE_TABLE[m.role].lineage, m.lineage, m.mode);
+  const { DEFAULT_CONFIG } = await import('../runstate.mjs');
+  for (const j of DEFAULT_CONFIG.judiciary) assert.ok(V.ROLE_TABLE[V.roleOfMode(V.reviewModeOf('judge', j.lineage))].lineage === j.lineage);
+  const { catalogFromCapabilities } = await import('../team.mjs');
+  const cat = catalogFromCapabilities(CAPS);
+  for (const r of fixed.filter((x) => Object.hasOwn(cat, x))) assert.equal(cat[r].lineage, V.ROLE_TABLE[r].lineage, r);
+});

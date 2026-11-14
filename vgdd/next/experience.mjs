@@ -40,13 +40,13 @@
 
 import { openChain, digest, canonical, Refused, nowIso } from './lib/chain.mjs';
 import { scrub } from '../scripts/prior-record.mjs';
-import { parseActor, normActor, normRole as vocabNormRole, isJudicialRole as vocabIsJudicial, isCourtSide, isOwner, makeWorkItemId, parseWorkItemSpec, sameWorkItemSpec, DEFAULT_WORK_ITEM, parseTs, isTs, isLineHash, refusal } from './lib/vocab.mjs';
+import { branchOf, parseActor, normActor, normRole as vocabNormRole, isJudicialRole as vocabIsJudicial, isCourtSide, isOwner, makeWorkItemId, parseWorkItemSpec, sameWorkItemSpec, DEFAULT_WORK_ITEM, parseTs, isTs, isLineHash, refusal } from './lib/vocab.mjs';
 
 export { Refused };
 
 export const RECORD_TYPE = 'vgdd.experience.v1';
 /** 規則の版。ガードの規則を変えるたびに上げる。各行に rules として記録する（improvement.mjs・trace.mjs と同じ。epoch で古い行を覆う） */
-export const RULES = 'ex.v1';
+export const RULES = 'ex.v2'; // ex.v2：取り出しの行為者、採用済みの項目の自動の引退の禁止、移行の記録のガード、行為者の正規形（独立した審査 E-1・E-5・E-6）
 const KINDS = ['verdict_finding', 'gate_event', 'owner_ruling', 'worker_report', 'obs'];
 const GROUNDED_KINDS = new Set(['verdict_finding', 'gate_event', 'owner_ruling']);   // obs は未検証の扱い（保守的）
 export const MAX_TEXT = 600;
@@ -344,6 +344,9 @@ export const GUARDS = {
     if (normActor(c.actor).kind === 'script') {
       if (!isCourtSide(normActor(c.actor).role)) return 'スクリプトで引退させられるのは裁判所の側（gate_runner）だけ（feedback と同じ。行政の代行・回収のスクリプトは引退させられない）';
       if (!c.target) return null;   // 存在しないことは EX-RETIRE-STATE
+      // オーナーが採用した項目は、スクリプトの自動の引退の対象にしない（評価は代理の指標で、取り出しの申告から操られうる。独立した審査 E-1）。
+      // 採用済みの項目の引退はオーナーだけ。閾値を超えた採用済みの項目は inspect・summary でオーナーへの注意として出す
+      if (c.target.status !== 'candidate') return `スクリプトが引退させられるのは候補（candidate）の項目だけ（${c.target.status} の項目の引退はオーナーだけ）`;
       const th = c.opts?.retireHarmful ?? DEFAULTS.retireHarmful;
       return c.target.harmful >= th && c.target.harmful > c.target.helpful ? null : `スクリプトが引退させられるのは harmful >= ${th} かつ harmful > helpful のときだけ`;
     }
@@ -383,6 +386,15 @@ export const GUARDS = {
     const k = refKey(c.raw.evidence.ref);
     const dup = c.raw.item_ids.find((id) => c.state.seen.has(`${k}\u0000${id}`));
     return dup ? `同じ証拠（${c.raw.evidence.ref}。表記ゆれは同一とみなす）はこの項目（${dup}）にすでに数えた（水増しの防止）` : null;
+  },
+
+  // 取り出す者（行為者）を必須にし、記録に残す（独立した審査 E-1：誰が、どの票のために取り出したかが申告だけだと、評価を操れる）。
+  // 取り出せるのは行政の側の役割（executive_head・worker・tester・night_runner）だけ。司法・裁判所の側・人・書記は取り出さない
+  'EX-RETRIEVE-ACTOR': (c) => {
+    if (c.op !== 'retrieve') return null;
+    const a = parseActor(c.actor);
+    if (!a.ok) return `取り出す者（actor）が vocab の行為者でない：${a.errors[0]}`;
+    return branchOf(a.actor.role) === 'executive' ? null : `取り出せるのは行政の側の役割だけ（${a.actor.role} は取り出せない）`;
   },
 
   'EX-RETRIEVE-JUDGE': (c) => {
@@ -529,16 +541,22 @@ function optsOfCfg(cfg, base = {}) {
 const sameCfg = (a, b) => isObj(a) && isObj(b) && a.min_sources === b.min_sources && a.retire_harmful === b.retire_harmful && sameWorkItemSpec(a.work_item, b.work_item);
 
 /** 移行の記録が覆う行の数（今の版・オーナー・覆う範囲がその前の行と一致するものだけ） */
-function coveredCount(records) {
+function coveredCount(records, opts = {}) {
   let n = 0;
   records.forEach((r, i) => {
     if (!isObj(r) || r.type !== RECORD_TYPE || r.op !== 'epoch' || r.rules !== RULES || !isOwner(r.actor) || !isObj(r.covers)) return;
     const c = r.covers.count;
     if (c !== i || !(r.covers.last_hash === (c === 0 ? 'genesis' : (records[c - 1] || {}).hash)) || !(c === 0 || isLineHash(r.covers.last_hash))) return;
+    // 移行の記録そのものもガードに通す（trace と同じ作り。独立した審査 E-5：理由のない・時刻の読めない・綴りの崩れた epoch に覆わせない）
+    const at = parseTs(r.at);
+    if (at === null || !actorCanonical(r)) return;
+    if (!check(ctxFromEvent(emptyState(), r, at, opts), ['EX-ACTOR', 'EX-EPOCH-OWNER']).ok) return;
     n = Math.max(n, c);
   });
   return n;
 }
+/** 記録された行為者が正規形か（runstate と同じ。全角・大文字の綴りの行を、同じとみなして黙って通さない。独立した審査 E-6） */
+const actorCanonical = (r) => isObj(r.actor) && canonical(r.actor) === canonical(normActor(r.actor));
 
 /**
  * 行の列から現在の状態を作り直す。各行を、そのときの時刻（at）と状態でガードに通し、通らないものは rejected に残す。
@@ -549,7 +567,7 @@ function coveredCount(records) {
 export function reduce(records, opts = {}, o = {}) {
   const st = emptyState();
   const cur = cfgCopy(opts);
-  const covered = o.pendingEpoch ? records.length : coveredCount(records);
+  const covered = o.pendingEpoch ? records.length : coveredCount(records, opts);
   records.forEach((rec, i) => {
     try {
       if (!isObj(rec) || rec.type !== RECORD_TYPE || !OPS.includes(rec.op)) throw new Error('知らない行');
@@ -561,8 +579,11 @@ export function reduce(records, opts = {}, o = {}) {
       }
       const rowOpts = current ? { ...opts, taskMatch: makeWorkItemId(opts.workItem || DEFAULT_WORK_ITEM) } : optsOfCfg(rec.cfg, opts);
       if (!rowOpts) throw new Error('設定の写し（cfg）が読めない');
+      if (!actorCanonical(rec)) { st.rejected.push({ seq: rec.seq, op: rec.op, violations: [{ guard: 'EX-ACTOR', reason: '記録された行為者が正規形でない（綴りが vocab の正規化の後と違う）' }] }); return; }
       if (rec.op === 'retrieved') {
         if (!Array.isArray(rec.item_ids) || typeof rec.role !== 'string') throw new Error('retrieved の形が不正');
+        const rc = check({ op: 'retrieve', actor: rec.actor, audience: { role: rec.role } }, ['EX-RETRIEVE-ACTOR', 'EX-RETRIEVE-JUDGE']);
+        if (!rc.ok) { st.rejected.push({ seq: rec.seq, op: rec.op, violations: rc.violations }); return; }
         applyEvent(st, rec, rec.seq); return;
       }
       const at = parseTs(rec.at);
@@ -653,6 +674,7 @@ export function openExperience(file, opt = {}) {
   if (!workItem) throw new Refused('bad_config', 'workItem は票の ID の宣言 { prefix, digits: [最小, 最大] }');
   const opts = { minSources: opt.minSources ?? DEFAULTS.minSources, retireHarmful: opt.retireHarmful ?? DEFAULTS.retireHarmful, workItem, verifyRef: opt.verifyRef };
   const state = () => reduce(chain.read(), opts);
+  const needsAttention = (it) => it.status === 'adopted' && it.harmful >= opts.retireHarmful && it.harmful > it.helpful;
 
   function mutate(op, actor, args) {
     const body = { type: RECORD_TYPE, rules: RULES, cfg: cfgCopy(opts) };
@@ -693,19 +715,27 @@ export function openExperience(file, opt = {}) {
       return { item: structuredClone(it), digest: itemDigest(it), warnings: [
         ...(it.flags.some((f) => f !== 'invisible_chars') ? [`命令らしい文を含む印: ${it.flags.filter((f) => f !== 'invisible_chars').join(', ')}（内容を確かめ、acknowledgeFlags: true を付けて昇格する）`] : []),
         ...(it.flags.includes('invisible_chars') ? ['不可視の文字（制御・書式文字）を含む。確認は要らないが、内容を目で確かめる'] : []),
+        ...(needsAttention(it) ? [`採用済みだが harmful ${it.harmful} > helpful ${it.helpful}（閾値 ${opts.retireHarmful}）。自動では引退させない。オーナーが確かめて引退させるか決める`] : []),
       ] };
+    },
+    /** 件数と、オーナーへの注意（harmful が閾値を超えた採用済みの項目。自動の引退の対象にしない） */
+    summary() {
+      const st = state();
+      const by = { candidate: 0, adopted: 0, retired: 0 };
+      for (const it of st.items.values()) by[it.status] = (by[it.status] || 0) + 1;
+      return { rules: RULES, items: st.items.size, by_status: by, rejected: st.rejected.length, uncovered: st.uncovered, attention: [...st.items.values()].filter(needsAttention).map((it) => it.id).sort() };
     },
     add: (actor, item) => mutate('add', actor, item),
     induce: (actor, args) => mutate('induce', actor, args),
     promote: (actor, id, o = {}) => mutate('promote', actor, { id, digest: o.digest, acknowledgeFlags: o.acknowledgeFlags }),
     retire: (actor, id, o = {}) => mutate('retire', actor, { id, reason: o.reason }),
     feedback: (actor, args) => mutate('feedback', actor, args),
-    /** harmful が閾値を超えた項目を、スクリプトの行為者で引退させる。引退させた id の配列を返す */
+    /** harmful が閾値を超えた候補（candidate）の項目を、裁判所の側のスクリプトで引退させる。採用済みの項目は引退させない（summary の attention に出る）。引退させた id の配列を返す */
     autoRetire(actor) {
       const th = opts.retireHarmful ?? DEFAULTS.retireHarmful;
       const done = [];
       for (const it of state().items.values()) {
-        if (it.status !== 'retired' && it.harmful >= th && it.harmful > it.helpful) { mutate('retire', actor, { id: it.id, reason: `harmful ${it.harmful} > helpful ${it.helpful}（自動）` }); done.push(it.id); }
+        if (it.status === 'candidate' && it.harmful >= th && it.harmful > it.helpful) { mutate('retire', actor, { id: it.id, reason: `harmful ${it.harmful} > helpful ${it.helpful}（自動）` }); done.push(it.id); }
       }
       return done;
     },
@@ -714,7 +744,7 @@ export function openExperience(file, opt = {}) {
      * 作業員への指示に添える経験を取り出す。司法の役割には渡さない。取り出したことを retrieved として記録する。
      * @returns { items, rendered, searchKind, refused? }
      */
-    retrieve({ audience, query = {}, limit = 5, maxChars = 2000, ...rest } = {}) {
+    retrieve({ actor, audience, query = {}, limit = 5, maxChars = 2000, ...rest } = {}) {
       // 時刻は引数で差し替えられない（期限切れの項目を取り出せてしまうため）。差し替えは openExperience の opt.now（試験用）だけ
       if (Object.keys(rest).length) throw new Refused('bad_args', `未知の引数: ${Object.keys(rest).join(',')}（now は指定できない）`);
       const scorer = opt.scorer || lexicalScorer;
@@ -723,7 +753,7 @@ export function openExperience(file, opt = {}) {
       if (!Number.isInteger(maxChars) || maxChars < 100 || maxChars > 50000) throw new Refused('bad_args', 'maxChars');
       const nowMs = parseTs(nowFn());
       if (nowMs === null) throw new Refused('bad_args', 'now');
-      const rc = check({ op: 'retrieve', audience });
+      const rc = check({ op: 'retrieve', actor, audience });
       // 拒否は例外にせず { refused, violations } を返す：取り出しは状態を書かず、空を返せば何も渡らない（fail-closed）。呼び出し側（指示の組み立て）を落とさない
       if (!rc.ok) return { items: [], rendered: '', searchKind, refused: rc.violations.map((v) => v.reason).join(' / '), violations: rc.violations };
 
@@ -769,7 +799,7 @@ export function openExperience(file, opt = {}) {
       if (items.length) {
         const role = normRole(audience.role);
         const task = typeof audience.task === 'string' && makeWorkItemId(workItem)(audience.task) ? audience.task : null;
-        chain.append({ type: RECORD_TYPE, rules: RULES, cfg: cfgCopy(opts), op: 'retrieved', role, task, item_ids: items.map((x) => x.id), query: digest(q) });
+        chain.append({ type: RECORD_TYPE, rules: RULES, cfg: cfgCopy(opts), op: 'retrieved', actor: normActor(actor), role, task, item_ids: items.map((x) => x.id), query: digest(q) });
       }
       return { items, rendered, searchKind };
     },

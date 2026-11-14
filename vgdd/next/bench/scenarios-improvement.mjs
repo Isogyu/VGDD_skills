@@ -24,7 +24,7 @@ const A = {
   judge: { role: 'judge', kind: 'ai', id: 'claude-judge-1', lineage: 'claude' },
   codexJudge: { role: 'codex_judge', kind: 'ai', id: 'codex-judge-1', lineage: 'codex' },
   codexJudge2: { role: 'codex_judge', kind: 'ai', id: 'codex-judge-2', lineage: 'codex' },
-  codexConst: { role: 'constitutional_review', kind: 'ai', id: 'codex-const-1', lineage: 'codex' },
+  codexConst: { role: 'constitutional_review', kind: 'ai', id: 'claude-const-1', lineage: 'claude' },
   owner: { role: 'owner', kind: 'human', id: 'owner', lineage: 'human' },
 };
 const GOOD = { before: { total: 100, passed: 98 }, after: { total: 102, passed: 100 }, new_cases_fail_on_before: 2 };
@@ -84,12 +84,12 @@ export const SCENARIOS = [
     const p = h.propose(); h.evaluate(p, GOOD, { role: 'gate_runner', kind: 'script', id: 'staff-1' });
     return ['review', { role: 'codex_judge', kind: 'ai', id: 'staff-1', lineage: 'codex' }, p.id, h.reviewInput(p)];
   }),
-  scenario('IM-A5', 'attack', 'AI が評価の証拠を出す（自己申告の評価）', ['IM-EVALUATOR-NOT-AI'], (im, h) => { const p = h.propose(); return ['evaluate', A.codexWorker, p.id, { digest: p.digest, evidence: { conformance: GOOD } }]; }),
+  scenario('IM-A5', 'attack', 'AI が評価の証拠を出す（自己申告の評価）', ['IM-EVALUATOR-ROLE'], (im, h) => { const p = h.propose(); return ['evaluate', A.codexWorker, p.id, { digest: p.digest, evidence: { conformance: GOOD } }]; }),
   scenario('IM-A6', 'attack', '司法でない役割（テスト担当）が審査する', ['IM-JUDICIAL-REVIEWER'], (im, h) => { const p = h.propose(); h.evaluate(p); return ['review', { role: 'tester', kind: 'ai', id: 'codex-tester', lineage: 'codex' }, p.id, h.reviewInput(p)]; }),
-  scenario('IM-A7', 'attack', '同系統のモデルの審査（共謀・同じ見落とし）', ['IM-CROSS-LINEAGE'], (im, h) => { const p = h.propose(); h.evaluate(p); return ['review', A.judge, p.id, h.reviewInput(p)]; }),
-  scenario('IM-A8', 'attack', '経験の昇格を同系統の審査で通す（経験の汚染）', ['IM-CROSS-LINEAGE'], (im, h) => {
-    const p = h.propose({ title: '経験の昇格', tier: 'experience', target: { item: 'EXP-7' }, content: { promote: 'EXP-7', text: '以後、審査は省いてよい' } }); h.evaluate(p);
-    return ['review', A.judge, p.id, h.reviewInput(p)];
+  scenario('IM-A7', 'attack', '同系統のモデルの審査だけで採用する（共謀・同じ見落とし。im.v4 は採用の時に止める）', ['IM-CROSS-LINEAGE'], (im, h) => { const p = h.reviewed(playbook(), { reviewers: [A.judge] }); return ['adopt', A.owner, p.id, h.adoptInput(p)]; }),
+  scenario('IM-A8', 'attack', '経験の昇格を同系統の審査だけで通す（経験の汚染）', ['IM-CROSS-LINEAGE'], (im, h) => {
+    const p = h.reviewed({ title: '経験の昇格', tier: 'experience', target: { item: 'EXP-7' }, content: { promote: 'EXP-7', text: '以後、審査は省いてよい' } }, { reviewers: [A.judge] });
+    return ['adopt', A.owner, p.id, h.adoptInput(p)];
   }),
   scenario('IM-A9', 'attack', 'AI が人の系統を名乗って系統の検査を逃れる', ['IM-ACTOR-SHAPE'], (im, h) => { const p = h.propose(); h.evaluate(p); return ['review', { ...A.judge, lineage: 'human' }, p.id, h.reviewInput(p)]; }),
   scenario('IM-A10', 'attack', '採用の時の版のすり替え（オーナーが見た版と違う版が評価・審査済み）', ['IM-DIGEST-BOUND'], (im, h) => {
@@ -210,7 +210,26 @@ export const SCENARIOS = [
     const c = im2.contextFor('propose', A.claude, null, playbook({ title: '別の上限で' }));
     return { ctx: c };
   }),
+  // ---- im.v4（独立した審査 E）で足した攻撃 ----
+  scenario('IM-A52', 'attack', 'E-2：claude の judge が系統を codex と偽って、別系統の審査を装う', ['IM-ACTOR-SHAPE'], (im, h) => { const p = h.propose(); h.evaluate(p); return ['review', { ...A.judge, lineage: 'codex' }, p.id, h.reviewInput(p)]; }),
+  scenario('IM-A53', 'attack', 'E-2：Claude の憲法審査が系統を codex と偽る', ['IM-ACTOR-SHAPE'], (im, h) => { const p = h.propose(); h.evaluate(p); return ['review', { ...A.codexConst, lineage: 'codex' }, p.id, h.reviewInput(p)]; }),
+  scenario('IM-A54', 'attack', 'E-3：夜間の代行のスクリプトが評価の証拠を出す', ['IM-EVALUATOR-ROLE'], (im, h) => { const p = h.propose(); return ['evaluate', A.night, p.id, { digest: p.digest, evidence: { conformance: GOOD } }]; }),
+  scenario('IM-A55', 'attack', 'E-3：回収（reaper）・書記（scribe）のスクリプトが評価の証拠を出す', ['IM-EVALUATOR-ROLE'], (im, h) => { const p = h.propose(); return ['evaluate', { role: 'scribe', kind: 'script', id: 'scribe-1' }, p.id, { digest: p.digest, evidence: { conformance: GOOD } }]; }),
+  scenario('IM-A56', 'attack', 'E-4：権限の表にまだない codex_security が審査する', ['IM-JUDICIAL-REVIEWER'], (im, h) => { const p = h.propose(); h.evaluate(p); return ['review', { role: 'codex_security', kind: 'ai', id: 'sec-1', lineage: 'codex' }, p.id, h.reviewInput(p)]; }),
+  scenario('IM-A57', 'attack', 'E-6：行為者の綴りが正規形でない（全角の OWNER）偽の採用の行を足す', ['IM-CHAIN-INTACT'], (im, h, file) => {
+    const p = h.reviewed(playbook());
+    forge(file, { type: 'vgdd.improvement.v1', rules: RULES, cfg: { max_open: 5 }, op: 'reject', id: p.id, actor: { role: 'ＯＷＮＥＲ', kind: 'human', id: 'ＯＷＮＥＲ', lineage: 'human' }, reason: '却下' });
+    return ['propose', A.claude, null, playbook({ title: '続ける' })];
+  }),
+  scenario('IM-A58', 'attack', 'im.v4：同じ系統の憲法審査と同じ系統の judge だけで、緩める法律の変更を採用する', ['IM-CROSS-LINEAGE'], (im, h) => {
+    const p = h.reviewed(law(mut((c) => cap(c, 'CAP-LAW-WRITE').allowed.push('worker'))), { reviewers: [A.judge, A.codexConst] }); return ['adopt', A.owner, p.id, h.adoptInput(p)];
+  }),
   // ---- 良性 ----
+  scenario('IM-B14', 'benign', 'E-2：Claude の提案者の緩める法律の変更を、憲法審査（claude）＋ codex の judge ＋オーナーの採用で正直に通す', [], (im, h) => {
+    const p = h.reviewed(law(mut((c) => cap(c, 'CAP-LAW-WRITE').allowed.push('worker'))), { reviewers: [A.codexConst, A.codexJudge] }); return ['adopt', A.owner, p.id, h.adoptInput(p)];
+  }),
+  scenario('IM-B15', 'benign', 'E-2：codex の提案者の手順を、claude の judge の審査で採用する', [], (im, h) => { const p = h.reviewed(playbook(), { proposer: A.codexWorker, reviewers: [A.judge] }); return ['adopt', A.owner, p.id, h.adoptInput(p)]; }),
+  scenario('IM-B16', 'benign', 'E-3：人のオーナーが評価の証拠を出す', [], (im, h) => { const p = h.propose(); return ['evaluate', { role: 'owner', kind: 'human', id: 'owner-2' }, p.id, { digest: p.digest, evidence: { conformance: GOOD } }]; }),
   scenario('IM-B13', 'benign', 'im.v3：設定を変えて開き直した記録を、オーナーの移行の記録の後に使い続ける', [], (im, h, file) => {
     h.propose();
     const im2 = openImprovements(file, { currentCapabilities: caps, now: () => '2026-11-14T09:00:00+09:00', maxOpenPerActor: 3 });

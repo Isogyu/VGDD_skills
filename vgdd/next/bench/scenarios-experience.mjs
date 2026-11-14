@@ -103,7 +103,7 @@ function reopenedStricter() {
 /** 移行の記録（epoch）の1手を guardNames のガードだけで検査する */
 const lastEpoch = (st, actor, args, g) => last(st, 'epoch', actor, args, g);
 /** 取り出しの役割の検査だけ */
-const lastRetrieve = (role, g) => { const r = check({ op: 'retrieve', audience: { role } }, g); return { blocked: !r.ok, by: r.violations.map((v) => v.guard) }; };
+const lastRetrieve = (role, g) => { const r = check({ op: 'retrieve', actor: WORKER, audience: { role } }, g); return { blocked: !r.ok, by: r.violations.map((v) => v.guard) }; };
 
 function withExperience() {
   const { st, a, b } = twoReflections();
@@ -286,12 +286,23 @@ export const SCENARIOS = [
     run: (g) => { const { st, a } = twoReflections(); return last(st, 'feedback', REAPER, { item_ids: [a], outcome: 'harmful', evidence: { kind: 'gate_event', ref: 'g-1', task: 'T-003' } }, g); } },
   { id: 'EX-A68', kind: 'attack', title: '作業員の役割のスクリプト（role: worker、kind: script）がカウンタを更新する', expectGuards: ['EX-ACTOR', 'EX-FEEDBACK-ACTOR'],
     run: (g) => { const { st, a } = twoReflections(); return last(st, 'feedback', { role: 'worker', kind: 'script', id: 'w-script' }, { item_ids: [a], outcome: 'helpful', evidence: { kind: 'verdict', ref: 'v-1', task: 'T-003' } }, g); } },
+  // ---- 独立した審査 E-1：取り出す者を必須にし、記録に残す ----
+  { id: 'EX-A69', kind: 'attack', title: 'E-1：取り出す者（actor）を申告せずに取り出す（誰の取り出しか記録に残らない）', expectGuards: ['EX-RETRIEVE-ACTOR'],
+    run: (g) => { const r = check({ op: 'retrieve', audience: { role: 'worker' } }, g); return { blocked: !r.ok, by: r.violations.map((v) => v.guard) }; } },
+  { id: 'EX-A70', kind: 'attack', title: 'E-1：司法・裁判所の側・人のオーナーが作業員の役割あての取り出しをする', expectGuards: ['EX-RETRIEVE-ACTOR'],
+    run: (g) => allBlocked([{ role: 'judge', kind: 'ai', id: 'j' }, { role: 'gate_runner', kind: 'script', id: 'g' }, { role: 'owner', kind: 'human', id: 'o' }].map((actor) => () => { const r = check({ op: 'retrieve', actor, audience: { role: 'worker' } }, g); return { blocked: !r.ok, by: r.violations.map((v) => v.guard) }; })) },
+  { id: 'EX-A71', kind: 'attack', title: 'E-1：裁判所の側のスクリプトが、オーナーの採用した項目を自動で引退させる（取り出しの申告で harmful を積まれた）', expectGuards: ['EX-RETIRE-ACTOR'],
+    run: (g) => {
+      const { st, a } = twoReflections();
+      const it = st.items.get(a); it.status = 'adopted'; it.harmful = 5;
+      return last(st, 'retire', COURT, { id: a, reason: 'harmful 5 > helpful 0（自動）' }, g);
+    } },
 
   // ---- benign ----
   { id: 'EX-B01', kind: 'benign', title: '司法の指摘からの reflection の追加', expectGuards: [],
     run: (g) => last(emptyState(), 'add', WORKER, refl('指摘: テストが無いと差し戻される', V(1, 'T-001')), g) },
   { id: 'EX-B02', kind: 'benign', title: '作業員への取り出し（期限内・役割と領域が合う）', expectGuards: [],
-    run: (g) => { const { st, a } = twoReflections(); const r = check({ op: 'retrieve', audience: { role: 'worker' } }, g); const s = lastServe(st, a, { role: 'worker' }, 'software-dev', T0 + DAY, g); return { blocked: !r.ok || s.blocked, by: [...r.violations.map((v) => v.guard), ...s.by] }; } },
+    run: (g) => { const { st, a } = twoReflections(); const r = check({ op: 'retrieve', actor: WORKER, audience: { role: 'worker' } }, g); const s = lastServe(st, a, { role: 'worker' }, 'software-dev', T0 + DAY, g); return { blocked: !r.ok || s.blocked, by: [...r.violations.map((v) => v.guard), ...s.by] }; } },
   { id: 'EX-B03', kind: 'benign', title: '別々の task の2件からの帰納', expectGuards: [],
     run: (g) => { const { st, a, b } = twoReflections(); return last(st, 'induce', WORKER, { from: [a, b], text: '変更にはテストを添える', scope: SCOPE }, g); } },
   { id: 'EX-B04', kind: 'benign', title: 'オーナーによる昇格（指紋が一致）', expectGuards: [],
@@ -377,7 +388,7 @@ export function benchRetrieve(n) {
     fs.writeFileSync(`${file}.head`, JSON.stringify({ seq: n, hash: prev }) + '\n');
     const store = openExperience(file, { now: () => '2026-11-14T09:00:00+09:00' });
     const t0 = performance.now(); const st = store.state(); const t1 = performance.now();
-    const r = store.retrieve({ audience: { role: 'worker', task: 'T-900' }, query: { text: 'テストと認証の経験', tags: ['テスト'], domain: 'software-dev' } });
+    const r = store.retrieve({ actor: WORKER, audience: { role: 'worker', task: 'T-900' }, query: { text: 'テストと認証の経験', tags: ['テスト'], domain: 'software-dev' } });
     const t2 = performance.now();
     return { n, rebuildMs: Math.round((t1 - t0) * 10) / 10, retrieveMs: Math.round((t2 - t1) * 10) / 10, ms: Math.round((t2 - t1) * 10) / 10, rejected: st.rejected.length, returned: r.items.length };
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
