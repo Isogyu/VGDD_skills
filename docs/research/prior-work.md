@@ -22,6 +22,8 @@ VGDD は二つの考え方でできています。
 
 この文書は三つの調査報告と、VGDD 自身の文書（README、規範仕様 `vgdd/kernel/SPEC.md`、`docs/kernel.md`、`docs/validation.md`）に基づきます。調査報告は調査担当が書いたもので、確認済みの事項と未確認の事項が区別されています。この文書はその区別をそのまま引き継ぎます。材料に書かれていない事実、数値、URL は足していません。
 
+2026-11-14 に、追加の調査報告（`handoff-notes/dr-4-prior-work-fulltext.md`）の主張を、一次の資料（論文の HTML 本文、GitHub のコード）で確かめ、第3節から第7節に反映しました。確かめた主張と食い違いは `handoff-notes/dr-4-verification.md` にあります。
+
 確認の水準を、次の三つで書き分けます。
 
 | 水準 | 意味 |
@@ -419,46 +421,90 @@ VGDD は二つの考え方でできています。
 
 ### 3.1 VGDD に最も近い研究と実装
 
-#### AgentCity（arXiv 2604.07007）
+この項の「本文確認」は、2026-11-14 に論文の HTML 本文と GitHub のコードを取得して読んだ、という意味です。確認の記録は `handoff-notes/dr-4-verification.md` にあります。実装は、読んだだけで、動かしていません。
 
-- Ruan と Zhang、2026-04-08、cs.MA、111ページ。arXiv のプレプリントで、査読はありません。要旨確認です。
-- 内容：エージェントが運用の規則をスマートコントラクト（ブロックチェーン上で自動で実行されるプログラム）として「立法」し、決定的なソフトウェアが「執行」し、人間が所有者の連鎖を通じて「裁定」する、三権分立（Separation of Power）です。EVM 互換のレイヤー2 上の3階層のコントラクトで構成します。50 から 1000 体のエージェントによる、事前登録の実験を設計していますが、要旨には結果の記載がありません。
-- VGDD との類似：立法、執行、司法の三分割、憲法的な階層、人間への責任の帰属、実行時の強制です。VGDD の概念に最も近い先行研究です。
-- VGDD との違い：対象は組織をまたぐ「エージェント経済」で、開発のライフサイクルではありません。強制はブロックチェーンで行います。人間が司法（紛争の裁定）の側にあり、立法はエージェントの側にあります。VGDD は、人が立法の効力を持ち、AI は起草だけです。配置が逆です。コードの公開は確認できていません。
-- 成熟度：論文のみです。
+#### 公開の実装（開発の工程に近いもの）
 
-#### From Logic Monopoly to Social Contract（Ruan、NetX Enterprise Framework。arXiv 2603.25100）
+##### Maku（`https://github.com/Smana/maku`）
 
-- 2026-03-26、単著、143ページの working paper です。要旨確認です。
-- 内容：各エージェントが、計画、実行、評価を独占する状態（Logic Monopoly）を問題とし、立法、執行、司法の分離を、契約を中心に実装します（TEE と呼ばれる隔離された実行環境、ブロックチェーン、8つのスマートコントラクト、ガバナンスのハブ）。NetX 社のホワイトペーパーに「Judiciary Layer」があります（`https://netx.gitbook.io/netx-docs/whitepaper/netx-enterprise-framework-nef/vi.-netx-enterprise-framework-the-judiciary-layer`。200 の応答は未確認のため、参考扱いです）。
-- 類似：司法の層が、立法を上書きしたり、実行を止めたりする構造は、VGDD の独立した審査に近いです。
-- 違い：企業間の経済とブロックチェーンが前提です。人間の役割は要旨で不明です。実証は、二次資料の数値（攻撃の成功率 84.3%、欺瞞 31.4%）が中心で、自身の枠組みの評価は不明瞭です。
-- 成熟度：論文と、ベンダーの設計文書です。実装の公開は未確認です。
-- 注意：AgentCity と Logic Monopoly は同じ著者で、どちらもコードを確認できておらず、査読もありません。
+- 本文確認（README、`docs/merge-policies.md`、`internal/factory/mergepolicy/structural.go`）。Apache-2.0。2026-09-29 に作成、2026-11-14 に push。コミットは約 470 件。スターは 0。
+- 内容：GitHub の issue にラベルを付けると、エージェントが Kubernetes 上の gVisor の隔離環境で作業し、プルリクエストを返します。README は「Every control sits outside the agent」と述べます。役割は tester、implementer、reviewer などに分かれます。tester はテストだけを書き、実装者がそのテストを変えると `contract_modified` で人に回ります。実行ごとに短命で範囲の限られた認証情報を発行し、reviewer は push できません。
+- 人の承認：README は「Humans merge by default. Only a class of change you mark `live` merges itself」と述べます。既定は人が merge します。人が `live` と指定した種類の変更だけが、条件を満たせば自動で merge されます。毎回の承認ではありません。
+- 規則の変更の分類（`structural.go`）：対象は merge の方針、つまり「自動 merge してよい変更の種類」の定義です。許可するファイル、禁止するファイル、行数や件数の上限、承認が要るパス、必要な検査、動作の段階（off、shadow、live）を持ちます。権限の表（役割ごとの許可）ではありません。新旧の種類を行ごとに比べ、全部の行で新が旧に収まるときだけ `tightening` とします。コードの説明は「Anything else, or anything it cannot prove, such as a rewritten pattern or another harness profile, is a relaxation」です。証明できない書き換えは緩める側に倒します。結果は三つ（unchanged、tightening、relaxation）です。
+- 分類の結果の使い方：文書によると、`maku policy diff` が結果を表示します。切り替え済みのリポジトリで、`live` の種類が緩められると、その種類は shadow（判定するが merge しない）で動き、ログに理由が残ります。方針のファイルは `.github/` の下にあるので、人が merge します。
+- VGDD との同じ点：規則の変更を機械的に「締める」「緩める」に分け、証明できないものを緩める側に倒します。実行環境の外で強制し、役割を分けます。
+- VGDD との違い：Maku が分類するのは merge の方針で、権限の表ではありません。確かめ方（probe）や不変条件に当たるものは、読んだ範囲に見当たりません。緩めた後の扱いは、自動で shadow に落とす運用です。VGDD の権限の差分は、緩める変更と分類できない変更を、憲法審査とオーナーの承認の経路に回す設計です（試作）。Maku には、立法（規則の起草と人の承認）と司法（独立した審査の判定）を分けた構造は、読んだ範囲に見当たりません。
+- 注意：Maku の分類器の網羅性や、実運用での誤分類は検証していません。merge の判定にモデルを使わないかどうかは、文書に明示がありません。
 
-#### PEA：Policy-Execution-Authorization（arXiv 2604.23646）
+##### ctrlAI（`https://github.com/GautamRonanki/ctrlAI`）
 
-- Xiang、2026-04-26、プレプリント、ライセンスは CC BY-NC-SA 4.0。要旨確認です。
-- 内容：意図の生成、認可、実行を分離し、暗号的に制約された capability token（特定の操作だけを許す証票）で連携させます。意図の検証、意図の系譜の追跡、目標からの逸脱の検知、出力の意味による関門、形式検証を提案します。
-- 類似：モデルの振る舞いではなく、構造で強制するという考え方と、権力分立を明示している点が、Kernel の思想に近いです。
-- 違い：人間の最終の統制と、開発の工程についての記述がありません。実装とコードの参照がありません。
-- 成熟度：論文のみ（実装なし）です。
+- 本文確認（README、`core/evals.py`）。ライセンスのファイルはなく、API でも不明です。2026-03-17 に作成、2026-04-09 が最後の push。コミットは約 83 件。ハッカソンの作品です。
+- 内容：Slack ボットと管理画面から、Gmail、Drive、Calendar、GitHub のエージェントの権限を管理します。対象は業務の API で、開発の工程ではありません。
+- テストの生成：`evals.py` の冒頭は「Generates tests dynamically from the live permission state」と述べます。`generate_permission_tests()` は、登録簿にあるエージェントと scope ごとに、許可なら True、そうでなければ False という期待値を作ります。`run_permission_tests()` が、`check_scope_permission` の結果と比べます。承認が要る操作（`generate_ciba_tests`）と、エージェント間の通信の許可（`generate_inter_agent_tests`）も同じ形です。
+- VGDD との同じ点：権限の設定からテストを機械的に作り、判定の関数と比べます。設定が変われば、期待値も変わります。
+- VGDD との違い：ctrlAI の期待値は、許可の集合から導かれます。VGDD の probe と期待値は、権限の表に手で書かれていて、機械的に増えるのは「probe × 役割」の組み合わせです。VGDD は probe を、実際のフックのスクリプトに入力します。止めるべきものと通すべきものの両方を試し、前の版にかけて新しい試験だけが落ちることを確かめます。`evals.py` には、前の版にかける処理は見当たりません。ctrlAI は Python の関数を呼ぶ形で、期待値と判定が同じ登録簿に依ります。
 
-#### Microsoft Agent Governance Toolkit（AGT）
+##### AgentPolicyPack（`https://github.com/sekacorn/AgentPolicyPack`）
+
+- 本文確認（README、`diffing.py`、`testing.py`）。Apache-2.0。2026-07-06 に作成、2026-08-12 が最後の push。コミットは約 8 件。版は 0.2.0b1 の beta で、README は「not production certification」と述べます。
+- 内容：エージェントの規則を YAML で書き、評価し、試験し、比べる、判定器です。README は「External systems must enforce policy decisions」と述べます。実際の操作の遮断は、別のシステムの責任です。
+- 規則の変更の分類（`diffing.py`）：政策（policy）を ID で対応づけ、`deny` を削除すれば `security_relaxation`、`deny` から `allow` への変更も `security_relaxation`、`allow` から `deny` への変更と `deny` の追加は `tightening` とします。優先度か対象が変わると `potentially_breaking`、それ以外は `informational` です。README は「conservative and rule-based」と述べます。
+- 規則のテスト：規則の束に埋め込まれた試験（`tests`）を実行します。試験は人が書きます。生成はしません。
+- VGDD との同じ点：規則の変更を機械的に分類します。
+- VGDD との違い：読んだコードでは、同じ効果（effect）のまま条件（conditions）だけが変わる場合は、優先度と対象が同じなら `informational` に入ります。条件を広げる変更を緩める側とは見ません。VGDD は、規則にない欄の変更や穴の記載の削除を「分類できない」とし、緩める側と同じ経路に回します。AgentPolicyPack は役割ごとの許可の表ではなく、汎用の許可規則を扱います。
+
+##### AgentBoardroom（`https://github.com/GixGosu/AgentBoardroom`）
+
+- 本文確認（`CONSTITUTION.md`、`src/governance/protection.ts`、README）。MIT。2026-02-10 に作成、2026-02-18 が最後の push。コミットは約 47 件。スターは 3。
+- 内容：人の Board Chair の下で、CEO、CTO、QA、Auditor のエージェントが挑戦と承認の手順を踏みながら、ソフトウェア開発を進めます。憲法（12 条）が役割を定めます。
+- 憲法の食い違い：Article IX は「No Boardroom agent ... may propose, draft, or execute changes to governance assets」と述べます。Article XI の Section 1 は、改正を「Any Boardroom agent, via escalation with rationale」が提案できるとします。報告の指摘どおり、二つは文面で食い違います。Article XI の Section 2 は、改正に Board Chair の承認を要すると述べます。
+- 強制：Article IX の Section 3 は「enforced at the infrastructure level through file access controls」と述べます。実装の `protection.ts` は、書き込みの可否を返す TypeScript の関数（`checkWriteAccess`）です。`src/` の中で、この名前を含むのは `protection.ts` だけでした。呼び出し元は、今回の検索では見つかりませんでした。OS の sandbox やフックに当たる記述は、`src/` の `.ts` に見当たりませんでした。ライブラリとして呼ばれる前提の、アプリケーションの中の検査です。
+- VGDD との違い：人が頂点に立つ三権分立は同じ系統です。VGDD は、実行環境（フック、sandbox、別プロセス）で強制し、強制していない約束を公開します。AgentBoardroom の強制が OS の境界まで届くかは、確認できていません。
+
+##### Gavel（`https://github.com/jlugo63/gavel`）
+
+- 本文確認（README、`gavel-v2/gavel/separation.py`、`blastbox.py`）。MIT。2026-02-17 に作成、2026-05-20 が最後の push。コミットは約 88 件。
+- 内容：エージェントの行動を、提案、方針の検査、sandbox での証拠の採取、決定的な審査、独立した認証、独立した承認、範囲を限った実行トークン、の順に通します。
+- 分離：`separation.py` は、同じ chain の中で proposer、reviewer、approver が別の主体であることを、追記の時点で強制します（`SeparationViolation`）。主体は文字列の ID です。人であることを求める記述は、読んだ範囲に見当たりません。
+- sandbox：`blastbox.py` は、安全のためでなく、証拠を作るための sandbox だと説明しています。
+- VGDD との違い：提案者が自分を審査と承認できない点は、VGDD の「行政は自分で統合できない」と同じ方向です。最終の承認が人であること、開発の工程全体の統治は、Gavel の中心ではありません。
+
+#### 論文
+
+##### AgentCity（arXiv 2604.07007）
+
+- 本文確認（v1 の HTML）。Ruan と Zhang、2026-04-08、cs.MA。査読の記載はありません。
+- 内容：上位の規則（constitutional parameters）は、人の principal が定めます。業務の規則（operational parameters）は、エージェントが議論し、採決し、契約として採用します。実行は決定的なソフトウェアが行い、紛争は人を最終点とする系統が裁定します。強制の中心は EVM 系ブロックチェーンのスマートコントラクトです。本文は、Registrar、Speaker、Regulator、Codifier の4つの事務役を「trusted institutional infrastructure」として扱います。
+- 実験の段階：§5 は「Experiments are currently in progress」「Results will be reported in a forthcoming revision」と述べます。計画は n=200、4条件、各条件10 seed です。pilot は「n=5, Python mock contracts」で、限界の節は「exploratory pilot studies」と書きます。
+- VGDD との類似：立法、執行、司法の三分割、憲法的な階層、人への責任の帰属です。人が上位の規則を定め、最終の裁定者である点も同じです。違いは、対象が組織をまたぐエージェント経済で、業務の規則をエージェントが立法することです。VGDD は、効力を持つ規則を人が承認し、AI は起草までです。コードの公開は確認できていません。
+
+##### From Logic Monopoly to Social Contract（Ruan。arXiv 2603.25100）
+
+- 本文確認（v1 の HTML）。2026-03-26、単著、working paper です。本文に「pre-peer-review working paper」とあります。
+- 内容：憲法に当たる System Charter を、Human Committee が定めます。合意が行き詰まると、Human Committee が拘束力のある指示を出すか、業務を終了します。立法は専門エージェントの集合、執行は契約に結び付いたソフトウェア、司法は監視の仕組みと人の委員会です。強制として、スマートコントラクト、TEE（隔離された実行環境）、呼び出し先の許可リスト、緊急停止を提案します。
+- 実験の段階：本文は「NetX's primary limitation ... is the absence of empirical validation」と述べます。統合したシステムの実証はありません。本文にある 84.3% と 31.4% は、他の研究（Agent Security Bench、La Serenissima）の数値で、この枠組みの結果ではありません。
+- 違い：企業間の経済とブロックチェーンが前提です。人の取締役会の形骸化という課題を、著者自身が認めます。AgentCity と同じ著者で、どちらもコードを確認できていません。
+
+##### PEA：Policy-Execution-Authorization（arXiv 2604.23646）
+
+- 本文確認（v1 の HTML）。Xiang、2026-04-26、CC BY-NC-SA 4.0。
+- 内容：信頼しない LLM（Policy）が、型付きの実行案を作ります。規則の検査（Authorization）が、署名付きの capability token を発行します。実行層（Execution）は、トークンを検証します。許可の表（MinimalCapSet）は「a static, human-maintained configuration」で、LLM は変えられない前提です。
+- 実験：「prototype PEA system」で、Policy は GPT-class の LLM、実行は「action dispatcher in mock environment」（模擬）です。本文の数値は、攻撃 10,000 件で迂回 0 件、目標の逸脱の攻撃の成功率 41.2% から 3.9%、暗黙の強迫の検出率 21.3% から 84.7% です。Hard Authorization を外すと成功率は 34.8% になります（アブレーション）。著者の報告で、独立した再現は確認できていません。
+- 違い：人の最終の統制と開発の工程の記述はなく、模擬環境のプロトタイプです。
+
+##### Microsoft Agent Governance Toolkit（AGT）
 
 - `https://github.com/microsoft/agent-governance-toolkit`。MIT ライセンス、約 6.6k のスター、2026-11-14 に push を確認。本文確認（公式のリポジトリ）です。
-- 内容：ツールの呼び出し、メッセージの送信、委任を、実行の前に横取りする実行時の統治の層です。YAML のポリシー（allow、deny、require_approval）、ゼロトラストの ID、サンドボックス（4つの特権リング）、緊急停止、改ざんを検知できる監査記録があります。NIST AI RMF との整合は、自己申告です。OWASP Agentic Top 10 の被覆の説明は矛盾しています（10/10 という記述と、7 が Full で 3 が Partial というバッジ）。OPA と Cedar は構成図に載っていますが、連携の説明は確認できていません。
-- 類似：決定する点と執行を分け、人間の承認、監査を持つ、実行時の強制の最有力な実装です。VGDD の Kernel の部分にあたります。
-- 違い：立法と司法の役割の分離や、独立した審査のエージェントがありません。LLM による判定もありません。強制は、アプリの中のミドルウェアで、エージェントと同じプロセスの境界にあります（コンテナによる分離を推奨と、自己記述）。開発のライフサイクルを管理するものではありません。
+- 内容：ツールの呼び出し、メッセージの送信、委任を、実行の前に横取りする実行時の統治の層です。YAML のポリシー（allow、deny、require_approval）、ゼロトラストの ID、サンドボックス（4つの特権リング）、緊急停止、改ざんを検知できる監査記録があります。NIST AI RMF との整合は、自己申告です。OWASP Agentic Top 10 の被覆の説明は矛盾しています（10/10 という記述と、7 が Full で 3 が Partial というバッジ）。
+- 類似：決定する点と執行を分け、人間の承認、監査を持つ、実行時の強制の最有力な実装です。VGDD の Kernel の部分にあたります。違いは、立法と司法の役割の分離や独立した審査のエージェントがないこと、LLM による判定がないことです。強制は、エージェントと同じプロセスの境界にあるミドルウェアです（コンテナによる分離を推奨と、自己記述）。開発のライフサイクルを管理するものではありません。
 - 成熟度：オープンソースの実装があります（公開プレビュー。適合テスト 992 件を含む CI）。
 
-#### Institutional AI（arXiv 2601.11369。概念の論文は 2601.10599）
+##### Institutional AI（arXiv 2601.11369。概念の論文は 2601.10599）
 
-- Bracale Syrnikov ほか、2026-01。要旨確認です。
-- 内容：外部の、監査できる governance graph と、暗号鍵つきの追記だけのログで、LLM どうしの共謀を抑えます。Cournot 市場（企業どうしの生産量の競争の模型）で、6つの構成にわたって、共謀の段階の平均が 3.1 から 1.8、重い共謀の割合が 50% から 5.6% に下がりました。プロンプトだけの「憲法」のベースラインでは、有意な改善がありませんでした。
-- 類似：憲法をプロンプトに書くだけでは足りず、外部の機構で強制する、という VGDD の主張を、実験で支持します。
-- 違い：市場のシミュレーションです。開発の工程と人間の最終の統制は、中心ではありません。
-- 成熟度：論文のみです。コードは未確認です。
+- 本文確認（2601.11369 の v2 の HTML）。Bracale Syrnikov ほか、2026-01。CC BY 4.0。
+- 内容：公開で不変の governance graph（状態、遷移、制裁、復帰を宣言した manifest）を、Oracle と Controller が実行し、暗号鍵つきの追記だけのログを残します。Cournot 市場（企業どうしの生産量の競争の模型）で、無統治、プロンプトだけの憲法、制度の3条件を比べました。6つのモデルの構成（同じモデルの組が3、異なる提供元の組が3）で、条件ごとに90 run です。
+- 数値：平均の共謀の tier は、無統治 3.100、憲法 3.022、制度 1.822 です。tier 4（重い共謀）の割合は、無統治 50.0%、憲法 44.4%、制度 5.6% です。どちらも本文にあります。以前の本文の「重い共謀の割合 50% から 5.6%」は、このうち後者です。
+- 範囲：本文は、異なる提供元の組でも共謀が確実に減る証拠はない、と述べます。対象は二社の数量競争で、開発の工程ではありません。本文に、エージェントが制度を改正する仕組みの記述は見当たりませんでした（amend を検索）。コードは未確認です。この結果は、憲法をプロンプトに書くだけでは足りず、外部の機構で強制する、という VGDD の主張を、市場の模擬実験が支持するものです。
 
 ### 3.2 実行時の強制とポリシーの系統
 
@@ -508,7 +554,10 @@ VGDD は、Claude Code のフックと権限を、自身の Kernel の部品と�
 
 - Why Do Multi-Agent LLM Systems Fail?（MAST。14の失敗の型。NeurIPS 2025 の Datasets and Benchmarks。`https://arxiv.org/abs/2503.13657`）：失敗は、設計上の問題によるものが多い、という主張です。
 - Risk Analysis Techniques for Governed LLM-based MAS（Gradient Institute。`https://arxiv.org/abs/2508.05687`）：モノカルチャーによる崩壊や、相関した故障が合意に見える問題を扱います。検索の要約による記述で、原文は未精読です。
-- Preference Optimization Drives Monoculture in LLM Prediction Markets（`https://arxiv.org/abs/2606.26583`）、Strategic Algorithmic Monoculture（`https://arxiv.org/abs/2604.09502`）、Why Better Models Can Create Riskier Systems（`https://arxiv.org/abs/2609.04373`）：題名と日付だけを API で確認しました。論文中の数値は、検索の要約に由来し、未検証です。
+- 2026-11-14 に arXiv の HTML 本文で、次の数値を確かめました（本文確認）。いずれも、開発の審査役の見逃しを直接測ったものではありません。
+  - Preference Optimization Drives Monoculture in LLM Prediction Markets（`https://arxiv.org/abs/2606.26583`）：二択 QA の予測市場です。誤りの相関は、同じモデルの組が 0.679、異なるモデルの組が 0.396 です。Tulu 3 の SFT から DPO で、8B は 0.559 から 0.799、70B は 0.465 から 0.746 です。
+  - Strategic Algorithmic Monoculture（`https://arxiv.org/abs/2604.09502`）：16 のモデル、12 の質問、条件ごとに各 50 回答です。一致すると得をする条件の一致率は、LLM が 72%、人が 31% です。異なる回答が得な条件は、LLM が 27%、人が 4%（序文では 3.5%）です。
+  - Why Better Models Can Create Riskier Systems（`https://arxiv.org/abs/2609.04373`）：金融市場の模擬で、LLM の取引役の行動が、能力が高いほど似ると報告します。共通の推論が正しければ参加者の増加がリスクを下げ、共通の誤情報があれば逆になります。他の領域は「open empirical question」とされています。
 - LLM による審査の、自己選好のバイアス（同じ系列のモデルを好む傾向）を示す複数のプレプリントがあります。しかし、「同じ系列のモデルは、同じ誤りを見落とす」ことを直接示す結果は、検索で確認できませんでした。
 - VGDD にとっての意味：司法の役を同じ系列のモデルで動かすと、独立性が損なわれるおそれがあります。VGDD は、judge（Claude 系）と Codex（別系統）の二つの司法を置き、不一致をオーナーの裁定に回します。しかし、二つの司法が同じ見落としをする可能性は残る、と SPEC に書かれています（SPEC 第12節）。これは検証すべき課題であり、解決済みの主張ではありません。
 
@@ -527,20 +576,22 @@ VGDD は、Claude Code のフックと権限を、自身の Kernel の部品と�
 
 ### 4.1 VGDD と、統治を主題とする研究や実装
 
-| 観点 | VGDD | AgentCity | NetX | PEA | MS AGT | Institutional AI |
-|---|---|---|---|---|---|---|
-| 1 統治権限の分離と独立性 | あり（立法、行政、司法） | あり | あり | あり（意図、認可、執行） | 一部（決定点と執行は分離。独立した審査者なし） | 一部（外部の governance graph） |
-| 2 人間による最終統制 | あり（承認、裁定、停止） | あり（人間が裁定） | 未確認 | 未確認 | 一部（require_approval） | 未確認 |
-| 3 実行時に強制される権限制御 | あり（フック、sandbox、裁判所） | あり（コントラクト） | あり | あり（提案のみ） | あり（同じプロセス境界の限界） | あり（外部の強制） |
-| 4 動的なエージェント構成 | なし（静的） | 一部 | 未確認 | 未確認 | 一部（委任、メッシュ） | なし |
-| 5 グラフ型のタスク実行 | 一部（票の depends_on と統合キュー） | 未確認 | 未確認 | 未確認 | なし | 一部（governance graph） |
-| 6 経験記憶と意味検索 | 最小形（前の試行の記録） | 未確認 | 未確認 | 未確認 | 未確認 | 一部（追記ログ） |
-| 7 自己改善の安全性 | 人の手続きによる法律の改正だけ | なし | なし | 一部（目標の逸脱の検知） | なし | なし |
-| 8 開発ライフサイクル全体への適用 | あり（1題材でのみ実稼働） | なし | なし | なし | なし | なし |
-| 9 非開発業務への転用性 | なし | あり | あり | あり | あり | あり |
-| 10 非エンジニアの操作性 | 一部（操作画面はあるが、非エンジニアでの検証はない） | なし | なし | 未確認 | 一部（YAML） | 未確認 |
-| 11 監査可能性と再現性 | あり（ハッシュチェーン。外部への固定はなし） | 一部（公開の台帳） | 一部 | 一部（提案のみ） | あり | あり |
-| 12 性能、費用、保守性 | 比較実験はなし。予算の台帳と、適合性テスト527件はある | 未確認 | 未確認 | 未確認 | 一部（CI と適合テスト） | 未確認 |
+| 観点 | VGDD | AgentCity | NetX | PEA | MS AGT | Institutional AI | Maku |
+|---|---|---|---|---|---|---|---|
+| 1 統治権限の分離と独立性 | あり（立法、行政、司法） | あり | あり | あり（意図、認可、執行） | 一部（独立した審査者なし） | 一部（外部の governance graph） | 一部（役割の分離と別の merge 判定。立法の層なし） |
+| 2 人間による最終統制 | あり（承認、裁定、停止） | あり（上位規則と最終の裁定） | あり（Human Committee） | 一部（人が許可表を維持） | 一部（require_approval） | 未確認 | 一部（既定は人が merge。許した種類は自動） |
+| 3 実行時に強制される権限制御 | あり（フック、sandbox、裁判所） | あり（コントラクト。実験は未報告） | 提案のみ | 模擬環境の試作 | あり（同じプロセス境界） | あり（市場の模擬） | あり（gVisor、外部の予算、範囲つき認証情報） |
+| 4 動的なエージェント構成 | なし（静的） | 一部 | 未確認 | 未確認 | 一部（委任、メッシュ） | なし | 一部（種類と tier を最初に選ぶ） |
+| 5 グラフ型のタスク実行 | 一部（票の depends_on と統合キュー） | 未確認 | 未確認 | 未確認 | なし | 一部（governance graph） | 未確認 |
+| 6 経験記憶と意味検索 | 最小形（前の試行の記録） | 未確認 | 未確認 | 未確認 | 未確認 | 一部（追記ログ） | 未確認 |
+| 7 自己改善の安全性 | 人の手続きによる法律の改正だけ | なし | なし | 一部（目標の逸脱の検知） | なし | なし | 一部（規則の緩和は shadow に落とす） |
+| 8 開発ライフサイクル全体への適用 | あり（1題材でのみ実稼働） | なし | なし | なし | なし | なし | 一部（issue からプルリクエストまで。仕様の承認なし） |
+| 9 非開発業務への転用性 | なし | あり | あり | あり | あり | あり | 未確認 |
+| 10 非エンジニアの操作性 | 一部（操作画面はあるが、非エンジニアでの検証はない） | なし | なし | 未確認 | 一部（YAML） | 未確認 | 未確認 |
+| 11 監査可能性と再現性 | あり（ハッシュチェーン。外部への固定はなし） | 一部（公開の台帳） | 一部 | 一部 | あり | あり | あり（追記だけの記録） |
+| 12 性能、費用、保守性 | 比較実験はなし。予算の台帳と、適合性テスト527件はある | 未確認 | 未確認 | 未確認 | 一部（CI と適合テスト） | 未確認 | 未確認 |
+
+Maku の列は、2026-11-14 に README と文書とコードの一部を読んだ範囲です。動かしてはいません。ctrlAI、AgentPolicyPack、AgentBoardroom、Gavel は、第5.1節の表で扱います。
 
 ### 4.2 VGDD と、制御、仕様、ワークフロー、自己改善の系統
 
@@ -586,7 +637,10 @@ VGDD は、Claude Code のフックと権限を、自身の Kernel の部品と�
 
 | VGDD の要素 | 先行例 | コメント |
 |---|---|---|
-| 三権分立の着想をエージェントの統治に持ち込むこと | AgentCity、Logic Monopoly と NetX、PEA、LawClaw（個人の記事） | AgentCity と Logic Monopoly は、立法、執行、司法の分離を、明示的に提案しています。VGDD に先立つ、または同じ時期の仕事です |
+| 三権分立の着想をエージェントの統治に持ち込むこと | AgentCity、Logic Monopoly と NetX、PEA、AgentBoardroom、Gavel、LawClaw（個人の記事） | 立法、執行、司法の分離や、提案者と承認者の分離は、既に提案され、一部は実装されています |
+| 開発の工程での、役割の分離と別の merge 判定、隔離環境 | Maku | tester と implementer の分離、モデルを動かさないとは明示されていない別の merge 判定、gVisor の隔離があります。既定は人が merge します |
+| 権限の設定からの、テストの機械的な生成 | ctrlAI | 登録簿の許可の集合から、許可と拒否の期待値を作り、判定の関数と比べます。業務の API 向けです |
+| 規則の変更の、締める／緩めるの機械的な分類 | Maku、AgentPolicyPack | Maku は証明できない書き換えを緩める側に倒します。対象は merge の方針です。AgentPolicyPack は汎用の許可規則を分類します |
 | 実行時の強制（Kernel に相当するもの） | MS AGT、AgentSpec、Progent、GaaS、Invariant、OPA と Cedar、Claude Code の hooks と permissions | 先行が多く、単独では差別化にならないと調査担当は評価しています |
 | 仕様駆動の開発 | Spec Kit、Kiro、BMAD、OpenSpec | 仕様の合意と、変更の提案を人と合意してから実装する流れは、既にあります |
 | 承認待ちと再開の基盤 | LangGraph の interrupt、Temporal の Signal | 状態を保存し、無期限に待って再開できます |
@@ -600,7 +654,7 @@ VGDD は、Claude Code のフックと権限を、自身の Kernel の部品と�
 
 ここでの「独自」は、先行研究の中に同じ配置が確認できなかった、という意味です。優れていると主張するものではありません。根拠は、VGDD 自身の文書に書かれた設計です。
 
-1. 人が立法の効力と最終の承認を持ち、AI は起草だけという配置。SPEC 第4節は、仕様を起草するのは誰でもよいが、効力はオーナーが仕様の指紋（SHA-256）を承認した記録だけが与える、と定めています。承認の記録は、行政が書けない場所に置かれます。AgentCity は、立法をエージェントの側に置くので、配置が逆です。
+1. 人が立法の効力と最終の承認を持ち、AI は起草だけという配置。SPEC 第4節は、仕様を起草するのは誰でもよいが、効力はオーナーが仕様の指紋（SHA-256）を承認した記録だけが与える、と定めています。承認の記録は、行政が書けない場所に置かれます。AgentCity は、上位の規則を人が定め、業務の規則はエージェントが立法します。VGDD は、効力を持つ規則の承認を人だけに置きます。
 2. 承認が、対象と範囲に結びつくこと。仕様が1文字でも変われば承認は効かなくなります。承認は法律の系統（`policy_line`）にも結びつき、権限の表が読めなければ、どの承認も効きません（SPEC 第4節の 5 と 6、不変条件 INV-06）。
 3. 「司法が使えない」ことを、判定として扱わないこと。判定のファイルがない、壊れている、CLI の応答が空、という場合は、合格にも差し戻しにも数えません。申請を残し、同じ申請で3回続けば、オーナーの判断に回します（SPEC 第6節の 5）。
 4. 司法の入力を、機械的に集めた差分、承認された受け入れ条件、決定的な監査の結果だけに限り、行政の説明を入れないこと（SPEC 第6節の 1）。
@@ -616,7 +670,7 @@ VGDD は、Claude Code のフックと権限を、自身の Kernel の部品と�
 
 仮説：人が立法の効力と最終の承認を持ち、AI を起草と作業に限る三権分立の配置を、開発の工程で実際に動かし、その規則を適合性テストで検査できる。
 
-- 近い先行研究：AgentCity（三権分立。ただし立法はエージェント、人間は裁定）、Logic Monopoly と NetX（司法の層）、MS AGT（実行時の強制と人間の承認。ただし役割の分離はない）、Spec Kit と OpenSpec（仕様の合意。ただし強制はない）。
+- 近い先行研究：Maku（開発の工程での役割の分離と、実行環境での強制。既定は人が merge する。ただし立法と司法の分離はない）、AgentCity（三権分立。ただし業務の規則はエージェントが立法）、Logic Monopoly と NetX（司法の層。実証なし）、MS AGT（実行時の強制と人間の承認。ただし役割の分離はない）、Spec Kit と OpenSpec（仕様の合意。ただし強制はない）。
 - VGDD が持っているもの：適合性テストが 527 件（法律 p0.4.14。2026-11-14 にこのリポジトリの写しで実行し、525 件が合格。合格しなかった 2 件は、配置済みの設定ファイルがこの写しにないことによる）、実稼働の記録は、題材アプリ「つぶやき業務ログ」の票と、`docs/validation.md` に記された事例（仕様の承認前の申請を blocked にした例、裁定が4件あった例など）。
 - まだ示せていないこと：
   - 実稼働の記録は、一つの題材、一人のオーナー、一つの環境（macOS、Claude Code）です。他の構成での再現は、新しい clone での公開の手順による試験が、macOS と Node 25 の一つの環境だけで確かめられています。Windows と Linux、ほかの人の手元は、確かめていません。
@@ -624,16 +678,18 @@ VGDD は、Claude Code のフックと権限を、自身の Kernel の部品と�
   - 司法の独立性（同じ系列のモデルによる相関した見落とし）が、実際にどの程度問題になるかを測っていません。
   - 非エンジニアが、承認の役を実際に担えるかを示していません。
 
-#### 候補2：強制していない約束を、権限の表に promise として公開する規律と、権限の表から適合性テストを生成する仕組み
+#### 候補2：強制していない約束を promise として公開する規律（権限の表からのテストの生成は、先行例がある）
 
-仮説：強制の層を持たない約束を、権限の表に `promise` と明記して公開させ、権限の表の各権限に `probes`（試験する操作）と `expect`（期待する判定）を持たせると、表から適合性テストを機械的に生成でき、表と実装の食い違いが試験の失敗として現れる。
+仮説：強制の層を持たない約束を、権限の表に `promise` と明記して公開させると、利用者は強制されていないことを知り、誤解を避けられる。
 
-- 近い先行研究：AgentSpec（事象、述語、強制の動作の記述言語）、OPA と Cedar（宣言的なポリシー）、MS AGT（YAML のポリシーと適合テスト 992 件）。これらは、ポリシーの記述と、実装の試験を持ちます。
-- VGDD が持っているもの：`capabilities.json` の各権限に、`allowed`、`enforced_by`、`probes`、`expect`、`known_gaps` があります（SPEC 第2節）。適合性テストの M 群は、どの権限にも確かめ方があり、参照した試験が合格していることを自己検査します（SPEC 第11節）。`docs/kernel.md` の第7節に、「適合性テストが規範の表から試験を生成するので、表と実装の食い違いは試験の不合格として現れる」と書かれています。
-- 先行研究との違いの見込み：「強制していないことを、表の中で、約束として公開する」という規律を、仕様の義務（MUST）にしている点です。AGT などが、強制していない約束を公開しているかどうかは、調査していません。
+- 先行例：権限の設定からテストを機械的に作る技法は、ctrlAI にあります（第3.1節）。`generate_permission_tests()` が、登録簿の許可の集合から期待値を作り、判定の関数と比べます。業務の API の領域で、公開のコードに実装があります。したがって、「権限の表からテストを生成する」こと自体は、新しい貢献として主張しません。VGDD の適合性テスト（C1）は、この技法の、開発の工程への適用です。
+- 違い（コードで確かめた事実）：
+  - ctrlAI は、許可の集合から期待値を導きます。VGDD の probe と `expect` は、権限の表に手で書かれています。機械的に増えるのは、probe と役割の組み合わせです（`run.mjs` の C1）。
+  - VGDD は、probe を実際のフックのスクリプトに入力し、止めるべきものと通すべきものの両方を試します。前の版にかけて、新しい試験だけが落ちることも確かめます（SPEC 第11節）。ctrlAI の `evals.py` には、前の版にかける処理は見当たりませんでした。
+  - これらの違いが、見落としを減らすかどうかは、比べていません。貢献と言えるほどの差かどうかは、未検証です。
+- 残る候補：`promise` の公開を仕様の義務（MUST）にする規律です。ctrlAI、AgentPolicyPack、AGT などが、強制していない約束を公開しているかどうかは、調べていません。
 - まだ示せていないこと：
   - 約束の公開が、利用者の誤解を実際に減らすかどうか。
-  - 表から試験を生成する方式が、手で書いた試験より、見落としを減らすかどうか。比べていません。
   - 表の `probes` の網羅の程度を、独立に評価していません。実際、`docs/kernel.md` の不変条件の表では、INV-03、07、08、11 は「一部」、INV-09 は「対象外」です。
 
 #### 候補3：統治の仕組み自身の穴を「判例」にして、前の版にかけて新しい判例だけが落ちることを確かめてから改正する手続き
@@ -648,16 +704,22 @@ VGDD は、Claude Code のフックと権限を、自身の Kernel の部品と�
   - 改正の履歴は、一人のオーナーの一つのプロジェクトに限られます。
   - 憲法審査の結果は、公開されていないので、第三者は確かめられません（`docs/validation.md`）。
 
-#### 候補4：権限の差分（Authority Delta）
+#### 候補4：権限の差分（Authority Delta。規則の変更の分類は、先行例がある）
 
-仮説：権限の表の変更を、機械的に、「締める」「緩める」「分類できない」に分類し、緩める変更を、AI の改善の提案が通る通常の経路に乗せない。
+仮説：権限の表の変更を、機械的に「締める」「緩める」「分類できない」に分類し、緩める変更を、AI の改善の提案が通る通常の経路に乗せない。
 
 - 状態：試作です。`vgdd/next/` にある起草段階のもので、実装済みとは書けません。
-- 近い先行研究：論文1の 9.1 節（権限の境界や検証器を広げる経路への懸念。critic の更新は単調な変更に限る）、論文5の表12（目標と安全の制約の変更には人間のレビューを必須にする）、Progent（最小権限の記述言語）、OPA と Cedar（ポリシーの分析）。ポリシーの変更の差分を分類する研究は、今回の検索では確認していませんが、調べた範囲が限られています。
+- 先行例：規則の変更を締める／緩めるに機械的に分類し、証明できないものを緩める側に倒す技法は、Maku にあります（`structural.go`、第3.1節）。AgentPolicyPack にも、規則の変更の分類があります（`diffing.py`）。したがって、分類そのものは、新しい貢献として主張しません。既存の技法の適用です。
+- 違い（コードと文書で確かめた事実）：
+  - 分類の対象が違います。Maku は merge の方針（自動 merge してよい変更の種類）を、VGDD は権限の表（役割ごとの許可、強制の層、確かめ方と判例、不変条件）を分類します。
+  - 必要な検査の削除を緩める側に数える点は、同じです。Maku は `checks`、`holdoutChecks`、`testFirst` の削除を緩める側に数えます。VGDD は、権限の表の probe と判例の削除や書き換え、不変条件の格下げを緩める側に数えます。不変条件の格下げに当たる行は、Maku には見当たりません。
+  - 結果が三つか四つかの違いもあります。VGDD の「分類できない」は、規則にない欄の変更、穴の記載の削除、法律の系統の変更などで、緩める側と同じ経路に回します。
+  - 結果の使い方が違います。Maku は、緩んだ `live` の種類を自動で shadow に落とします。VGDD の設計は、緩める変更を憲法審査とオーナーの承認の経路に回すことで、運用にはつないでいません。
+- 違いが貢献と言えるほどのものかは、未検証です。権限の表を対象にする、確かめ方の弱体化を緩める側に数える、という点が、実際の事故を防ぐかは示していません。
 - まだ示せていないこと：
-  - 分類が、実際の権限の表の変更に対して、正しいか（取りこぼしや誤分類）を示せていません。
-  - 「分類できない」と判定されたものの割合と、その扱いの手間を示せていません。
-  - 実運用で、緩める変更が、実際に別の経路に乗って人の承認を受けた記録が、まだありません。
+  - 分類が、実際の権限の表の変更に対して、正しいか（取りこぼしや誤分類）。過去の 15 回の改正に当てた結果（`vgdd/next/README.md` 第4.5節）は、1 人の目視による確認にとどまります。
+  - 「分類できない」と判定されたものの割合と、その扱いの手間。
+  - 実運用で、緩める変更が、別の経路に乗って人の承認を受けた記録。
 
 #### 候補5：編成案の検証
 
@@ -685,7 +747,14 @@ VGDD は、Claude Code のフックと権限を、自身の Kernel の部品と�
 
 VGDD の独自の設計として根拠を挙げられるのは、人が立法の効力を持つ配置、承認が対象と範囲に結びつく仕組み、司法が使えないことを判定として扱わない規則などです。これらは、VGDD 自身の文書と、適合性テストの結果で確かめられています。
 
-新しい技術的貢献の候補として挙げたものは、どれも、仮説の段階にあります。特に候補4から6は試作で、効果を示すデータはまだありません。候補1から3も、一つのオーナー、一つの題材、一つの環境での記録に基づいています。第三者による再現と、比較実験が、示すべき次の課題です。
+2026-11-14 の一次の資料での確認で、二つの技法に公開の先行実装があると分かりました。権限の設定からのテストの生成（ctrlAI）と、規則の変更の締める／緩めるの分類（Maku、AgentPolicyPack）です。そこで候補2と候補4は、次のように位置づけ直しました。
+
+- 候補2：テストの生成は「既存の技法の適用」です。残る候補は、強制していない約束を公開する規律だけです。
+- 候補4：分類は「既存の技法の適用」です。権限の表を対象にする点などの違いはありますが、貢献と言えるほどかは未検証です。
+
+新規性は、個々の要素が存在するかどうかでは比べられません。要素をどう結び付け、どの迂回路を防ぎ、どの保証を検証したかで比べる必要があります。VGDD の候補は、その比較をまだ満たしていません。候補3、5、6は、先行の実装を今回の調査では確認できませんでしたが、「見つからなかった」は「存在しない」の証明ではありません。
+
+候補4から6は試作で、効果を示すデータはまだありません。候補1と3も、一つのオーナー、一つの題材、一つの環境での記録に基づきます。第三者による再現と、比較実験が、示すべき次の課題です。
 
 ## 6. 未確認事項の一覧
 
@@ -698,8 +767,8 @@ VGDD の独自の設計として根拠を挙げられるのは、人が立法の
 - 論文3（AdaptOrch）：コードのリポジトリの実在、内容、ライセンス。整合スコアの閾値 θCS の値。著者の所属。査読の有無（記載なし）。
 - 論文4（Scaling Agent Systems）：初版の投稿日。査読と採択の状況。コードのライセンス。ブログと v3 の数値の差の理由。
 - 論文5（Self-Evolving Agents）：著者27名のうち後半の所属の対応。各ベンチマークの数値の網羅。SICA の ID。
-- 論文6（From Benchmarks to Deployment）：後半約15万字は未読。限界の指摘は、取得ツールの要約に依り、全文での検証ではない。
-- 論文7（LLM-Based Multi-Agent Orchestration）：本文が未確認で、要旨だけ。6次元の評価枠組みの中身、各フレームワークの個別の評価、限界の節。
+- 論文6（From Benchmarks to Deployment）：2026-11-14 に Springer の本文（約16万字）を取得し、二つの合成指標の式（第5節の周辺と第7節）と、評価例の `8/25 ≈ 45%` を確かめた（8/25 は 32% で、本文の算術が合わない）。費用の式は `log(1 + Cost_Ratio)` と `log(Cost Ratio)` の二通りが本文にある。報告の「六つの軸」の表は、軸ごとの照合をしていない。限界の指摘は、取得ツールの要約に依る。
+- 論文7（LLM-Based Multi-Agent Orchestration）：2026-11-14 も出版社のページは 403 で、本文を取得できなかった（Crossref の要旨だけ）。6次元の定義と、比較した枠組みの範囲（要旨は6つ、報告は9つ以上）は未確認。報告の内容は未確認の二次情報のまま。
 - 論文8（ACE）：複数回の試行の分散や信頼区間。付録の B と C（拡張した関連研究と議論）の詳細。Dynamic Cheatsheet、Reflexion、TextGrad の URL。
 
 ### 6.2 追加調査の未確認
@@ -708,19 +777,20 @@ VGDD の独自の設計として根拠を挙げられるのは、人が立法の
 - Devin の公式の情報。Kiro のライセンス。BMAD の LICENSE の実体（README と GitHub のメタデータが不一致）。
 - AgentCore Policy が Cedar を採用している点（二次情報）。
 - NetX の司法の層のページの内容（200 の応答も未確認）。
-- AgentCity、NetX、PEA、AgentSpec、GaaS のコード公開の有無。Institutional AI のコード。
-- モノカルチャー系の論文の本文（題名と日付だけ確認）。
+- AgentCity、NetX、PEA、AgentSpec、GaaS のコード公開の有無。Institutional AI のコード。AgentCity の公式サイト（`agentcity.dev`）の SWE-bench 評価。
+- 公開の実装（Maku、ctrlAI、AgentPolicyPack、AgentBoardroom、Gavel）は、コードを読んだだけで、動かしていない。分類器とテスト生成器の網羅性、誤分類の割合は未検証。Maku の merge 判定にモデルを使わないかどうかは、文書に明示がない。AgentBoardroom の `checkWriteAccess` の呼び出し元は、検索で見つからなかった。
+- ctrlAI のライセンス（ファイルなし）。
+- Maku、ctrlAI、AgentPolicyPack 以外に、権限の表からのテスト生成や規則の差分の分類を持つ実装があるか。今回の検索は限られている。
+- モノカルチャー系の論文は、数値を確かめたが、開発の審査役の見逃しへの当てはめは未検証。PEA の数値の独立した再現は未確認。
 - LawClaw の本文（未精読）。
 - 比較表の「未確認」の欄は、取得した資料に記載がないという意味で、「なし」を意味しない。
 - Gödel Machine（Schmidhuber 2003）、Vingean reflection、Huxley-Gödel Machine、Live-SWE-Agent の URL は、本文から確認できなかった。
 
 ### 6.3 材料の間の食い違い
 
-- 論文4：ブログと arXiv v3 の本文で、構成の数、ベンチマークの種類、説明力が違う（第2.4節の表）。この文書では v3 を使いました。
-- MS AGT：OWASP Agentic Top 10 の被覆について、10/10 という記述と、7 が Full で 3 が Partial というバッジが矛盾しています。
-- BMAD：README は MIT、GitHub のメタデータは NOASSERTION で不一致です。
-- 論文6：論文自体の内部に、採択基準の閾値、論文数、手法の記述に整合しない点が指摘されています（取得ツールの要約による）。
-- 論文3：Qwen の実行基盤、MMLU の ε、命題1の定数に、本文内の不整合があります。
+- 論文3、4、6、MS AGT、BMAD の本文内や資料間の食い違いは、第2節と第3節の各項に書きました。論文4は、この文書で v3 の値を使っています。
+- 調査報告（`dr-4-prior-work-fulltext.md`）と一次の資料の食い違い：AgentCity の pilot は「n=5」で、5 エージェントとは書かれていない。Institutional AI の「重い共謀 50% から 5.6%」と平均 tier の数値は、どちらも本文にある。PEA の日付は、報告が指す版の不一致を確かめていない。詳しくは `handoff-notes/dr-4-verification.md`。
+- Strategic Algorithmic Monoculture：人の一致率が、序文で 3.5%、結果の節で 4% と書かれている。
 - VGDD 自身の文書：`docs/validation.md` は法律 p0.4.8（414件）の時点で、`vgdd/kernel/capabilities.json` の `kernel_version` は p0.4.14、`vgdd/kernel/SPEC.md` の見出しは p0.4.10 で、本文は p0.4.14 までの記述を含みます。p0.4.14 の適合性テストは 527 件で、2026-11-14 にこのリポジトリの写しで実行した結果は 525 件の合格でした（`vgdd/next/README.md` の基準の節）。
 
 ### 6.4 VGDD 自身についての未確認
@@ -748,11 +818,7 @@ VGDD の独自の設計として根拠を挙げられるのは、人が立法の
 
 追加の先行研究と実装（材料が HTTP 200 または取得の確認をしているもの）：
 
-- AgentCity：`https://arxiv.org/abs/2604.07007`
-- Logic Monopoly と NetX：`https://arxiv.org/abs/2603.25100`
-- PEA：`https://arxiv.org/abs/2604.23646`
 - Microsoft Agent Governance Toolkit：`https://github.com/microsoft/agent-governance-toolkit`
-- Institutional AI：`https://arxiv.org/abs/2601.11369`、`https://arxiv.org/abs/2601.10599`
 - AgentSpec：`https://arxiv.org/abs/2503.18666`
 - GaaS：`https://arxiv.org/abs/2508.18765`
 - Progent：`https://arxiv.org/abs/2504.11703`、`https://github.com/sunblaze-ucb/progent`
@@ -764,8 +830,11 @@ VGDD の独自の設計として根拠を挙げられるのは、人が立法の
 - LangGraph：`https://docs.langchain.com/oss/python/langgraph/interrupts`、`https://docs.langchain.com/oss/python/langgraph/durable-execution`。Temporal：`https://docs.temporal.io/ai-cookbook/human-in-the-loop-python`
 - Darwin Gödel Machine：`https://arxiv.org/abs/2505.22954`、`https://github.com/jennyzzt/dgm`。ADAS：`https://arxiv.org/abs/2408.08435`、`https://github.com/ShengranHu/ADAS`
 - MAST：`https://arxiv.org/abs/2503.13657`。Risk Analysis Techniques for Governed LLM-based MAS：`https://arxiv.org/abs/2508.05687`
-- モノカルチャー系（題名と日付のみ API で確認）：`https://arxiv.org/abs/2606.26583`、`https://arxiv.org/abs/2604.09502`、`https://arxiv.org/abs/2609.04373`
+- モノカルチャー系（2026-11-14 に arXiv の HTML 本文で数値を確認）：`https://arxiv.org/html/2606.26583`、`https://arxiv.org/html/2604.09502v2`、`https://arxiv.org/html/2609.04373`
 - LawClaw の記事：`https://dev.to/nghiahsgs/i-built-an-ai-agent-that-governs-itself-separation-of-powers-for-llms-123`（実在のみ確認）
+- 2026-11-14 に、一次の資料（HTML 本文、GitHub のコードと API）で確認したもの：
+  - 論文：`https://arxiv.org/abs/2604.07007`、`https://arxiv.org/html/2604.07007v1`（AgentCity）、`https://arxiv.org/html/2603.25100v1`（Logic Monopoly）、`https://arxiv.org/html/2604.23646v1`（PEA）、`https://arxiv.org/html/2601.11369v2`（Institutional AI）。From Benchmarks to Deployment の本文：`https://link.springer.com/article/10.1007/s10462-026-11571-0`。
+  - 実装：`https://github.com/Smana/maku`（Apache-2.0）、`https://github.com/GautamRonanki/ctrlAI`（ライセンスのファイルなし）、`https://github.com/sekacorn/AgentPolicyPack`（Apache-2.0）、`https://github.com/GixGosu/AgentBoardroom`（MIT）、`https://github.com/jlugo63/gavel`（MIT）。
 - 論文の本文に ID があり、抽出で確認されたもの：Your agent may misevolve `https://arxiv.org/abs/2509.26354`、Alignment Tipping Process `https://arxiv.org/abs/2510.04860`、Agent-SafetyBench `https://arxiv.org/abs/2412.14470`、Reflective oracles `https://arxiv.org/abs/1508.04145`、GEPA `https://arxiv.org/abs/2507.19457`、The Prompt Alchemist `https://arxiv.org/abs/2501.01329`
 
 ### 7.2 アクセスの確認が取れていないもの
@@ -776,7 +845,7 @@ VGDD の独自の設計として根拠を挙げられるのは、人が立法の
 - 論文3の関連研究（記憶に基づく ID）：Mixture-of-Agents `https://arxiv.org/abs/2406.04692`、Self-MoA `https://arxiv.org/abs/2502.00674`。Anthropic のブログ `https://www.anthropic.com/engineering/multi-agent-research-system`（到達は確認。内容は読んでいない）。arXiv 2502.00674 の題名は「Rethinking Mixture-of-Agents」で、Self-MoA がこの論文の手法名であることは本文で確かめていない。
 - 論文3のコード `https://github.com/adaptorch/adaptorch`：論文に記載があるが、2026-11-14 の取得では 404 で到達できなかった。論文4のコード `github.com/ybkim95/agent-scaling`：報告に記載があるが、リポジトリの実在と内容、ライセンスは未確認。
 - NetX の Judiciary Layer のページ：200 の応答は未確認。
-- URL 自体が取得できなかった、または掲載できないもの：ISO/IEC 42001（403）、MDPI と Preprints の本文（403）、Devin の公式ページ（未取得）、職務の分離の実務記事（アクセス未実施）。
+- URL 自体が取得できなかった、または掲載できないもの：ISO/IEC 42001（403）、MDPI と Preprints の本文（403。2026-11-14 に再試行しても同じ）、Devin の公式ページ（未取得）、職務の分離の実務記事（アクセス未実施）。
 - 論文の本文から URL を取り出せなかったもの：Gödel Machine、Vingean reflection、Huxley-Gödel Machine、Live-SWE-Agent、Self-Taught Optimizer、SICA、Dynamic Cheatsheet、Reflexion の原典、TextGrad、MIPROv2。
 
 ### 7.3 VGDD 自身の資料
