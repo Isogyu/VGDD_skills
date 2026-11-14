@@ -8,7 +8,7 @@ import { SCENARIOS, CATALOG } from '../bench/scenarios-team.mjs';
 const ctx = (o = {}) => ({
   catalog: CATALOG,
   ticket: { resources: ['src/**'], risk: 'low' },
-  limits: { workers: 2, depth: 2 },
+  limits: { concurrent_work: 2, depth: 2 },
   required: { judicial_min: 1, judicial_distinct_lineage: true },
   ...o,
 });
@@ -46,7 +46,7 @@ test('requires_approval（B-F4）: 常に true。plan の中身（proposed_by: o
   // 検査に落ちた編成にも付く
   assert.equal(validateTeam({ task: 't', proposed_by: 'executive_head', members: [W('w1')] }, ctx()).requires_approval, true);
   // 陽性の対照: 呼び出し側が認証した人のオーナーが渡したときだけ false（それでも効力は与えない）
-  const r = validateTeam(plan('whatever'), ctx({ proposer: { kind: 'human', role: 'owner' } }));
+  const r = validateTeam(plan('whatever'), ctx({ proposer: { kind: 'human', role: 'owner', id: 'azuki' } }));
   assert.equal(r.requires_approval, false);
   assert.equal(r.effect, 'none');
 });
@@ -149,6 +149,9 @@ test('B-F3: 系統は正規化して比べる。catalog が知っていれば pl
   // catalog に系統のない型は申告を受ける（許可された形のときだけ）
   const c2 = { ...CATALOG, worker: { ...CATALOG.worker, lineage: undefined } };
   const p2 = { task: 't', proposed_by: 'x', members: [{ ...W('w1'), lineage: 'Gemini' }, { id: 'j', template: 'codex_judge', scope: { resources: [], tools: [] } }] };
+  // 共通の語彙：知らない系統（Gemini）は申告として受けない
+  assert.ok(validateTeam(p2, ctx({ catalog: c2 })).violations.some((v) => v.guard === 'TM-LINEAGE-HONEST'));
+  p2.members[0].lineage = ' CLAUDE ';
   assert.equal(validateTeam(p2, ctx({ catalog: c2 })).ok, true);
   p2.members[0].lineage = 'codex';
   assert.equal(validateTeam(p2, ctx({ catalog: c2 })).ok, false);
@@ -163,7 +166,7 @@ test('B-F13: context の値は型を検査する（司法ゼロ・NaN・undefine
   }
   const plan1 = { task: 't', proposed_by: 'x', members: [W('w1'), J] };
   assert.ok(validateTeam(plan1, ctx({ required: { judicial_distinct_lineage: 'false' } })).violations.some((v) => v.guard === 'TM-CONTEXT-SHAPE'));
-  for (const lim of [{ workers: 2.5 }, { workers: NaN }, { workers: '2' }, { workers: 2, depth: -1 }, { workers: 2, members_total: 0 }, null]) assert.equal(validateTeam(plan1, ctx({ limits: lim })).ok, false, JSON.stringify(lim));
+  for (const lim of [{ concurrent_work: 2.5 }, { concurrent_work: NaN }, { concurrent_work: '2' }, { concurrent_work: 2, depth: -1 }, { concurrent_work: 2, members_total: 0 }, null]) assert.equal(validateTeam(plan1, ctx({ limits: lim })).ok, false, JSON.stringify(lim));
   assert.equal(validateTeam(plan1, ctx({ ticket: {} })).ok, false);
   assert.equal(validateTeam(plan1, ctx({ catalog: null })).ok, false);
   // 陽性の対照
@@ -177,19 +180,19 @@ test('B-F13: member の総数に上限（既定 16）。行政以外も数える
   assert.ok(r.violations.some((v) => v.guard === 'TM-MEMBER-LIMIT'));
   assert.equal(validateTeam(many(15), ctx()).ok, true); // 合計 16
   assert.equal(validateTeam(many(16), ctx()).ok, false);
-  assert.equal(validateTeam(many(16), ctx({ limits: { workers: 2, depth: 2, members_total: 32 } })).ok, true);
+  assert.equal(validateTeam(many(16), ctx({ limits: { concurrent_work: 2, depth: 2, members_total: 32 } })).ok, true);
 });
 
 test('B-F13: 大きな plan でも線形の時間で終わる（深さ・循環の検査）', () => {
   const ms = [{ ...J }];
   for (let i = 0; i < 20000; i++) ms.push({ id: 'h' + i, template: 'executive_head', lineage: 'claude', parent: i ? 'h' + (i - 1) : null, scope: { resources: ['src/a'], tools: ['Read'] } });
   const t = Date.now();
-  const r = validateTeam({ task: 't', proposed_by: 'x', members: ms }, ctx({ limits: { workers: 1000, depth: 2, members_total: 64 } }));
+  const r = validateTeam({ task: 't', proposed_by: 'x', members: ms }, ctx({ limits: { concurrent_work: 1000, depth: 2, members_total: 64 } }));
   assert.ok(Date.now() - t < 5000, `所要 ${Date.now() - t}ms`);
   assert.ok(r.violations.some((v) => v.guard === 'TM-MEMBER-LIMIT'));
   const cyc = Array.from({ length: 3000 }, (_, i) => ({ id: 'c' + i, template: 'executive_head', lineage: 'claude', parent: 'c' + ((i + 1) % 3000), scope: { resources: ['src/a'], tools: ['Read'] } }));
   const t2 = Date.now();
-  const r2 = validateTeam({ task: 't', proposed_by: 'x', members: cyc }, ctx({ limits: { workers: 1e9 } }));
+  const r2 = validateTeam({ task: 't', proposed_by: 'x', members: cyc }, ctx({ limits: { concurrent_work: 1e9 } }));
   assert.ok(Date.now() - t2 < 5000);
   assert.ok(r2.violations.some((v) => v.guard === 'TM-DELEG-CYCLE'));
 });
@@ -198,4 +201,15 @@ test('検査は例外を投げず違反にする（壊れた入力）', () => {
   const evil = { task: 't', proposed_by: 'x', get members() { throw new Error('boom'); } };
   assert.doesNotThrow(() => validateTeam(evil, ctx()));
   assert.equal(validateTeam(evil, ctx()).ok, false);
+});
+
+test('語彙：limits.concurrent_work は作業員（worker・tester）の数で、行政の長は数えず 1 体まで。旧名 workers は受けない', () => {
+  const H = { id: 'h', template: 'executive_head', lineage: 'claude', scope: { resources: ['src/**'], tools: ['Read', 'Agent'] } };
+  const plan = (ms) => ({ task: 't', proposed_by: 'x', members: [...ms, J] });
+  assert.equal(validateTeam(plan([H, W('w1', ['src/a/**']), W('w2', ['src/b/**'])]), ctx({ limits: { concurrent_work: 2 } })).ok, true, '長＋作業員 2 は同時 2 に収まる');
+  assert.ok(validateTeam(plan([W('w1', ['src/a/**']), W('w2', ['src/b/**']), W('w3', ['src/c/**'])]), ctx({ limits: { concurrent_work: 2 } })).violations.some((v) => v.guard === 'TM-WORKER-LIMIT'));
+  assert.ok(validateTeam(plan([H, { ...H, id: 'h2' }]), ctx({ limits: { concurrent_work: 2 } })).violations.some((v) => v.guard === 'TM-WORKER-LIMIT'));
+  assert.ok(validateTeam(plan([W('w1')]), ctx({ limits: { workers: 2 } })).violations.some((v) => v.guard === 'TM-CONTEXT-SHAPE' && /concurrent_work/.test(v.reason)));
+  // 系統の別名は受けない
+  assert.ok(validateTeam(plan([{ ...W('w1'), lineage: 'anthropic' }]), ctx()).violations.some((v) => v.guard === 'TM-LINEAGE-HONEST'));
 });

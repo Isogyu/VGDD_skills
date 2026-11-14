@@ -3,7 +3,7 @@
   "id": "research-report",
   "title": "調査報告書（非開発の例。このパックで実際に仕事を回したことはない）",
   "work_item": {
-    "id_pattern": "^R-[0-9]{3,4}$",
+    "id": { "prefix": "R-", "digits": [3, 4] },
     "store": "reports/items",
     "spec_sections": ["問い", "受け入れ条件"],
     "resource_field": "sections_allowed"

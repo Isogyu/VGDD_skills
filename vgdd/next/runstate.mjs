@@ -37,20 +37,27 @@
 //     実時間との比較は呼び出し側の Date.now なので、過去の時刻を使うことは止めない（過去の時刻は「記録の上の今」を進めないので、期限の判定は動かない）。
 //     記録のファイルを直接書ける者（オーナーの権限）が未来の時刻の行を足すことは止められない（clock_reset で正す）
 //   - lease は期限の記録だけで、プロセスの生死は見ない（長時間の実行の延長・生存確認の出来事は未実装。lease_sec の上限は7日）
-//   - 節の id は小文字だけ（^[a-z0-9][a-z0-9._-]{0,63}$）。大文字を含む票の id は呼び出し側で写す（別物として通さないため）
+//   - 節の id は票の ID（lib/vocab.mjs の宣言の形。config の work_item、既定は T- と 3〜4 桁）。大文字小文字は畳まない（書いたとおり）。
+//     宣言を確かめるのは新しく足す節の id だけ（既存の節への参照は RS-NODE-EXISTS が見る）
+//   - 役割・行為者・系統・指紋・時刻・結論の名前は lib/vocab.mjs の語彙。行為者は { role, kind, id, lineage } で、全部品と同じ形
 //   - 古い規則の版の行は、オーナーの移行の記録（epoch）に覆われるときだけ、構造の検査（形・重複・存在・遷移）だけで受け入れる
 //   - 1つの出来事の処理は節の数に比例する（節 2000・依存の総数 20000 で数十ミリ秒の見込み。試験で1秒以内を確かめる）
 
 import { openChain, digest, canonical, sha256, Refused, nowIso } from './lib/chain.mjs';
-import { buildGraph, check as tgCheck, ready as tgReady, schedule, recommend, STATUSES, MAX_NODES } from './taskgraph.mjs';
+import { buildGraph, check as tgCheck, ready as tgReady, schedule, recommend, MAX_NODES, parsePattern, overlap } from './taskgraph.mjs';
+import {
+  parseActor as vocabParseActor, isOwner, normActorId, normLineage, makeWorkItemId, parseWorkItemSpec, sameWorkItemSpec, DEFAULT_WORK_ITEM,
+  isDigest, asDigest, isLineHash, isArtifactRef, isPolicyLine, isRequirementId, reviewModeOf, REVIEW_KINDS, VERDICTS, AUDIT_RESULTS, STATUSES,
+  parseVerdictId, parseAuditId, parseFindingRef, refHead12, parseTs, refusal as vocabRefusal,
+} from './lib/vocab.mjs';
 
 export const RECORD_TYPE = 'vgdd.runstate.v1';
 /** 規則の版。ガードの規則を変えるたびに上げる。各行に rules として記録する（improvement.mjs と同じ。epoch で古い行を覆う） */
-export const RULES = 'rs.v1';
+export const RULES = 'rs.v2';
 export const MAX_EVENTS = 20000;
 /** 人（human）の出来事のために取っておく枠。人以外の出来事は、MAX_EVENTS - HUMAN_RESERVE に達したら拒む（行政が使い切ってオーナーの stop・epoch を塞がない） */
 export const HUMAN_RESERVE = 2000;
-export const MAX_AI_PLANS = 500; // 行政（role: executive）の plan の回数の上限（kind を名乗り変えても数える）
+export const MAX_AI_PLANS = 500; // 行政の長（role: executive_head）の plan の回数の上限
 export const MAX_PLAN_NODES = 200; // 1回の plan で足せる節の数
 export const HUMAN_NODE_RESERVE = 200; // 節の上限のうち、オーナー（human）のために取ってある数
 export const TIME_FUTURE_MS = 5 * 60e3; // 追記する側の実時間より先に進めてよい幅
@@ -64,49 +71,64 @@ const BUSY = new Set(['in_progress', 'review', 'held']); // 未統合の作業�
 const SLOT = ['in_progress', 'review']; // 作業員の枠を使う状態（held は人の承認待ちで枠を使わない）
 const MAX_VERDICTS = 8;
 const MAX_PLAN_SUPERSEDE = 500;
+const MAX_FINDING_REFS = 64;
+const MAX_REQUEST_HISTORY = 100; // 節に残す申請の履歴の件数（古いものから落とし、落とした数を requests_dropped に数える）
+const MAX_PROTECTED = 64;
+const MAX_REQUIREMENTS = 32;
 
 /** 設定（config の出来事の内容）の既定（SPEC §5・§6・§9 に合わせる）。範囲は CFG_BOUNDS */
+//   concurrent_work：同時に動かす作業（in_progress と review の節）の数の上限。team.mjs の limits.concurrent_work と同じ意味（作業員の同時の数）。
+//   work_item：節の id の宣言（vocab の票の ID）。protected：触ってはならない範囲（領域パックの protected を写す。bridge.protectedFromDomainPack）
 export const DEFAULT_CONFIG = Object.freeze({
-  hold: false, max_attempts: 4, max_returns: 3, max_unavailable: 3, workers: 1, lease_sec: 21600, policy_line: null,
+  hold: false, max_attempts: 4, max_returns: 3, max_unavailable: 3, concurrent_work: 1, lease_sec: 21600, policy_line: null,
   judiciary: Object.freeze([Object.freeze({ kind: 'judge', lineage: 'claude' }), Object.freeze({ kind: 'judge', lineage: 'codex' })]), security_lineage: 'codex',
+  work_item: DEFAULT_WORK_ITEM, protected: Object.freeze([]),
 });
-const CFG_BOUNDS = { max_attempts: [1, 10], max_returns: [1, 3], max_unavailable: [1, 3], workers: [0, 64], lease_sec: [1, 604800] };
+const CFG_BOUNDS = { max_attempts: [1, 10], max_returns: [1, 3], max_unavailable: [1, 3], concurrent_work: [0, 64], lease_sec: [1, 604800] };
 
-// ---- 役割と種類（行為者） ----
-export const ROLES = ['owner', 'executive', 'night_agent', 'court', 'reaper'];
-export const KINDS = ['human', 'ai', 'script'];
-/** op → 起こせる役割（SPEC §5 の表・§6・§7・§8）。種類（human/ai/script）は別の表で別のガードが見る */
+// ---- 役割（行為者） ----
+// 役割の名前・種類は lib/vocab.mjs の表（capabilities.json の名前）。役割ごとの種類（human・ai・script）は vocab の parseActor が確かめるので、
+// この部品は「どの役割がどの出来事を起こせるか」だけを持つ（rs.v1 の RS-KIND-OP は、役割と種類の対応が vocab に移ったので要らなくなった）。
+//
+// 作業員（worker・tester）は行為者にしない：SPEC §2・§5 で、着手（作業員の起動）と統合の申請は行政の長（昼）と夜間の代行の権限で、
+// 作業員は自分の worktree の中だけを書く。作業員を行為者にすると、作業員が自分の仕事を申請に回す経路が増える。
+// 代わりに、start の任意の項目 assignee に作業員の行為者（role: worker・tester）を記録する（追跡と経験の評価のため。権限は与えない）。
+/** この部品の出来事を起こせる役割 */
+export const ROLES = Object.freeze(['owner', 'executive_head', 'night_runner', 'gate_runner', 'reaper']);
+/** op → 起こせる役割（SPEC §5 の表・§6・§7・§8） */
 const ROLE_OPS = {
-  config: ['owner'], clock_reset: ['owner'], plan: ['executive', 'owner'], approve: ['owner'], start: ['executive', 'night_agent'], submit: ['executive', 'night_agent'],
-  verdict: ['court'], release: ['owner'], rule: ['owner'], unblock: ['owner'], annul: ['owner'],
-  expire: ['court', 'night_agent', 'reaper'], stop: ['owner'], resume: ['owner'], epoch: ['owner'],
+  config: ['owner'], clock_reset: ['owner'], plan: ['executive_head', 'owner'], approve: ['owner'], start: ['executive_head', 'night_runner'], submit: ['executive_head', 'night_runner'],
+  verdict: ['gate_runner'], release: ['owner'], rule: ['owner'], unblock: ['owner'], annul: ['owner'],
+  expire: ['gate_runner', 'night_runner', 'reaper'], stop: ['owner'], resume: ['owner'], epoch: ['owner'],
 };
-const KIND_OPS = {
-  config: ['human'], clock_reset: ['human'], plan: ['ai', 'human'], approve: ['human'], start: ['ai', 'human', 'script'], submit: ['ai', 'human', 'script'],
-  verdict: ['script'], release: ['human'], rule: ['human'], unblock: ['human'], annul: ['human'],
-  expire: ['script'], stop: ['human'], resume: ['human'], epoch: ['human'],
-};
+const ASSIGNEE_ROLES = new Set(['worker', 'tester']);
 
 // ---- 文字列の正規化と許可リスト（NFKC・前後の空白を落としてから、決まった形だけを受ける） ----
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const nf = (s) => (typeof s === 'string' ? s.normalize('NFKC').trim() : null);
-const NODE_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
-const NAME_RE = /^[a-z][a-z0-9_.-]{0,39}$/;
-const ROLE_RE = /^[a-z][a-z0-9_]{0,39}$/;
-const LINEAGE_RE = /^[a-z][a-z0-9_]{0,39}$/; // ハイフンを許さない（openai と open-ai を別の系統にしない）
+// event_id は、この部品の冪等の鍵（役割・ID・系統の語彙ではない）。節の id の形は vocab の票の ID の宣言（config）で、RS-WORK-ITEM-ID が見る
 const EVENT_ID_RE = /^[a-z0-9][a-z0-9._:-]{0,127}$/;
-const DIGEST_RE = /^sha256:[0-9a-f]{64}$/;
-const REQUEST_RE = /^(sha256:[0-9a-f]{64}|[0-9a-f]{7,64})$/;
-const POLICY_RE = /^p\d+\.\d+$/;
 const REASON_RE = /^[^\p{Cc}\p{Cf}]+$/u;
 const tok = (re) => (v) => { const s = nf(v); return s !== null && re.test(s) ? { v: s } : { e: '形が正しくない' }; };
+/** vocab の述語で受ける（NFKC・trim の後に確かめる。書いたとおりの綴りでなければ、再生で RS の綴りの検査が止める） */
+const pred = (fn, what) => (v) => { const s = nf(v); return s !== null && fn(s) ? { v: s } : { e: `${what}の形でない` }; };
+/** 節の id の受け口：書いたとおり（NFKC で変わる全角・前後の空白は拒む）の、空白・制御文字のない 1〜32 字の文字列（宣言の形は RS-WORK-ITEM-ID が config で確かめる） */
+const nodeP = (v) => { const s = nf(v); return s !== null && s === v && s.length >= 1 && s.length <= 32 && !/[\s\p{C}]/u.test(s) ? { v: s } : { e: '節の id が 1〜32 字の空白・制御文字のない文字列でない' }; };
+const lineageP = (v) => { const s = normLineage(v); return s !== null ? { v: s } : { e: '知っている系統（vocab の LINEAGES）でない' }; };
+const judgeNameP = (v) => { const s = normActorId(v); return s !== null && s === v ? { v: s } : { e: '審査者の名前が行為者の id の形でない' }; };
+const actorP = (roles) => (v) => { const a = vocabParseActor(v); if (!a.ok) return { e: `行為者の形でない（${a.errors[0]}）` }; return roles.has(a.actor.role) ? { v: a.actor } : { e: `役割 ${a.actor.role} は使えない` }; };
 const reasonP = (v) => { const s = nf(v); return s !== null && s.length >= 1 && s.length <= 1000 && REASON_RE.test(s) ? { v: s } : { e: '理由が空・長すぎる・制御文字を含む' }; };
 const intP = (min, max) => (v) => (Number.isSafeInteger(v) && v >= min && v <= max ? { v } : { e: `${min}〜${max} の整数でない` });
 const enumP = (...xs) => (v) => { const s = nf(v); return s !== null && xs.includes(s) ? { v: s } : { e: `${xs.join('/')} のどれかでない` }; };
 const boolP = (v) => (v === true || v === false ? { v } : { e: '真偽値でない' });
 const resP = (v) => (typeof v === 'string' && v.length >= 1 && v.length <= 512 && !/\p{C}/u.test(v) ? { v } : { e: 'resources の要素が文字列（512字以内・制御文字なし）でない' });
-const hashP = (v) => (v === 'genesis' || (typeof v === 'string' && /^[0-9a-f]{64}$/.test(v)) ? { v } : { e: 'ハッシュの形でない' });
-const policyOrNullP = (v) => (v === null ? { v: null } : tok(POLICY_RE)(v));
+const hashP = (v) => (v === 'genesis' || isLineHash(v) ? { v } : { e: 'ハッシュの形でない' });
+const policyP = pred(isPolicyLine, '法律の系統（pN.N）');
+const policyOrNullP = (v) => (v === null ? { v: null } : policyP(v));
+const digestP = pred(isDigest, '指紋（sha256:<64桁>）');
+const refP = pred(isArtifactRef, '参照（40桁の16進か sha256:<64桁>）');
+const workItemP = (v) => { const s = parseWorkItemSpec(v); return s ? { v: s } : { e: '票の ID の宣言 { prefix, digits: [最小, 最大] } でない' }; };
+const patternP = (v) => (typeof v === 'string' && parsePattern(v) ? { v } : { e: '範囲の形（taskgraph が扱える literal・dir/**・prefix*）でない' });
 function listP(item, max, { unique = false, sortKey = null, min = 0 } = {}) {
   return (v) => {
     if (!Array.isArray(v) || v.length > max || v.length < min) return { e: `配列（${min}〜${max}個）でない` };
@@ -129,24 +151,35 @@ function objP(req, opt = {}) {
   };
 }
 
-const nodeP = tok(NODE_RE);
+const reqIdP = pred(isRequirementId, '要件の ID');
 const nodeDefP = objP({ id: nodeP, depends_on: listP(nodeP, MAX_DEPS_PER_NODE, { unique: true, sortKey: (x) => x }), resources: listP(resP, 64, { sortKey: (x) => x }) },
-  { risk: enumP('low', 'mid', 'high'), security_review: boolP });
-const judiciaryItemP = objP({ kind: enumP('judge'), lineage: tok(LINEAGE_RE) });
-const verdictItemP = objP({ kind: enumP('judge', 'security'), judge: tok(NAME_RE), lineage: tok(LINEAGE_RE), verdict: enumP('APPROVED', 'CHANGES_REQUIRED', 'UNAVAILABLE'), major: boolP });
+  { risk: enumP('low', 'mid', 'high'), security_review: boolP, requirements: listP(reqIdP, MAX_REQUIREMENTS, { unique: true, sortKey: (x) => x }) });
+// 必須の審査は、trace の審査の種類（vocab の REVIEW_MODES）に写せる（種類, 系統）だけ（写せない審査の判定は追跡に残せない）
+const judgeLineageP = (v) => { const r = lineageP(v); return r.e ? r : (reviewModeOf('judge', r.v) ? r : { e: `judge の系統 ${r.v} は審査の種類に写せない` }); };
+const securityLineageP = (v) => { const r = lineageP(v); return r.e ? r : (reviewModeOf('security', r.v) ? r : { e: `security の系統 ${r.v} は審査の種類に写せない` }); };
+const judiciaryItemP = objP({ kind: enumP('judge'), lineage: judgeLineageP });
+const verdictItemP = objP({ kind: enumP(...REVIEW_KINDS), judge: judgeNameP, lineage: lineageP, verdict: enumP(...VERDICTS), major: boolP });
+// 判定の参照（任意。この部品は中身を確かめない。あとで trace・experience が使う）：審査ごとの判定の id と指紋、指摘への参照の一覧、監査の id
+const verdictRefP = objP({ kind: enumP(...REVIEW_KINDS), lineage: lineageP, id: pred((x) => parseVerdictId(x) !== null, '判定の id') }, { digest: digestP });
+const refsP = objP({}, {
+  verdicts: listP(verdictRefP, MAX_VERDICTS, { sortKey: (x) => `${x.kind}:${x.lineage}` }),
+  findings: listP(pred((x) => parseFindingRef(x) !== null, '指摘への参照（<判定の id>#<ラベル>）'), MAX_FINDING_REFS, { unique: true, sortKey: (x) => x }),
+  audit: objP({ id: pred((x) => parseAuditId(x) !== null, '監査の id') }, { digest: digestP }),
+});
 const SCHEMA = {
   config: objP({ hold: boolP, max_attempts: intP(...CFG_BOUNDS.max_attempts), max_returns: intP(...CFG_BOUNDS.max_returns), max_unavailable: intP(...CFG_BOUNDS.max_unavailable),
-    workers: intP(...CFG_BOUNDS.workers), lease_sec: intP(...CFG_BOUNDS.lease_sec), policy_line: policyOrNullP,
-    judiciary: listP(judiciaryItemP, 6, { unique: true, min: 1, sortKey: (x) => x.lineage }), security_lineage: tok(LINEAGE_RE) }, { reason: reasonP }),
+    concurrent_work: intP(...CFG_BOUNDS.concurrent_work), lease_sec: intP(...CFG_BOUNDS.lease_sec), policy_line: policyOrNullP,
+    judiciary: listP(judiciaryItemP, 6, { unique: true, min: 1, sortKey: (x) => x.lineage }), security_lineage: securityLineageP,
+    work_item: workItemP, protected: listP(patternP, MAX_PROTECTED, { unique: true, sortKey: (x) => x }) }, { reason: reasonP }),
   clock_reset: objP({}, { reason: reasonP }),
   plan: objP({ nodes: listP(nodeDefP, MAX_PLAN_NODES) }, { supersede: listP(objP({ old: nodeP, new: nodeP }), MAX_PLAN_SUPERSEDE) }),
-  approve: objP({ node: nodeP, spec_digest: tok(DIGEST_RE), policy_line: tok(POLICY_RE), def_digest: tok(DIGEST_RE) }),
-  start: objP({ node: nodeP, spec_digest: tok(DIGEST_RE), lease_sec: intP(1, 604800) }),
-  submit: objP({ node: nodeP, request: tok(REQUEST_RE) }),
-  verdict: objP({ node: nodeP, request: tok(REQUEST_RE), audits: enumP('passed', 'failed', 'not_run'),
-    verdicts: listP(verdictItemP, MAX_VERDICTS, { sortKey: (x) => `${x.kind}:${x.lineage}` }) }),
-  release: objP({ node: nodeP, request: tok(REQUEST_RE) }),
-  rule: objP({ node: nodeP, request: tok(REQUEST_RE), decision: enumP('merge', 'return') }, { reason: reasonP }),
+  approve: objP({ node: nodeP, spec_digest: digestP, policy_line: policyP, def_digest: digestP }),
+  start: objP({ node: nodeP, spec_digest: digestP, lease_sec: intP(1, 604800) }, { assignee: actorP(ASSIGNEE_ROLES) }),
+  submit: objP({ node: nodeP, request: refP }),
+  verdict: objP({ node: nodeP, request: refP, audits: enumP(...AUDIT_RESULTS),
+    verdicts: listP(verdictItemP, MAX_VERDICTS, { sortKey: (x) => `${x.kind}:${x.lineage}` }) }, { refs: refsP, merge: refP }),
+  release: objP({ node: nodeP, request: refP }, { merge: refP }),
+  rule: objP({ node: nodeP, request: refP, decision: enumP('merge', 'return') }, { reason: reasonP, merge: refP }),
   unblock: objP({ node: nodeP }, { reason: reasonP, extra_returns: intP(0, 3), extra_attempts: intP(0, 5), extra_unavailable: intP(0, 3) }),
   annul: objP({ node: nodeP }, { reason: reasonP }),
   expire: objP({ node: nodeP }),
@@ -171,18 +204,45 @@ export function parseEvent(raw) {
     const keys = r.v.verdicts.map((x) => `${x.kind}:${x.lineage}`);
     if (new Set(keys).size !== keys.length) return { ok: false, ev: null, errors: ['verdict: 同じ審査（種類と系統）の結果が2件ある'] };
     if (new Set(r.v.verdicts.map((x) => x.judge)).size !== r.v.verdicts.length) return { ok: false, ev: null, errors: ['verdict: 同じ審査者が2回出ている（1人の判定を2つに数えない）'] };
+    const bad = refsProblem(r.v);
+    if (bad) return { ok: false, ev: null, errors: [`verdict.refs: ${bad}`] };
   }
   return { ok: true, ev: { op, event_id: id.v, ...r.v }, errors: [] };
 }
 
-/** 行為者の正規化と形の検査。{ ok, actor, errors } */
-export function parseActor(raw) {
-  if (!isObj(raw)) return { ok: false, actor: null, errors: ['行為者がオブジェクトでない'] };
-  const r = objP({ role: tok(ROLE_RE), kind: enumP(...KINDS), id: tok(NAME_RE) })(raw);
-  if (r.e) return { ok: false, actor: null, errors: [`行為者: ${r.e}`] };
-  if (!ROLES.includes(r.v.role)) return { ok: false, actor: null, errors: ['行為者: 知らない役割'] };
-  return { ok: true, actor: { role: r.v.role, kind: r.v.kind, id: r.v.id }, errors: [] };
+/**
+ * 判定の参照の整合（形は refsP）：審査ごとの id は、この判定の項目の（種類, 系統）にあり、id の審査の種類と申請の先頭 12 桁が合うこと。
+ * 指摘への参照は、refs.verdicts の判定の id を指すこと。監査の id の先頭 12 桁が申請と合うこと。違反の理由か null
+ */
+function refsProblem(ev) {
+  const refs = ev.refs;
+  if (!refs) return null;
+  const head = refHead12(ev.request);
+  const have = new Set(ev.verdicts.map((x) => `${x.kind}:${x.lineage}`));
+  const ids = new Set();
+  const seen = new Set();
+  for (const x of refs.verdicts || []) {
+    const k = `${x.kind}:${x.lineage}`;
+    if (seen.has(k)) return `同じ審査（${k}）の参照が2つある`;
+    seen.add(k);
+    if (!have.has(k)) return `判定の項目にない審査（${k}）の参照`;
+    const p = parseVerdictId(x.id);
+    if (p.mode !== reviewModeOf(x.kind, x.lineage)) return `判定の id の審査の種類（${p.mode}）が（${k}）と合わない`;
+    if (p.head !== head) return '判定の id の先頭 12 桁が申請と合わない';
+    if (p.short !== null && (!x.digest || x.digest.slice(7, 15) !== p.short)) return '判定の id の指紋の 8 桁と digest が合わない';
+    ids.add(x.id);
+  }
+  for (const f of refs.findings || []) if (!ids.has(parseFindingRef(f).verdict)) return `指摘への参照 ${f} が refs.verdicts の判定を指さない`;
+  if (refs.audit) {
+    const a = parseAuditId(refs.audit.id);
+    if (a.head !== head) return '監査の id の先頭 12 桁が申請と合わない';
+    if (a.short !== null && (!refs.audit.digest || refs.audit.digest.slice(7, 15) !== a.short)) return '監査の id の指紋の 8 桁と digest が合わない';
+  }
+  return null;
 }
+
+/** 行為者の正規化と形の検査（lib/vocab.mjs の parseActor と同じ。{ ok, actor, errors }） */
+export const parseActor = vocabParseActor;
 
 // ---- 状態 ----
 export function newState() {
@@ -190,11 +250,24 @@ export function newState() {
     nodes: new Map(), order: [], seen: new Map(), hashes: [], covered: 0, epochs: 0, pure: true,
     final: new Map(), sources: new Map() }; // final: 置き換えられた節 → 最後の置き換え先（一度だけ更新。鎖をたどらない）
 }
-const defDigest = (d) => digest({ id: d.id, depends_on: d.depends_on, resources: d.resources, risk: d.risk ?? null, security_review: d.security_review === true });
+/**
+ * 節の定義の指紋（approve の def_digest に渡す値）。定義は id・depends_on・resources・risk・security_review・requirements（並べ替え済み）。
+ * plan の節の定義（または state() の節）から、呼び出し側が計算できる。承認の後に定義が変われば、承認は効かない
+ */
+export function defDigestOf(d) {
+  const sorted = (x) => (Array.isArray(x) ? [...x].sort() : []);
+  return digest({ id: d.id, depends_on: sorted(d.depends_on), resources: sorted(d.resources), risk: d.risk ?? null, security_review: d.security_review === true, requirements: sorted(d.requirements) });
+}
 function newNode(d, gen = 0) {
-  return { id: d.id, depends_on: [...d.depends_on], resources: [...d.resources], risk: d.risk ?? null, security_review: d.security_review === true, def_digest: defDigest(d), gen,
+  return { id: d.id, depends_on: [...d.depends_on], resources: [...d.resources], risk: d.risk ?? null, security_review: d.security_review === true, requirements: [...(d.requirements || [])], def_digest: defDigestOf(d), gen,
     status: 'ready', approval: null, attempts: 0, returns: 0, extra_returns: 0, extra_attempts: 0, extra_unavailable: 0, annulled: 0, unavail: {}, lease_until: null, request: null,
-    blocked_reason: null, superseded_by: null, worker: null };
+    blocked_reason: null, superseded_by: null, started_by: null, assignee: null, merge: null, requests: [], requests_dropped: 0 };
+}
+/** 申請の履歴に1件足す（指紋・結果の種類・記録の時刻）。上限を超えたら古いものから落とす */
+function withHistory(n, request, kind, at) {
+  const list = [...n.requests, { request, kind, at: new Date(at).toISOString() }];
+  const drop = Math.max(0, list.length - MAX_REQUEST_HISTORY);
+  return { requests: list.slice(drop), requests_dropped: n.requests_dropped + drop };
 }
 const approvedNow = (n) => !!(n && n.approval && n.approval.def_digest === n.def_digest);
 const eventDigest = (actor, ev) => digest({ actor, ev });
@@ -313,19 +386,24 @@ function computeResult(ctx) {
     case 'clock_reset': return { op: 'clock_reset' };
     case 'plan': return { op: 'plan', add: ev.nodes, supersede: ev.supersede || [] };
     case 'approve': return { op: 'approve', node: ev.node, to: node.status, patch: { approval: { spec_digest: ev.spec_digest, policy_line: ev.policy_line, def_digest: ev.def_digest } } };
-    case 'start': return { op: 'start', node: ev.node, to: 'in_progress', patch: { attempts: node.attempts + 1, lease_until: at + ev.lease_sec * 1000, worker: v.actor ? v.actor.id : null, request: null } };
+    case 'start': return { op: 'start', node: ev.node, to: 'in_progress', patch: { attempts: node.attempts + 1, lease_until: at + ev.lease_sec * 1000, started_by: v.actor ? v.actor.id : null, assignee: ev.assignee ?? null, request: null } };
     case 'submit': return { op: 'submit', node: ev.node, to: 'review', patch: { request: ev.request } };
-    case 'verdict': { const d = decide({ node, ev, cfg, at }); return { op: 'verdict', node: ev.node, kind: d.kind, to: d.to, patch: d.patch }; }
-    case 'release': return { op: 'release', node: ev.node, to: 'merged', patch: { lease_until: null } };
+    case 'verdict': {
+      const d = decide({ node, ev, cfg, at });
+      // 申請の履歴：使えない審査（unavailable）は申請が審査の待ちのまま残るので、履歴に入れない
+      const hist = d.kind === 'unavailable' ? {} : withHistory(node, ev.request, d.kind, at);
+      return { op: 'verdict', node: ev.node, kind: d.kind, to: d.to, patch: { ...d.patch, ...hist, ...(d.to === 'merged' ? { merge: ev.merge ?? null } : {}) } };
+    }
+    case 'release': return { op: 'release', node: ev.node, to: 'merged', patch: { lease_until: null, merge: ev.merge ?? null, ...withHistory(node, ev.request, 'release', at) } };
     case 'rule': return ev.decision === 'merge'
-      ? { op: 'rule', node: ev.node, to: 'merged', patch: { blocked_reason: null, lease_until: null } }
-      : { op: 'rule', node: ev.node, to: 'in_progress', patch: { returns: node.returns + 1, attempts: node.attempts + 1, lease_until: at + cfg.lease_sec * 1000, request: null, blocked_reason: null } };
+      ? { op: 'rule', node: ev.node, to: 'merged', patch: { blocked_reason: null, lease_until: null, merge: ev.merge ?? null, ...withHistory(node, ev.request, 'rule_merge', at) } }
+      : { op: 'rule', node: ev.node, to: 'in_progress', patch: { returns: node.returns + 1, attempts: node.attempts + 1, lease_until: at + cfg.lease_sec * 1000, request: null, blocked_reason: null, ...withHistory(node, ev.request, 'rule_return', at) } };
     case 'unblock': return { op: 'unblock', node: ev.node, to: 'ready', patch: { extra_returns: node.extra_returns + (ev.extra_returns || 0), extra_attempts: node.extra_attempts + (ev.extra_attempts || 0),
-      extra_unavailable: node.extra_unavailable + (ev.extra_unavailable || 0), blocked_reason: null, lease_until: null, request: null, worker: null } };
+      extra_unavailable: node.extra_unavailable + (ev.extra_unavailable || 0), blocked_reason: null, lease_until: null, request: null, started_by: null, assignee: null } };
     case 'annul': return { op: 'annul', node: ev.node, to: node.status, patch: { returns: Math.max(0, node.returns - 1), annulled: node.annulled + 1 } };
     case 'expire': {
       const exhausted = node.attempts >= attemptLimit(node, cfg);
-      return { op: 'expire', node: ev.node, to: exhausted ? 'blocked' : 'ready', patch: { lease_until: null, request: null, worker: null, blocked_reason: exhausted ? 'attempts_exhausted' : null } };
+      return { op: 'expire', node: ev.node, to: exhausted ? 'blocked' : 'ready', patch: { lease_until: null, request: null, started_by: null, assignee: null, blocked_reason: exhausted ? 'attempts_exhausted' : null } };
     }
     case 'stop': return { op: 'stop', flag: true };
     case 'resume': return { op: 'resume', flag: false };
@@ -350,11 +428,13 @@ const TRANSITIONS = {
 };
 /** 設定の変更が「緩める」か（上限を上げる・hold を外す・必須の審査を減らす・系統の縛りを外す）。締める変更はいつでも許す */
 function loosens(oldC, newC) {
-  if (newC.workers > oldC.workers || newC.max_attempts > oldC.max_attempts || newC.max_returns > oldC.max_returns || newC.max_unavailable > oldC.max_unavailable || newC.lease_sec > oldC.lease_sec) return true;
+  if (newC.concurrent_work > oldC.concurrent_work || newC.max_attempts > oldC.max_attempts || newC.max_returns > oldC.max_returns || newC.max_unavailable > oldC.max_unavailable || newC.lease_sec > oldC.lease_sec) return true;
   if (oldC.hold && !newC.hold) return true;
   if (oldC.policy_line !== newC.policy_line) return true; // 法律の系統の付け替え（null との間も）は、それ自体を緩める変更として扱う
   const nj = new Set(newC.judiciary.map((j) => j.lineage));
   if (oldC.judiciary.some((j) => !nj.has(j.lineage))) return true;
+  if (oldC.protected.some((p) => !newC.protected.includes(p))) return true; // 保護の範囲を減らす
+  if (!sameWorkItemSpec(oldC.work_item, newC.work_item)) return true; // 節の id の宣言の付け替え（厳しい側で、緩める変更として扱う）
   return oldC.security_lineage !== newC.security_lineage;
 }
 
@@ -365,7 +445,8 @@ function loosens(oldC, newC) {
 
 const gp = (ctx) => { const v = view(ctx); return { v, ev: v.ev, node: nodeOf(ctx, v.ev), res: resultOf(ctx), cfg: cfgOf(ctx) }; };
 const finalTo = (res) => !!res && (res.to === 'held' || res.to === 'merged');
-const tgCtx = (ctx, ev, cfg) => ({ nodes: tgBase(ctx), batch: [ev.node], limits: { workers: ctx.state.config ? cfg.workers : undefined }, occupy: [...BUSY], slotStatuses: SLOT });
+// taskgraph の limits.workers は「同時に動かす作業の数」で、config.concurrent_work と同じ意味（名前だけが taskgraph の側の名前）
+const tgCtx = (ctx, ev, cfg) => ({ nodes: tgBase(ctx), batch: [ev.node], limits: { workers: ctx.state.config ? cfg.concurrent_work : undefined }, occupy: [...BUSY], slotStatuses: SLOT });
 
 export const GUARDS = {
   // --- 出来事・行為者の形 ---
@@ -375,11 +456,6 @@ export const GUARDS = {
     const { v, ev } = gp(ctx);
     if (!v.actor || !ev) return null;
     return ROLE_OPS[ev.op].includes(v.actor.role) ? null : `役割 ${v.actor.role} は ${ev.op} を起こせない（起こせる役割: ${ROLE_OPS[ev.op].join('/')}）`;
-  },
-  'RS-KIND-OP': (ctx) => {
-    const { v, ev } = gp(ctx);
-    if (!v.actor || !ev) return null;
-    return KIND_OPS[ev.op].includes(v.actor.kind) ? null : `${v.actor.kind} は ${ev.op} を起こせない（起こせる種類: ${KIND_OPS[ev.op].join('/')}。行政の AI は司法と人の承認を迂回できない。INV-05）`;
   },
   'RS-EVENT-ID-UNIQUE': (ctx) => {
     const { v, ev } = gp(ctx);
@@ -427,8 +503,8 @@ export const GUARDS = {
     if (!v.actor || !ev) return null;
     const owner = v.actor.role === 'owner' && v.actor.kind === 'human'; // 取り置きの枠は role と kind の両方で決める（kind: human を名乗る行政は使えない）
     if (!owner && ctx.state.count >= MAX_EVENTS - HUMAN_RESERVE) return `オーナー以外の出来事の枠が尽きた（残りの ${HUMAN_RESERVE} 件はオーナーのために取ってある）`;
-    if (v.actor.role === 'executive' && ev.op === 'plan') {
-      if (ctx.state.ai_plans >= MAX_AI_PLANS) return `行政（role: executive）の plan の回数が上限 ${MAX_AI_PLANS} に達した`;
+    if (v.actor.role === 'executive_head' && ev.op === 'plan') {
+      if (ctx.state.ai_plans >= MAX_AI_PLANS) return `行政の長（role: executive_head）の plan の回数が上限 ${MAX_AI_PLANS} に達した`;
       if (ctx.state.nodes.size + ev.nodes.length > MAX_NODES_TOTAL - HUMAN_NODE_RESERVE) return `行政が足せる節の数の上限（${MAX_NODES_TOTAL - HUMAN_NODE_RESERVE}。残りはオーナーのために取ってある）に達する`;
     }
     if (!owner && ev.op === 'plan' && ctx.state.nodes.size + ev.nodes.length > MAX_NODES_TOTAL - HUMAN_NODE_RESERVE) return `オーナー以外が足せる節の数の上限（${MAX_NODES_TOTAL - HUMAN_NODE_RESERVE}）に達する`;
@@ -463,13 +539,44 @@ export const GUARDS = {
     const ok = (ev.op === 'verdict' && pass && cfg.hold !== true) || ev.op === 'release' || (ev.op === 'rule' && ev.decision === 'merge');
     return ok ? null : `merged になれる経路は verdict の合格（hold でないとき）・release・rule（merge）だけ（${ev.op}${res.kind ? `:${res.kind}` : ''}、hold=${cfg.hold}）`;
   },
+  // 統合の参照（merge）を持てるのは、merged になる出来事だけ（差し戻し・保留の判定に統合の参照を付けて、追跡に偽の統合を残さない）
+  'RS-MERGE-REF': (ctx) => {
+    const { ev, res } = gp(ctx);
+    if (!ev || ev.merge === undefined) return null;
+    return res && res.to === 'merged' ? null : `統合の参照（merge）は merged になる出来事だけが持てる（${ev.op}${res && res.kind ? `:${res.kind}` : ''} → ${res ? res.to : '?'}）`;
+  },
   'RS-WORKER-BIND': (ctx) => {
     const { v, ev, node } = gp(ctx);
     if (!v.actor || !ev || ev.op !== 'submit' || !node) return null;
-    return node.worker !== null && node.worker === v.actor.id ? null : `申請できるのは着手した行為者（${node.worker}）だけ`;
+    return node.started_by !== null && node.started_by === v.actor.id ? null : `申請できるのは着手した行為者（${node.started_by}）だけ`;
   },
   // --- plan ---
   'RS-PLAN-NONEMPTY': (ctx) => { const { ev } = gp(ctx); return ev && ev.op === 'plan' && ev.nodes.length === 0 ? '空の plan は拒む（記録を空の出来事で埋められない）' : null; },
+  // 新しく足す節の id は、config の票の ID の宣言（vocab の work_item）に合うこと（T-101 と t-101 を別の節として通さない）
+  'RS-WORK-ITEM-ID': (ctx) => {
+    const { ev, cfg } = gp(ctx);
+    if (!ev || ev.op !== 'plan') return null;
+    const match = makeWorkItemId(cfg.work_item);
+    if (!match) return 'config の票の ID の宣言が読めない';
+    const ids = [...ev.nodes.map((d) => d.id), ...ev.nodes.flatMap((d) => d.depends_on), ...(ev.supersede || []).flatMap((p) => [p.old, p.new])];
+    const bad = [...new Set(ids.filter((id) => !match(id)))];
+    return bad.length ? `節の id が票の ID の宣言（${cfg.work_item.prefix} と ${cfg.work_item.digits.join('〜')} 桁）に合わない: ${bad.slice(0, 5).join(', ')}` : null;
+  },
+  // 範囲は taskgraph が扱える形だけ（扱えない形は重なりとみなされ、他の節の着手を止め続ける）
+  'RS-PLAN-RESOURCES': (ctx) => {
+    const { ev } = gp(ctx);
+    if (!ev || ev.op !== 'plan') return null;
+    const bad = ev.nodes.flatMap((d) => d.resources.filter((r) => !parsePattern(r)).map((r) => `${d.id}: ${r.slice(0, 60)}`));
+    return bad.length ? `範囲が扱える形（literal・dir/**・prefix*）でない: ${bad.slice(0, 3).join(' / ')}` : null;
+  },
+  // 保護された範囲（config.protected。領域パックの protected の写し）と重なる節は、計画に入れない（統治の核を触る節を実行の記録に入れさせない）。
+  // オーナーの plan も同じ（統治の核の変更は、実行の記録でなく法律の改正の手続きで行う）
+  'RS-PROTECTED': (ctx) => {
+    const { ev, cfg } = gp(ctx);
+    if (!ev || ev.op !== 'plan' || !Array.isArray(cfg.protected) || cfg.protected.length === 0) return null; // 扱えない形の範囲は RS-PLAN-RESOURCES が止める
+    for (const d of ev.nodes) for (const r of d.resources) for (const p of cfg.protected) if (parsePattern(r) && overlap(r.normalize('NFKC'), p)) return `節 ${d.id} の範囲 ${r.slice(0, 60)} が保護された範囲 ${p} と重なる`;
+    return null;
+  },
   'RS-PLAN-APPEND-ONLY': (ctx) => {
     const { ev } = gp(ctx);
     if (!ev || ev.op !== 'plan') return null;
@@ -644,7 +751,7 @@ export function makeCtx(state, actor, event, o = {}) {
 }
 
 // ---- 状態への反映（ガードを全部通った後だけ） ----
-const PATCH_KEYS = new Set(['approval', 'attempts', 'lease_until', 'worker', 'request', 'returns', 'blocked_reason', 'unavail', 'extra_returns', 'extra_attempts', 'extra_unavailable', 'annulled']);
+const PATCH_KEYS = new Set(['approval', 'attempts', 'lease_until', 'started_by', 'assignee', 'request', 'returns', 'blocked_reason', 'unavail', 'extra_returns', 'extra_attempts', 'extra_unavailable', 'annulled', 'merge', 'requests', 'requests_dropped']);
 function reduce(st, actor, ev, res, at) {
   st.count += 1;
   st.last_at = at;
@@ -659,7 +766,7 @@ function reduce(st, actor, ev, res, at) {
     }
     case 'clock_reset': return;
     case 'plan':
-      if (actor.role === 'executive') st.ai_plans += 1;
+      if (actor.role === 'executive_head') st.ai_plans += 1;
       for (const d of res.add) { st.nodes.set(d.id, newNode(d)); st.order.push(d.id); st.dep_total += d.depends_on.length; }
       for (const p of res.supersede) {
         const o = st.nodes.get(p.old);
@@ -742,8 +849,8 @@ export function replay(records, o = {}) {
     if (!current && i >= covered) throw bad(r, `規則の版が今（${rules}）と違う（${String(r.rules)}）。古い版の行を受け入れるにはオーナーの移行の記録（epoch）が要る`);
     const event = {};
     for (const k of Object.keys(r)) if (!ROW_META.has(k)) event[k] = r[k];
-    const raw = Date.parse(r.at);
-    if (!Number.isSafeInteger(raw)) throw bad(r, '時刻が読めない');
+    const raw = parseTs(r.at);
+    if (raw === null || !Number.isSafeInteger(raw)) throw bad(r, '時刻が読めない');
     const at = r.op === 'clock_reset' ? raw : Math.max(raw, st.last_at); // 記録の上の今は、それまでの行の at の最大値（行の at が戻っていても拒まない）。clock_reset だけが戻せる
     const res = step(st, r.actor, event, { at, replay: true, guardNames: current ? base : STRUCTURAL });
     if (!res.ok) throw bad(r, `規則に合わない行（${res.violations.slice(0, 3).map((x) => `${x.guard}: ${x.reason}`).join(' / ')}）`);
@@ -798,7 +905,7 @@ function nextOf(st) {
   }
   const g = buildGraph(tgNodes(st, { hideApproval: new Set(own.keys()) }));
   if (!g.ok) return { stopped: false, start: [], recommend: null, waiting: [], error: g.errors };
-  const limits = { workers: cfg.workers };
+  const limits = { workers: cfg.concurrent_work };
   const opts = { occupy: [...BUSY], slotStatuses: SLOT };
   const sched = schedule(g.graph, limits, opts);
   const start = sched.batches.length ? [...sched.batches[0]] : [];
@@ -814,11 +921,7 @@ function nextOf(st) {
   return { stopped: false, start, recommend: recommend(g.graph, limits, opts), waiting, slots: sched.slots };
 }
 
-const refusal = (violations) => {
-  const x = new Refused('guard', violations.slice(0, 3).map((v) => `${v.guard}: ${v.reason}`).join(' / '));
-  x.violations = violations;
-  return x;
-};
+const refusal = vocabRefusal;
 
 function openRunWith(file, nowFn, lockWaitMs) {
   let cur = null;
@@ -841,8 +944,8 @@ function openRunWith(file, nowFn, lockWaitMs) {
       const rec = ch.append(body, (records) => {
         // 時刻はロックの中で決める。直前までの最大値より前なら、拒まず最大値をそのまま使う（進めない）
         const t = nowFn();
-        const raw = Date.parse(t);
-        if (typeof t !== 'string' || !Number.isSafeInteger(raw)) throw new Refused('bad_time', 'now が読めない時刻を返した');
+        const raw = parseTs(t);
+        if (raw === null || !Number.isSafeInteger(raw)) throw new Refused('bad_time', 'now が読めない時刻を返した（vocab の時刻の形でない）');
         const st = rebuild(records, pe.ok && pe.ev.op === 'epoch');
         applied = st;
         if (pa.ok && pe.ok && st.seen.get(seenKey(pa.actor, pe.ev)) === eventDigest(pa.actor, pe.ev)) throw new Dup();
@@ -855,7 +958,7 @@ function openRunWith(file, nowFn, lockWaitMs) {
       });
       applied.hashes.push(rec.hash);
       cache = applied;
-      return { ok: true, duplicate: false, seq: rec.seq, at: rec.at, ...out };
+      return { ok: true, duplicate: false, seq: rec.seq, at: rec.at, digest: asDigest(rec.hash), ...out };
     } catch (x) {
       if (x instanceof Dup) { cache = applied; return { ok: true, duplicate: true }; }
       throw x;
@@ -905,7 +1008,7 @@ export function unsafeOpenRunWithClock(file, opt = {}) {
  */
 export function memoryRun(opt = {}) {
   const st = newState();
-  let t = Date.parse(opt.start || '2026-01-01T00:00:00+09:00');
+  let t = parseTs(opt.start || '2026-01-01T00:00:00+09:00');
   const rows = []; // 書き出し用（bench が記録のファイルを速く作るために使う）
   const owner = { role: 'owner', kind: 'human', id: 'azuki' };
   const api = {
@@ -919,10 +1022,11 @@ export function memoryRun(opt = {}) {
       const at = pe.ok && pe.ev.op === 'clock_reset' ? t : Math.max(t, st.last_at);
       const r = step(st, a, e, { at, wall: opt.wall, guardNames: opt.guardNames });
       if (!r.ok) throw refusal(r.violations);
-      st.hashes.push(sha256(canonical({ n: st.count, id: r.ev.event_id })));
+      const h = sha256(canonical({ n: st.count, id: r.ev.event_id }));
+      st.hashes.push(h);
       const { op, event_id, ...fields } = r.ev;
       rows.push({ at: new Date(at).toISOString(), body: { type: RECORD_TYPE, rules: RULES, op, event_id, actor: r.actor, ...fields } });
-      return { ok: true, duplicate: false, kind: r.res.kind || null, to: r.res.to || null };
+      return { ok: true, duplicate: false, digest: asDigest(h), kind: r.res.kind || null, to: r.res.to || null };
     },
     state: () => publicState(st), next: () => nextOf(st), summary: () => summaryOf(st),
   };

@@ -9,9 +9,13 @@
 //   (a) 出どころの必須化  (b) 昇格はオーナー（人）だけ  (c) カウンタは裁判所側のスクリプトが司法の結果から更新する場合だけ
 //   (d) 取り出した経験は命令でなく引用（データ）として渡し、司法には渡さない
 //
-// 記録：追記専用の鎖つき記録（lib/chain.mjs）の上のイベント（add / promote / retire / feedback / induce / retrieved）。
-//       現在の状態は、イベントを頭から再生して作り直す。再生のときも同じガードを通し、通らないイベントは状態に入れず rejected に残す
-//       （記録ファイルへ直接書き込まれた偽のイベントを採らない）。
+// 記録：追記専用の鎖つき記録（lib/chain.mjs）の上の行 { type: RECORD_TYPE, rules, cfg, op, actor, ... }（op は add / induce / promote / retire /
+//       feedback / epoch / retrieved）。現在の状態は、行を頭から再生して作り直す。再生のときも同じガードを通し、通らない行は状態に入れず
+//       rejected に残す（記録ファイルへ直接書き込まれた偽の行を採らない）。verify() も再生して確かめる（鎖だけでない）。
+// 規則の版（ex.v1）と設定の写し：各行に規則の版（rules）と、書いた時の設定（cfg：min_sources・retire_harmful・work_item）の写しを持つ。
+//       設定は開く側の引数だが、写しが開く側の設定と違う行と、版の違う行は、オーナーの移行の記録（epoch）に覆われるまで状態に入れず、
+//       書き込みも止める（EX-RULES-VERSION）。覆われた行は、その行の写しの設定で確かめる（別の引数で開いても、過去の行の扱いは変わらない）。
+// 語彙（役割・行為者・票の ID・時刻・拒否の形）は lib/vocab.mjs。司法の判定は vocab の表の完全一致（isJudicialRole・isCourtSide）。
 //
 // 限界（正直に書く）：
 //   - 行為者 actor（{role, kind, id}）が本物であることは、この部品では保証できない。呼び出し側の自己申告である。
@@ -27,8 +31,7 @@
 //   - 不可視の文字だけの印（invisible_chars）は昇格の確認（EX-FLAG-ACK）の対象にしない。警告（inspect の warnings と rendered の注記）にとどめる。
 //     ZWJ（絵文字）・ZWNJ（ペルシア語など）・先頭の BOM などの普通の文にも付くため、毎回の確認が形骸化するのを避けた。
 //     不可視の文字を挟んだ命令文は、照合の印（ignore_previous など。除いた版と空白に替えた版の両方で照合）で従来どおり確認が要る。CRLF は LF に畳んでから見る。
-//   - 司法の側の役割名の判定は部分一致（judge・judic・court・gate_runner）を含むので、`courtesy_bot`・`prejudice_check` のような名前は使えない。
-//     ASCII の英数字でない役割名（日本語など）も使えない。どちらも安全側の誤検出（分類できない名前は司法かもしれないと見る）。
+//   - 役割は vocab の表にある名前だけ。表にない役割（planner など）は scope にも retrieve にも使えない（司法かどうか推し量らずに拒む）。
 //   - 重複排除の鍵は小文字にそろえるので、大文字小文字だけが違う別の証拠 ref は同じ鍵になり、2 件目は数えられない（水増し防止を優先した副作用）。
 //   - 伏せ字：URL は伏せない（認証情報 user:pass@ だけ伏せる）。空白を含む絶対パスの後半は残りうる（先頭の要素から空白までを伏せる）。
 //   - 取り出しは字句検索（BM25 に近い自作の点数）で、意味検索ではない。opt.scorer で差し替えられるが、埋め込みは実装していない。
@@ -37,47 +40,36 @@
 
 import { openChain, digest, canonical, Refused, nowIso } from './lib/chain.mjs';
 import { scrub } from '../scripts/prior-record.mjs';
+import { parseActor, normActor, normRole as vocabNormRole, isJudicialRole as vocabIsJudicial, isCourtSide, isOwner, makeWorkItemId, parseWorkItemSpec, sameWorkItemSpec, DEFAULT_WORK_ITEM, parseTs, isTs, isLineHash, refusal } from './lib/vocab.mjs';
 
 export { Refused };
 
+export const RECORD_TYPE = 'vgdd.experience.v1';
+/** 規則の版。ガードの規則を変えるたびに上げる。各行に rules として記録する（improvement.mjs・trace.mjs と同じ。epoch で古い行を覆う） */
+export const RULES = 'ex.v1';
 const KINDS = ['verdict_finding', 'gate_event', 'owner_ruling', 'worker_report', 'obs'];
 const GROUNDED_KINDS = new Set(['verdict_finding', 'gate_event', 'owner_ruling']);   // obs は未検証の扱い（保守的）
-const ACTOR_KINDS = new Set(['human', 'ai', 'script']);
-// 司法の側の役割。SPEC §2 の司法（judge・codex_judge・constitutional_review）に加え、裁判所の執行（gate_runner）と court も含める。
-// 司法の入力は機械的に集めたものだけ（SPEC §6-1）なので、裁判所の側のプロセスにも経験を渡さない。reviewer・night_runner は含めない（行政の側）。
-export const JUDICIAL_ROLES = ['judge', 'codex_judge', 'constitutional_review', 'gate_runner', 'court', 'judiciary'];
-const TASK_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/;
-const ID_RE = /^exp-\d{6,}$/;
 export const MAX_TEXT = 600;
 const DAY = 86400e3;
 export const DEFAULT_TTL_DAYS = 90;
 export const MAX_TTL_DAYS = 365;
 const DEFAULTS = { minSources: 2, retireHarmful: 3 };
+const OPS = ['add', 'induce', 'promote', 'retire', 'feedback', 'epoch', 'retrieved'];
 
 // ---------- 小さな部品 ----------
 const isObj = (x) => !!x && typeof x === 'object' && !Array.isArray(x);
 const nonEmpty = (s, max = 200) => typeof s === 'string' && s.trim().length > 0 && s.length <= max && !/[\u0000-\u001f\u007f]/.test(s);
-const okActor = (a) => isObj(a) && nonEmpty(a.role, 60) && ACTOR_KINDS.has(a.kind) && nonEmpty(a.id, 80);
-/**
- * 役割名の正規化（許可リスト）。NFKC → 前後の空白を除く → 小文字 → 空白・ハイフンを _ に → `^[a-z][a-z0-9_]{0,39}$` に合うものだけ。
- * 合わなければ null（不可視文字・全角の混ぜ込み・記号などは受けない）。null の役割は scope にも取り出しにも使えない。
- */
-export function normRole(r) {
-  if (typeof r !== 'string' || r.length > 200) return null;
-  const n = r.normalize('NFKC').trim().toLowerCase().replace(/[\s-]+/g, '_');
-  return /^[a-z][a-z0-9_]{0,39}$/.test(n) ? n : null;
-}
-/** 司法の側の役割か。名前が不正（null）のときも true（fail-closed：分類できない名前は司法かもしれない） */
-export const isJudicialRole = (r) => { const n = normRole(r); return n === null || JUDICIAL_ROLES.includes(n) || /judge|judic|court|gate_?runner/.test(n); };
+const okActor = (a) => parseActor(a).ok;
+/** 役割名の正規化（vocab の normRole。表にある名前だけ。ほかは null）。null の役割は scope にも取り出しにも使えない */
+export const normRole = vocabNormRole;
+/** 判定する司法の役割か（vocab。表の完全一致） */
+export const isJudicialRole = vocabIsJudicial;
+/** 経験を渡さない役割か：表にない名前（使えない）・判定する司法・裁判所の執行（vocab の isCourtSide） */
+export const isWithheldRole = (r) => normRole(r) === null || isCourtSide(r);
 const isoOf = (ms) => new Date(ms).toISOString();
-const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/;
-const ISO_STRICT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;   // 時差つきの ISO 8601 だけ（時差なしは環境で解釈が変わる）
-const msOf = (v) => {
-  if (v instanceof Date) return v.getTime();
-  if (typeof v === 'number') return v;
-  if (typeof v === 'string' && ISO_RE.test(v)) return Date.parse(v);
-  return NaN;
-};
+/** 票の ID の照合（設定の work_item。既定は vocab の T- と 3〜4 桁） */
+const taskOk = (c, t) => (c.opts?.taskMatch || DEFAULT_TASK)(t);
+const DEFAULT_TASK = makeWorkItemId(DEFAULT_WORK_ITEM);
 const padId = (n) => `exp-${String(n).padStart(6, '0')}`;
 const nextId = (st) => padId(st.counter + 1);
 /** 証拠 ref の許可リスト（絶対パス・.. を含まない）。合わなければ拒否 */
@@ -167,8 +159,8 @@ function scopeProblem(scope) {
   if (!isObj(scope)) return 'scope がない';
   if (!nonEmpty(scope.domain, 60)) return 'scope.domain がない';
   if (Object.keys(scope).some((k) => !['domain', 'roles', 'tags'].includes(k))) return 'scope に未知の欄がある';
-  if (!Array.isArray(scope.roles) || scope.roles.length < 1 || scope.roles.length > 20 || !scope.roles.every((r) => normRole(r) !== null)) return 'scope.roles が空か、役割名の形（英小文字・数字・_ のみ、先頭は英字、40 字まで）に合わない';
-  if (scope.roles.some(isJudicialRole)) return 'scope.roles に司法・裁判所の側の役割は入れられない（司法の独立。SPEC §6-1）';
+  if (!Array.isArray(scope.roles) || scope.roles.length < 1 || scope.roles.length > 20 || !scope.roles.every((r) => normRole(r) !== null)) return 'scope.roles が空か、役割の表（vocab）にない名前を含む';
+  if (scope.roles.some(isCourtSide)) return 'scope.roles に司法・裁判所の側の役割は入れられない（司法の独立。SPEC §6-1）';
   if (!Array.isArray(scope.tags) || scope.tags.length > 30 || !scope.tags.every((t) => nonEmpty(t, 60))) return 'scope.tags が不正';
   return null;
 }
@@ -178,7 +170,7 @@ const normScope = (s) => (scopeProblem(s) === null
 
 // ---------- 状態 ----------
 export function emptyState() {
-  return { items: new Map(), counter: 0, seen: new Set(), rejected: [], retrievals: 0, lastSeq: 0 };
+  return { items: new Map(), counter: 0, seen: new Set(), rejected: [], retrievals: 0, lastSeq: 0, uncovered: 0, epochs: 0, rules: RULES };
 }
 
 /** 帰納元（reflection）の task の集合から、別々の task を割り当てられる reflection の数（二部マッチング） */
@@ -209,15 +201,26 @@ const pickItem = (it) => {
   if (it.from) o.from = [...it.from];
   return o;
 };
-const WRITE_OPS = ['add', 'induce', 'promote', 'retire', 'feedback'];
+const WRITE_OPS = ['add', 'induce', 'promote', 'retire', 'feedback', 'epoch'];
 const isCreate = (c) => c.op === 'add' || c.op === 'induce';
 const sourcesOf = (c) => (Array.isArray(c.item?.from) ? c.item.from.map((id) => c.state.items.get(id)) : []);
 const sourcesValid = (c) => { const s = sourcesOf(c); return s.length >= 1 && s.every(Boolean); };
-const expired = (it, now) => !(Date.parse(it.expires_at) > now);
+const expired = (it, now) => !(parseTs(it.expires_at) > now);
 
 /** 名前 → (ctx) => null | string（違反の理由）。ctx.op で対象の操作を絞る（対象外は null） */
 export const GUARDS = {
-  'EX-ACTOR': (c) => (WRITE_OPS.includes(c.op) && !okActor(c.actor) ? '行為者が { role, kind(human|ai|script), id } の形でない' : null),
+  'EX-ACTOR': (c) => { if (!WRITE_OPS.includes(c.op)) return null; const a = parseActor(c.actor); return a.ok ? null : `行為者が vocab の形（{ role, kind, id, lineage }）でない：${a.errors[0]}`; },
+
+  // 版の違う行・設定の写しが今の設定と違う行が、オーナーの移行の記録（epoch）に覆われずに残っていれば、書き込みを止める
+  'EX-RULES-VERSION': (c) => (WRITE_OPS.includes(c.op) && c.op !== 'epoch' && c.state && c.state.uncovered > 0
+    ? `規則の版か設定の写しが今と違う行が ${c.state.uncovered} 行あり、オーナーの移行の記録（epoch）に覆われていない。オーナーが確かめて epoch を書くまで追記しない` : null),
+
+  // 移行の記録はオーナーだけが、理由をつけて書ける（AI・スクリプトには古い行を通せない）
+  'EX-EPOCH-OWNER': (c) => {
+    if (c.op !== 'epoch') return null;
+    if (!isOwner(c.actor)) return '移行の記録（epoch）はオーナー（human・owner）だけ';
+    return nonEmpty(c.raw?.reason, 1000) ? null : '移行の記録には理由（reason）が要る';
+  },
 
   'EX-PROVENANCE': (c) => {
     if (!isCreate(c)) return null;
@@ -228,7 +231,7 @@ export const GUARDS = {
       if (!isObj(e) || !KINDS.includes(e.kind)) return `出どころの kind が不正（${KINDS.join('|')}）`;
       if (Object.keys(e).some((k) => !['kind', 'ref', 'task'].includes(k))) return '出どころに未知の欄がある';
       if (!refOk(e.ref)) return '出どころの ref が許可された書式でない（英数字と . _ # : / - のみ、200 字まで、絶対パス・.. は不可）';
-      if (!nonEmpty(e.task, 40) || !TASK_RE.test(e.task)) return '出どころの task が不正';
+      if (!nonEmpty(e.task, 40) || !taskOk(c, e.task)) return '出どころの task が票の ID の宣言（vocab の work_item）に合わない';
       if (c.opts?.verifyRef && c.opts.verifyRef(e) !== true) return `出どころの ref を検証器が確認できない（${e.ref}）`;
     }
     if (c.op === 'induce' && sourcesValid(c)) {
@@ -282,8 +285,8 @@ export const GUARDS = {
   'EX-EXPIRY': (c) => {
     if (!isCreate(c)) return null;
     const e = c.item.expires_at;
-    if (typeof e !== 'string' || !ISO_STRICT.test(e) || Number.isNaN(Date.parse(e))) return '有効期限（expires_at）が必須（時差つきの ISO 8601 の形）';
-    const t = Date.parse(e);
+    if (!isTs(e)) return '有効期限（expires_at）が必須（vocab の時刻の形：秒まで・時差は Z か ±HH:MM）';
+    const t = parseTs(e);
     if (t <= c.now) return '有効期限がすでに過ぎている';
     if (t > c.now + MAX_TTL_DAYS * DAY) return `有効期限が長すぎる（${MAX_TTL_DAYS} 日まで）`;
     return null;
@@ -320,7 +323,7 @@ export const GUARDS = {
     return null;
   },
 
-  'EX-PROMOTE-OWNER': (c) => (c.op === 'promote' && !(okActor(c.actor) && c.actor.kind === 'human' && c.actor.role === 'owner') ? '昇格できるのは kind: human かつ role: owner だけ' : null),
+  'EX-PROMOTE-OWNER': (c) => (c.op === 'promote' && !isOwner(c.actor) ? '昇格できるのは kind: human かつ role: owner だけ' : null),
 
   'EX-PROMOTE-STATE': (c) => {
     if (c.op !== 'promote') return null;
@@ -337,8 +340,9 @@ export const GUARDS = {
 
   'EX-RETIRE-ACTOR': (c) => {
     if (c.op !== 'retire' || !okActor(c.actor)) return null;
-    if (c.actor.kind === 'human' && c.actor.role === 'owner') return null;
-    if (c.actor.kind === 'script') {
+    if (isOwner(c.actor)) return null;
+    if (normActor(c.actor).kind === 'script') {
+      if (!isCourtSide(normActor(c.actor).role)) return 'スクリプトで引退させられるのは裁判所の側（gate_runner）だけ（feedback と同じ。行政の代行・回収のスクリプトは引退させられない）';
       if (!c.target) return null;   // 存在しないことは EX-RETIRE-STATE
       const th = c.opts?.retireHarmful ?? DEFAULTS.retireHarmful;
       return c.target.harmful >= th && c.target.harmful > c.target.helpful ? null : `スクリプトが引退させられるのは harmful >= ${th} かつ harmful > helpful のときだけ`;
@@ -354,7 +358,12 @@ export const GUARDS = {
     return null;
   },
 
-  'EX-FEEDBACK-ACTOR': (c) => (c.op === 'feedback' && !(okActor(c.actor) && c.actor.kind === 'script') ? 'カウンタを更新できるのは kind: script（裁判所の側のプロセス）だけ（作業員の自己申告では増えない）' : null),
+  // カウンタは、裁判所の側のスクリプト（kind: script で、vocab の isCourtSide の役割＝gate_runner）だけが、司法の結果から更新する
+  'EX-FEEDBACK-ACTOR': (c) => {
+    if (c.op !== 'feedback') return null;
+    const a = normActor(c.actor);
+    return a && a.kind === 'script' && isCourtSide(a.role) ? null : 'カウンタを更新できるのは裁判所の側のスクリプト（kind: script、役割 gate_runner）だけ（作業員の自己申告・行政の代行のスクリプトでは増えない）';
+  },
 
   'EX-FEEDBACK-EVIDENCE': (c) => {
     if (c.op !== 'feedback') return null;
@@ -362,7 +371,7 @@ export const GUARDS = {
     if (!['helpful', 'harmful'].includes(r.outcome)) return 'outcome は helpful か harmful';
     if (!isObj(ev) || !['verdict', 'gate_event'].includes(ev.kind)) return '証拠の種類は verdict か gate_event だけ';
     if (!refOk(ev.ref)) return '証拠の ref が許可された書式でない（英数字と . _ # : / - のみ、200 字まで、絶対パス・.. は不可）';
-    if (!nonEmpty(ev.task, 40) || !TASK_RE.test(ev.task)) return '証拠の task が必須（書式 ' + TASK_RE + '）';
+    if (!nonEmpty(ev.task, 40) || !taskOk(c, ev.task)) return '証拠の task が必須（票の ID の宣言に合う形）';
     if (!Array.isArray(r.item_ids) || r.item_ids.length < 1 || r.item_ids.length > 50 || new Set(r.item_ids).size !== r.item_ids.length) return 'item_ids が不正（1〜50 件、重複なし）';
     if (!c.targets || c.targets.some((t) => !t || t.status === 'retired')) return 'item_ids に存在しない・引退済みの項目がある';
     return null;
@@ -380,7 +389,8 @@ export const GUARDS = {
     if (c.op !== 'retrieve') return null;
     const role = c.audience?.role;
     if (!nonEmpty(role, 60)) return '渡す先の役割が不明（fail-closed）';
-    return isJudicialRole(role) ? '司法の役割には経験を渡さない（司法の独立。SPEC §6-1。経験が審査の入力に混ざると、行政が司法に働きかける経路になる）' : null;
+    if (normRole(role) === null) return '渡す先の役割が役割の表（vocab）にない（使えない役割には渡さない。司法かどうかを名前から推し量らない）';
+    return isCourtSide(role) ? '司法・裁判所の側の役割には経験を渡さない（司法の独立。SPEC §6-1。経験が審査の入力に混ざると、行政が司法に働きかける経路になる）' : null;
   },
 
   'EX-SERVE': (c) => {
@@ -407,7 +417,8 @@ export function check(ctx, guardNames = Object.keys(GUARDS)) {
 }
 
 // ---------- 文脈の組み立て・イベントの作成と適用（純関数。書かない） ----------
-const cleanActor = (a) => (isObj(a) ? { role: a.role, kind: a.kind, id: a.id } : a);
+/** 行為者は vocab で正規化した形で検査・記録する（読めなければ生のまま渡し、EX-ACTOR が拒む） */
+const cleanActor = (a) => normActor(a) || a;
 const cleanProv = (p) => (Array.isArray(p) ? p.map((e) => (isObj(e) ? { kind: e.kind, ref: e.ref, task: e.task } : e)) : p);
 
 function ctxOf(op, actor, raw, st, nowMs, opts, item) {
@@ -441,7 +452,7 @@ export function plan(st, op, actor, args, { nowMs, opts = {} }) {
   if (op === 'add') {
     const prov = cleanProv(raw?.provenance);
     item = { ...newItemBase(st, nowMs, a, raw), layer: 'reflection', provenance: prov, trust: computeTrust(prov) };
-    event = { type: 'add', actor: a, item };
+    event = { op: 'add', actor: a, item };
   } else if (op === 'induce') {
     const from = raw?.from;
     item = { ...newItemBase(st, nowMs, a, raw), layer: 'experience', from };
@@ -451,14 +462,16 @@ export function plan(st, op, actor, args, { nowMs, opts = {} }) {
     if (ok) for (const s of src) for (const p of s.provenance) if (!seen.has(provKey(p))) { seen.add(provKey(p)); prov.push({ ...p }); }
     item.provenance = prov;
     item.trust = ok ? weakest(src.map((s) => s.trust)) : 'hypothesis';
-    event = { type: 'induce', actor: a, item };
+    event = { op: 'induce', actor: a, item };
   } else if (op === 'promote') {
     const tgt = st.items.get(raw?.id);
-    event = { type: 'promote', actor: a, id: raw?.id, digest: raw?.digest, acknowledged_flags: raw?.acknowledgeFlags === true, flags: tgt ? tgt.flags : [] };
+    event = { op: 'promote', actor: a, id: raw?.id, digest: raw?.digest, acknowledged_flags: raw?.acknowledgeFlags === true, flags: tgt ? tgt.flags : [] };
   } else if (op === 'retire') {
-    event = { type: 'retire', actor: a, id: raw?.id, reason: raw?.reason };
+    event = { op: 'retire', actor: a, id: raw?.id, reason: raw?.reason };
   } else if (op === 'feedback') {
-    event = { type: 'feedback', actor: a, item_ids: raw?.item_ids, outcome: raw?.outcome, evidence: isObj(raw?.evidence) ? { kind: raw.evidence.kind, ref: raw.evidence.ref, task: raw.evidence.task } : raw?.evidence };
+    event = { op: 'feedback', actor: a, item_ids: raw?.item_ids, outcome: raw?.outcome, evidence: isObj(raw?.evidence) ? { kind: raw.evidence.kind, ref: raw.evidence.ref, task: raw.evidence.task } : raw?.evidence };
+  } else if (op === 'epoch') {
+    event = { op: 'epoch', actor: a, reason: raw?.reason, covers: raw?.covers };
   } else throw new Refused('unknown_op', String(op));
   const ctx = ctxOf(op, a, raw, st, nowMs, opts, item);
   if (op === 'add' || op === 'induce') ctx.claimedTrust = raw?.trust;
@@ -467,8 +480,9 @@ export function plan(st, op, actor, args, { nowMs, opts = {} }) {
 
 /** 記録の1行（イベント）から検査の文脈を作る（再生用。bench の偽イベントの試験にも使う） */
 export function ctxFromEvent(st, rec, nowMs, opts = {}) {
-  const op = rec.type;
+  const op = rec.op;
   if (op === 'add' || op === 'induce') return ctxOf(op, rec.actor, rec.item, st, nowMs, opts, rec.item);
+  if (op === 'epoch') return ctxOf(op, rec.actor, { reason: rec.reason }, st, nowMs, opts);
   if (op === 'promote') return ctxOf(op, rec.actor, { id: rec.id, digest: rec.digest, acknowledgeFlags: rec.acknowledged_flags }, st, nowMs, opts);
   if (op === 'retire') return ctxOf(op, rec.actor, { id: rec.id, reason: rec.reason }, st, nowMs, opts);
   if (op === 'feedback') return ctxOf(op, rec.actor, { item_ids: rec.item_ids, outcome: rec.outcome, evidence: rec.evidence }, st, nowMs, opts);
@@ -477,7 +491,7 @@ export function ctxFromEvent(st, rec, nowMs, opts = {}) {
 
 /** イベントを状態に反映する（検査は済んでいる前提。再生と書き込みの両方が使う） */
 export function applyEvent(st, ev, seq = 0) {
-  switch (ev.type) {
+  switch (ev.op) {
     case 'add': case 'induce': {
       st.items.set(ev.item.id, pickItem(ev.item));   // 許可リストで射影（検査していない欄を入れない）
       st.counter = Math.max(st.counter, Number(ev.item.id.slice(4)));
@@ -494,30 +508,76 @@ export function applyEvent(st, ev, seq = 0) {
       break;
     }
     case 'retrieved': st.retrievals++; break;
+    case 'epoch': st.epochs++; break;
     default: break;
   }
   st.lastSeq = seq || st.lastSeq;
 }
 
-/** イベントの列から現在の状態を作り直す。各イベントを、そのときの時刻（at）と状態でガードに通し、通らないものは rejected に残す */
-export function reduce(records, opts = {}) {
+/** 設定 → 行に残す写し（cfg） */
+export function cfgCopy(opts = {}) {
+  const w = opts.workItem || DEFAULT_WORK_ITEM;
+  return { min_sources: opts.minSources ?? DEFAULTS.minSources, retire_harmful: opts.retireHarmful ?? DEFAULTS.retireHarmful, work_item: { prefix: w.prefix, digits: [w.digits[0], w.digits[1]] } };
+}
+/** 行の写し（cfg）→ 検査に使う設定。読めなければ null */
+function optsOfCfg(cfg, base = {}) {
+  if (!isObj(cfg) || Object.keys(cfg).some((k) => !['min_sources', 'retire_harmful', 'work_item'].includes(k))) return null;
+  const w = parseWorkItemSpec(cfg.work_item);
+  if (!w || !Number.isSafeInteger(cfg.min_sources) || !Number.isSafeInteger(cfg.retire_harmful)) return null;
+  return { ...base, minSources: cfg.min_sources, retireHarmful: cfg.retire_harmful, workItem: w, taskMatch: makeWorkItemId(w) };
+}
+const sameCfg = (a, b) => isObj(a) && isObj(b) && a.min_sources === b.min_sources && a.retire_harmful === b.retire_harmful && sameWorkItemSpec(a.work_item, b.work_item);
+
+/** 移行の記録が覆う行の数（今の版・オーナー・覆う範囲がその前の行と一致するものだけ） */
+function coveredCount(records) {
+  let n = 0;
+  records.forEach((r, i) => {
+    if (!isObj(r) || r.type !== RECORD_TYPE || r.op !== 'epoch' || r.rules !== RULES || !isOwner(r.actor) || !isObj(r.covers)) return;
+    const c = r.covers.count;
+    if (c !== i || !(r.covers.last_hash === (c === 0 ? 'genesis' : (records[c - 1] || {}).hash)) || !(c === 0 || isLineHash(r.covers.last_hash))) return;
+    n = Math.max(n, c);
+  });
+  return n;
+}
+
+/**
+ * 行の列から現在の状態を作り直す。各行を、そのときの時刻（at）と状態でガードに通し、通らないものは rejected に残す。
+ * 版の違う行・設定の写しが開く側の設定と違う行は、移行の記録に覆われていなければ状態に入れず uncovered に数える（書き込みは EX-RULES-VERSION が止める）。
+ * 覆われた行は、その行の写しの設定（cfg）で確かめる。
+ * @param {{ pendingEpoch?: boolean }} [o] 移行の記録を書く直前だけ：今ある全行を覆うとみなす
+ */
+export function reduce(records, opts = {}, o = {}) {
   const st = emptyState();
-  for (const rec of records) {
+  const cur = cfgCopy(opts);
+  const covered = o.pendingEpoch ? records.length : coveredCount(records);
+  records.forEach((rec, i) => {
     try {
-      if (rec.type === 'retrieved') {
-        if (!Array.isArray(rec.item_ids) || typeof rec.role !== 'string') throw new Error('retrieved の形が不正');
-        applyEvent(st, rec, rec.seq); continue;
+      if (!isObj(rec) || rec.type !== RECORD_TYPE || !OPS.includes(rec.op)) throw new Error('知らない行');
+      const current = rec.rules === RULES && sameCfg(rec.cfg, cur);
+      if (!current && i >= covered) {
+        st.uncovered++;
+        st.rejected.push({ seq: rec.seq, op: rec.op, violations: [{ guard: 'EX-RULES-VERSION', reason: rec.rules !== RULES ? `規則の版が今（${RULES}）と違う（${String(rec.rules).slice(0, 20)}）` : '設定の写し（cfg）が開く側の設定と違う（別の設定で開いている）' }] });
+        return;
       }
-      const at = Date.parse(rec.at);
-      const ctx = ctxFromEvent(st, rec, at, opts);
-      if (!ctx || Number.isNaN(at)) throw new Error('未知のイベントか時刻が不正');
+      const rowOpts = current ? { ...opts, taskMatch: makeWorkItemId(opts.workItem || DEFAULT_WORK_ITEM) } : optsOfCfg(rec.cfg, opts);
+      if (!rowOpts) throw new Error('設定の写し（cfg）が読めない');
+      if (rec.op === 'retrieved') {
+        if (!Array.isArray(rec.item_ids) || typeof rec.role !== 'string') throw new Error('retrieved の形が不正');
+        applyEvent(st, rec, rec.seq); return;
+      }
+      const at = parseTs(rec.at);
+      const ctx = ctxFromEvent(st, rec, at, rowOpts);
+      if (!ctx || at === null) throw new Error('未知の行か時刻が不正');
       const r = check(ctx);
-      if (!r.ok) { st.rejected.push({ seq: rec.seq, type: rec.type, violations: r.violations }); continue; }
+      if (!r.ok) { st.rejected.push({ seq: rec.seq, op: rec.op, violations: r.violations }); return; }
+      if (rec.op === 'epoch' && !(isObj(rec.covers) && rec.covers.count === i && rec.covers.last_hash === (i === 0 ? 'genesis' : records[i - 1].hash))) {
+        st.rejected.push({ seq: rec.seq, op: rec.op, violations: [{ guard: 'EX-EPOCH-OWNER', reason: '移行の記録の覆う範囲が、その前の行と一致しない' }] }); return;
+      }
       applyEvent(st, rec, rec.seq);
     } catch (e) {
-      st.rejected.push({ seq: rec?.seq, type: rec?.type, violations: [{ guard: 'REPLAY', reason: `再生できない行（${e.message}）` }] });
+      st.rejected.push({ seq: rec?.seq, op: rec?.op, violations: [{ guard: 'REPLAY', reason: `再生できない行（${e.message}）` }] });
     }
-  }
+  });
   return st;
 }
 
@@ -586,28 +646,44 @@ function publicView(it, score) {
 export function openExperience(file, opt = {}) {
   const nowFn = opt.now || nowIso;
   const chain = openChain(file, { now: nowFn, lockWaitMs: opt.lockWaitMs });
-  const opts = { minSources: opt.minSources, retireHarmful: opt.retireHarmful, verifyRef: opt.verifyRef };
+  // 設定は開く側の引数。範囲を確かめ、書く行に写し（cfg）を残す。写しが違う行は epoch まで状態に入れない（冒頭）
+  if (opt.minSources !== undefined && !(Number.isSafeInteger(opt.minSources) && opt.minSources >= 2 && opt.minSources <= 50)) throw new Refused('bad_config', 'minSources は 2〜50 の整数');
+  if (opt.retireHarmful !== undefined && !(Number.isSafeInteger(opt.retireHarmful) && opt.retireHarmful >= 1 && opt.retireHarmful <= 1000)) throw new Refused('bad_config', 'retireHarmful は 1〜1000 の整数');
+  const workItem = opt.workItem === undefined ? DEFAULT_WORK_ITEM : parseWorkItemSpec(opt.workItem);
+  if (!workItem) throw new Refused('bad_config', 'workItem は票の ID の宣言 { prefix, digits: [最小, 最大] }');
+  const opts = { minSources: opt.minSources ?? DEFAULTS.minSources, retireHarmful: opt.retireHarmful ?? DEFAULTS.retireHarmful, workItem, verifyRef: opt.verifyRef };
   const state = () => reduce(chain.read(), opts);
 
   function mutate(op, actor, args) {
-    const body = {};
+    const body = { type: RECORD_TYPE, rules: RULES, cfg: cfgCopy(opts) };
     let out;
     chain.append(body, (records) => {
-      const st = reduce(records, opts);
-      const nowMs = Date.parse(nowFn());
-      const { ctx, event } = plan(st, op, actor, args, { nowMs, opts });
+      const st = reduce(records, opts, { pendingEpoch: op === 'epoch' });
+      const nowMs = parseTs(nowFn());
+      if (nowMs === null) throw new Refused('bad_time', 'now が vocab の時刻の形でない');
+      const a2 = op === 'epoch' ? { ...args, covers: { count: records.length, last_hash: records.length ? records[records.length - 1].hash : 'genesis' } } : args;
+      const { ctx, event } = plan(st, op, actor, a2, { nowMs, opts: { ...opts, taskMatch: makeWorkItemId(workItem) } });
       const r = check(ctx);   // 書く経路は必ず全ガード
-      if (!r.ok) throw new Refused('guard_violation', r.violations.map((v) => `${v.guard}: ${v.reason}`).join(' / '));
+      if (!r.ok) throw refusal(r.violations);
       Object.assign(body, event);
       out = event;
     });
+    if (out.op === 'epoch') return structuredClone(out);
     const st = state();
-    if (out.type === 'feedback') return out.item_ids.map((id) => st.items.get(id));   // 更新後の項目の配列
+    if (out.op === 'feedback') return out.item_ids.map((id) => st.items.get(id));   // 更新後の項目の配列
     return st.items.get(out.item ? out.item.id : out.id);   // 更新後の項目
   }
 
   return {
-    file, verify: chain.verify, state,
+    file, state,
+    /** 鎖と、各行の再生の結果（rejected があれば ok: false。行は状態に入っていない） */
+    verify() {
+      const v = chain.verify(); if (!v.ok) return v;
+      const st = state();
+      return { ok: st.rejected.length === 0, count: v.count, rules: RULES, epochs: st.epochs, rejected_count: st.rejected.length, uncovered: st.uncovered, rejected_rows: st.rejected.slice(0, 100) };
+    },
+    /** オーナーの移行の記録。今ある全行を覆い、版・設定の写しの違う行を、その行の写しの設定で確かめて受け入れる。理由必須 */
+    epoch: (actor, o = {}) => mutate('epoch', actor, { reason: o.reason }),
     /** 項目の一覧（複製。生の本文を含む。オーナー・保守用。作業員には渡さない） */
     list: () => [...state().items.values()].map((x) => structuredClone(x)),
     /** オーナーの表示用：項目（生の本文）・指紋・警告。昇格の前にこれを見せる。生の本文を返すのはここ（と list）だけ */
@@ -645,10 +721,11 @@ export function openExperience(file, opt = {}) {
       const searchKind = scorer.searchKind || (opt.scorer ? 'custom' : 'lexical');
       if (!Number.isInteger(limit) || limit < 1 || limit > 50) throw new Refused('bad_args', 'limit');
       if (!Number.isInteger(maxChars) || maxChars < 100 || maxChars > 50000) throw new Refused('bad_args', 'maxChars');
-      const nowMs = Date.parse(nowFn());
-      if (Number.isNaN(nowMs)) throw new Refused('bad_args', 'now');
+      const nowMs = parseTs(nowFn());
+      if (nowMs === null) throw new Refused('bad_args', 'now');
       const rc = check({ op: 'retrieve', audience });
-      if (!rc.ok) return { items: [], rendered: '', searchKind, refused: rc.violations.map((v) => v.reason).join(' / ') };
+      // 拒否は例外にせず { refused, violations } を返す：取り出しは状態を書かず、空を返せば何も渡らない（fail-closed）。呼び出し側（指示の組み立て）を落とさない
+      if (!rc.ok) return { items: [], rendered: '', searchKind, refused: rc.violations.map((v) => v.reason).join(' / '), violations: rc.violations };
 
       const q = { text: String(query.text ?? ''), tags: Array.isArray(query.tags) ? query.tags.map((t) => String(t).trim().toLowerCase()) : [], domain: query.domain };
       const st = state();
@@ -691,7 +768,8 @@ export function openExperience(file, opt = {}) {
 
       if (items.length) {
         const role = normRole(audience.role);
-        chain.append({ type: 'retrieved', role, task: typeof audience.task === 'string' ? audience.task : null, item_ids: items.map((x) => x.id), query: digest(q) });
+        const task = typeof audience.task === 'string' && makeWorkItemId(workItem)(audience.task) ? audience.task : null;
+        chain.append({ type: RECORD_TYPE, rules: RULES, cfg: cfgCopy(opts), op: 'retrieved', role, task, item_ids: items.map((x) => x.id), query: digest(q) });
       }
       return { items, rendered, searchKind };
     },

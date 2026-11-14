@@ -8,8 +8,11 @@ import { GUARDS, openExperience, itemDigest, tokenize, detectFlags } from '../ex
 import { SCENARIOS, benchRetrieve } from '../bench/scenarios-experience.mjs';
 
 const OWNER = { role: 'owner', kind: 'human', id: 'owner-1' };
-const WORKER = { role: 'worker', kind: 'ai', id: 'worker-1' };
-const COURT = { role: 'court', kind: 'script', id: 'court-1' };
+const WORKER = { role: 'worker', kind: 'ai', id: 'worker-1', lineage: 'claude' };
+/** 裁判所の側のスクリプト（vocab の gate_runner。旧 'court'） */
+const COURT = { role: 'gate_runner', kind: 'script', id: 'court-1' };
+/** 鎖へ直接書く行の形（type・rules・cfg・op） */
+const ROW = (op, fields) => ({ type: X.RECORD_TYPE, rules: X.RULES, cfg: X.cfgCopy({}), op, ...fields });
 const SCOPE = { domain: 'software-dev', roles: ['worker'], tags: ['test'] };
 const V = (n, task) => [{ kind: 'verdict_finding', ref: `${task}-judge.json#${n}`, task }];
 let clock = '2026-11-14T09:00:00+09:00';
@@ -17,7 +20,9 @@ const mk = (opt = {}) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vgdd-next-'));
   return { dir, file: path.join(dir, 'exp.jsonl'), s: openExperience(path.join(dir, 'exp.jsonl'), { now: () => clock, ...opt }) };
 };
-const refused = (fn, re) => assert.throws(fn, (e) => e.code === 'guard_violation' && (!re || re.test(e.detail)));
+// 拒否は Refused('guard_violation') と e.violations（[{ guard, reason }]）。正規表現は detail か、違反のガード名・理由のどれかに合えばよい
+const refused = (fn, re) => assert.throws(fn, (e) => e.code === 'guard_violation' && Array.isArray(e.violations) && e.violations.length > 0
+  && (!re || re.test(e.detail) || e.violations.some((v) => re.test(v.guard) || re.test(v.reason))));
 
 test('ガード：全シナリオ。attack は止まり、benign は通る', () => {
   for (const sc of SCENARIOS) {
@@ -81,7 +86,7 @@ test('benign：別々の task から帰納 → オーナーが昇格。AI の昇
   assert.equal(e.layer, 'experience'); assert.equal(e.provenance.length, 2); assert.equal(e.trust, 'grounded');
   const ins = s.inspect(e.id);
   refused(() => s.promote(WORKER, e.id, { digest: ins.digest }), /EX-PROMOTE-OWNER/);
-  refused(() => s.promote({ role: 'owner', kind: 'ai', id: 'o' }, e.id, { digest: ins.digest }), /EX-PROMOTE-OWNER/);
+  refused(() => s.promote({ role: 'owner', kind: 'ai', id: 'o', lineage: 'claude' }, e.id, { digest: ins.digest }), /EX-PROMOTE-OWNER/);
   refused(() => s.promote(OWNER, e.id, { digest: 'sha256:00' }), /EX-DIGEST/);
   assert.equal(s.promote(OWNER, e.id, { digest: ins.digest }).status, 'adopted');
   refused(() => s.promote(OWNER, e.id, { digest: ins.digest }), /EX-PROMOTE-STATE/);
@@ -149,7 +154,7 @@ test('取り出し：期限切れ・引退・役割違い・領域違いは出�
   clock = '2027-03-01T09:00:00+09:00';
   assert.equal(s.retrieve({ audience: { role: 'worker' }, query: q }).items.length, 0);
   clock = '2026-11-14T09:00:00+09:00';
-  assert.equal(s.retrieve({ audience: { role: 'planner' }, query: q }).items.length, 0);
+  assert.equal(s.retrieve({ audience: { role: 'tester' }, query: q }).items.length, 0);   // 旧は 'planner'（表にない役割になったので、scope にない表の役割に替えた）
   assert.equal(s.retrieve({ audience: { role: 'worker' }, query: { ...q, domain: 'legal' } }).items.length, 0);
   s.retire(OWNER, a.id, { reason: '古い' });
   assert.equal(s.retrieve({ audience: { role: 'worker' }, query: q }).items.length, 0);
@@ -222,12 +227,14 @@ test('再生：記録へ直接書かれた偽のイベントは状態に入ら�
   s.add(WORKER, { text: 'x', scope: SCOPE, provenance: V(1, 'T-001') });
   const { openChain } = await import('../lib/chain.mjs');
   const c = openChain(file, { now: () => clock });
-  c.append({ type: 'promote', actor: WORKER, id: 'exp-000001', digest: 'x', acknowledged_flags: false });   // 作業員が鎖へ直接書く
-  c.append({ type: 'feedback', actor: WORKER, item_ids: ['exp-000001'], outcome: 'helpful', evidence: { kind: 'verdict', ref: 'z', task: 'T-001' } });
-  c.append({ type: 'mystery' });
+  c.append(ROW('promote', { actor: WORKER, id: 'exp-000001', digest: 'x', acknowledged_flags: false }));   // 作業員が鎖へ直接書く
+  c.append(ROW('feedback', { actor: WORKER, item_ids: ['exp-000001'], outcome: 'helpful', evidence: { kind: 'verdict', ref: 'z', task: 'T-001' } }));
+  c.append({ type: 'mystery' });   // 知らない行（意図して古い・未知の形のまま）
   const st = s.state();
   assert.equal(st.items.get('exp-000001').status, 'candidate'); assert.equal(st.items.get('exp-000001').helpful, 0);
   assert.equal(st.rejected.length, 3);
+  assert.deepEqual(st.rejected.map((r) => r.op), ['promote', 'feedback', undefined]);
+  assert.equal(s.verify().ok, false);   // verify も再生して確かめる（鎖だけでない）
 });
 
 test('記録の改ざんは fail-closed（取り出さず投げる）', () => {
@@ -258,11 +265,18 @@ test('B-F8：司法・裁判所の側の役割名の表記ゆれは、scope に�
     assert.ok(r.refused && r.items.length === 0, `取り出せた: ${JSON.stringify(role)}`);
   }
 });
-test('B-F8 の対照：通常の役割名（大文字・ハイフン・全角の英数字）は正規化されて通る', () => {
+// 旧は Planner・code-writer（表にない役割）を正規化して通していた。役割は vocab の表の名前だけになったので、表の役割の表記ゆれに替え、
+// 表にない役割・ハイフンの変換が使えないことを確かめる行を足した（意図の調整）
+test('B-F8 の対照：表の役割名（大文字・全角の英数字・前後の空白）は正規化されて通る。表にない役割は通らない', () => {
   const { s } = mk();
-  s.add(WORKER, { text: 'テスト', scope: { ...SCOPE, roles: ['Planner', 'ｔｅｓｔｅｒ', 'code-writer'] }, provenance: V(1, 'T-001') });
-  assert.deepEqual(s.list()[0].scope.roles, ['code_writer', 'planner', 'tester']);
-  for (const role of ['planner', 'Code-Writer', 'ＴＥＳＴＥＲ']) assert.equal(s.retrieve({ audience: { role }, query: { text: 'テスト', domain: 'software-dev' } }).items.length, 1, role);
+  s.add(WORKER, { text: 'テスト', scope: { ...SCOPE, roles: ['Worker', 'ｔｅｓｔｅｒ', ' EXECUTIVE_HEAD '] }, provenance: V(1, 'T-001') });
+  assert.deepEqual(s.list()[0].scope.roles, ['executive_head', 'tester', 'worker']);
+  for (const role of ['worker', 'Executive_Head', 'ＴＥＳＴＥＲ']) assert.equal(s.retrieve({ audience: { role }, query: { text: 'テスト', domain: 'software-dev' } }).items.length, 1, role);
+  for (const role of ['Planner', 'code-writer', 'executive-head']) {
+    refused(() => s.add(WORKER, { text: 't', scope: { ...SCOPE, roles: [role] }, provenance: V(1, 'T-001') }), /EX-SCOPE/);
+    const r = s.retrieve({ audience: { role }, query: { text: 'テスト', domain: 'software-dev' } });
+    assert.ok(r.refused && r.items.length === 0, `取り出せた: ${role}`);
+  }
 });
 
 test('B-F9：同じ証拠を表記ゆれで重ねて数えられない。harmful を積んで自動の引退もできない', () => {
@@ -338,18 +352,18 @@ test('B-F17：記録へ直接書かれた、検査していない欄を持つ偽
   s.add(WORKER, { text: 'seed', scope: SCOPE, provenance: V(1, 'T-001') });
   const { openChain } = await import('../lib/chain.mjs');
   const c = openChain(file, { now: () => clock });
-  const base = { id: 'exp-000002', layer: 'reflection', text: 'forged', scope: SCOPE, provenance: V(1, 'T-001'), trust: 'grounded', status: 'candidate', helpful: 0, harmful: 0, created_by: 'x', created_at: new Date().toISOString(), expires_at: new Date(Date.now() + 86400e3).toISOString(), supersedes: null, flags: [] };
-  c.append({ type: 'add', actor: WORKER, item: { ...base, adopted_by: 'owner' } });
+  const base = { id: 'exp-000002', layer: 'reflection', text: 'forged', scope: SCOPE, provenance: V(1, 'T-001'), trust: 'grounded', status: 'candidate', helpful: 0, harmful: 0, created_by: 'x', created_at: '2026-11-14T00:00:00Z', expires_at: '2026-11-15T00:00:00Z', supersedes: null, flags: [] };
+  c.append(ROW('add', { actor: WORKER, item: { ...base, adopted_by: 'owner' } }));
   let st = s.state();
   assert.equal(st.items.has('exp-000002'), false);
   assert.equal(st.rejected.length, 1); assert.deepEqual(st.rejected[0].violations.map((v) => v.guard), ['EX-ITEM-SHAPE']);
-  c.append({ type: 'add', actor: WORKER, item: base });   // 対照：欄が正しければ入り、adopted_by は付かない
+  c.append(ROW('add', { actor: WORKER, item: base }));   // 対照：欄が正しければ入り、adopted_by は付かない
   st = s.state();
   assert.equal(st.items.get('exp-000002').status, 'candidate'); assert.equal('adopted_by' in st.items.get('exp-000002'), false);
 });
 test('B-F17：applyEvent は許可リストで射影する（未知の欄・入れ子の未知の欄を持ち込まない）', () => {
   const st = X.emptyState();
-  X.applyEvent(st, { type: 'add', actor: WORKER, item: { id: 'exp-000001', layer: 'reflection', text: 't', scope: { ...SCOPE, extra: 1 }, provenance: [{ kind: 'obs', ref: 'a', task: 'T-1', x: 1 }], trust: 'hypothesis', status: 'candidate', helpful: 0, harmful: 0, created_by: 'w', created_at: 'x', expires_at: 'y', supersedes: null, flags: [], adopted_by: 'owner' } });
+  X.applyEvent(st, ROW('add', { actor: WORKER, item: { id: 'exp-000001', layer: 'reflection', text: 't', scope: { ...SCOPE, extra: 1 }, provenance: [{ kind: 'obs', ref: 'a', task: 'T-001', x: 1 }], trust: 'hypothesis', status: 'candidate', helpful: 0, harmful: 0, created_by: 'w', created_at: 'x', expires_at: 'y', supersedes: null, flags: [], adopted_by: 'owner' } }));
   const it = st.items.get('exp-000001');
   assert.equal('adopted_by' in it, false); assert.equal('extra' in it.scope, false); assert.equal('x' in it.provenance[0], false);
 });
@@ -403,4 +417,81 @@ test('良性の流れ：追加 → 取り出し → feedback → 帰納 → 昇�
   const e = s.induce(WORKER, { from: [a.id, b.id], text: '変更にはテストを添える', scope: SCOPE });
   assert.equal(s.promote(OWNER, e.id, { digest: s.inspect(e.id).digest }).status, 'adopted');
   assert.equal(s.state().rejected.length, 0);
+});
+
+// ---------- 共通の語彙（vocab）への移行・規則の版と移行の記録（epoch） ----------
+const NIGHT = { role: 'night_runner', kind: 'script', id: 'night-1' };
+
+test('判例：Codex のセキュリティ審査（codex_security）には経験を渡さない（以前は名前の推し量りで漏れていた）', () => {
+  const { s } = mk();
+  s.add(WORKER, { text: 'テストの経験', scope: SCOPE, provenance: V(1, 'T-001') });
+  for (const role of ['codex_security', ' Codex_Security ', 'ｃｏｄｅｘ＿ｓｅｃｕｒｉｔｙ', 'gate_runner']) {
+    const r = s.retrieve({ audience: { role }, query: { text: 'テスト', domain: 'software-dev' } });
+    assert.equal(r.items.length, 0, role); assert.equal(r.rendered, ''); assert.match(r.refused, /司法/);
+    assert.deepEqual(r.violations.map((v) => v.guard), ['EX-RETRIEVE-JUDGE']);
+  }
+  refused(() => s.add(WORKER, { text: 't', scope: { ...SCOPE, roles: ['codex_security'] }, provenance: V(1, 'T-001') }), /EX-SCOPE/);
+  assert.equal(s.state().retrievals, 0);
+  assert.equal(X.isWithheldRole('codex_security'), true); assert.equal(X.isWithheldRole('courtesy_bot'), true); assert.equal(X.isWithheldRole('Worker'), false);
+  assert.equal(X.isJudicialRole('codex_security'), true); assert.equal(X.isJudicialRole('gate_runner'), false); assert.equal(X.normRole('code-writer'), null);
+  const r = s.retrieve({ audience: { role: 'courtesy_bot' }, query: { text: 'テスト', domain: 'software-dev' } });
+  assert.ok(r.refused && r.items.length === 0); assert.match(r.refused, /表/);   // 表にない役割は「使えない」として拒む（推し量らない）
+});
+
+test('feedback：作業員の役割のスクリプト・行政の夜間のスクリプトは更新できない。裁判所の執行（gate_runner）はできる', () => {
+  const { s } = mk();
+  const a = s.add(WORKER, { text: 'a', scope: SCOPE, provenance: V(1, 'T-001') });
+  const fb = { item_ids: [a.id], outcome: 'helpful', evidence: { kind: 'verdict', ref: 'v-1', task: 'T-002' } };
+  refused(() => s.feedback({ role: 'worker', kind: 'script', id: 'w-script' }, fb), /EX-ACTOR/);   // worker の種類は ai（行為者として不正）
+  refused(() => s.feedback({ role: 'worker', kind: 'script', id: 'w-script' }, fb), /EX-FEEDBACK-ACTOR/);
+  refused(() => s.feedback(NIGHT, fb), /EX-FEEDBACK-ACTOR/);
+  refused(() => s.feedback({ role: 'reaper', kind: 'script', id: 'reaper-1' }, fb), /EX-FEEDBACK-ACTOR/);
+  assert.equal(s.list()[0].helpful, 0);
+  assert.equal(s.feedback(COURT, fb)[0].helpful, 1);
+  refused(() => s.feedback(COURT, { ...fb, evidence: { ...fb.evidence, ref: 'v-2', task: 'T-1' } }), /EX-FEEDBACK-EVIDENCE/);   // 票の ID の宣言（T- と 3〜4 桁）に合わない
+});
+
+test('verify は再生する：厳しい設定（minSources 5）で開き直すと、帰納の行は覆われず ok: false・書き込みは止まる。オーナーの epoch の後は ok で古い項目を保つ', () => {
+  const { s, file } = mk();
+  const a = s.add(WORKER, { text: 'テスト不足は差し戻される', scope: SCOPE, provenance: V(1, 'T-001') });
+  const b = s.add(WORKER, { text: '境界値のテストが無いと差し戻される', scope: SCOPE, provenance: V(1, 'T-002') });
+  const e = s.induce(WORKER, { from: [a.id, b.id], text: '変更にはテストを添える', scope: SCOPE });
+  const v0 = s.verify();
+  assert.equal(v0.ok, true); assert.equal(v0.count, 3); assert.equal(v0.rules, 'ex.v1'); assert.equal(v0.uncovered, 0); assert.equal(v0.rejected_count, 0);
+
+  const s5 = openExperience(file, { now: () => clock, minSources: 5 });
+  const v1 = s5.verify();
+  assert.equal(v1.ok, false); assert.equal(v1.uncovered, 3); assert.equal(v1.rejected_count, 3);
+  assert.ok(v1.rejected_rows.every((r) => r.violations[0].guard === 'EX-RULES-VERSION'));
+  assert.ok(v1.rejected_rows.some((r) => r.op === 'induce'));
+  assert.equal(s5.state().items.size, 0);   // 覆われるまで状態に入れない
+  refused(() => s5.add(WORKER, { text: 'x', scope: SCOPE, provenance: V(1, 'T-003') }), /EX-RULES-VERSION/);
+  refused(() => s5.retire(OWNER, a.id, { reason: '古い' }), /EX-RULES-VERSION/);
+
+  const ep = s5.epoch(OWNER, { reason: 'min_sources を 5 に上げた。古い行は確かめた' });
+  assert.equal(ep.op, 'epoch'); assert.equal(ep.covers.count, 3);
+  const v2 = s5.verify();
+  assert.equal(v2.ok, true); assert.equal(v2.uncovered, 0); assert.equal(v2.epochs, 1); assert.equal(v2.count, 4);
+  assert.deepEqual(s5.list().map((x) => x.id), [a.id, b.id, e.id]);   // 覆われた帰納の行は、その行の写しの設定（min_sources 2）で確かめて保つ
+  assert.equal(s5.state().items.get(e.id).layer, 'experience');
+  assert.ok(s5.add(WORKER, { text: '移行の後の経験', scope: SCOPE, provenance: V(1, 'T-003') }));   // 書き込みが戻る
+  const c = s5.add(WORKER, { text: 'c', scope: SCOPE, provenance: V(1, 'T-004') });
+  refused(() => s5.induce(WORKER, { from: [a.id, b.id, c.id], text: 'x', scope: SCOPE }), /5 件以上/);   // 新しい行は新しい設定で確かめる
+});
+
+test('移行の記録（epoch）はオーナーだけが理由つきで書ける。開く側の設定の範囲外は bad_config', () => {
+  const { s, file } = mk();
+  s.add(WORKER, { text: 'a', scope: SCOPE, provenance: V(1, 'T-001') });
+  const s3 = openExperience(file, { now: () => clock, minSources: 3 });
+  refused(() => s3.epoch(WORKER, { reason: '古い行を通す' }), /EX-EPOCH-OWNER/);
+  refused(() => s3.epoch(COURT, { reason: '自動の移行' }), /EX-EPOCH-OWNER/);
+  refused(() => s3.epoch(NIGHT, { reason: '夜間の移行' }), /EX-EPOCH-OWNER/);
+  refused(() => s3.epoch({ role: 'owner', kind: 'ai', id: 'owner-1', lineage: 'claude' }, { reason: '代理' }), /EX-EPOCH-OWNER/);
+  for (const o of [{}, { reason: '' }, { reason: '   ' }]) refused(() => s3.epoch(OWNER, o), /EX-EPOCH-OWNER/);
+  assert.equal(s3.verify().epochs, 0); assert.equal(s3.verify().ok, false);
+  assert.equal(s3.epoch(OWNER, { reason: '確かめた' }).op, 'epoch');
+  assert.equal(s3.verify().ok, true);
+  for (const o of [{ minSources: 1 }, { minSources: 51 }, { minSources: 2.5 }, { retireHarmful: 0 }, { retireHarmful: 1001 }, { workItem: { prefix: 'T-', digits: [0, 3] } }]) {
+    assert.throws(() => openExperience(file, { now: () => clock, ...o }), (e) => e.code === 'bad_config', JSON.stringify(o));
+  }
 });

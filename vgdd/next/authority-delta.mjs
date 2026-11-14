@@ -16,6 +16,7 @@
 //   - 新しい probe が本当に意味のある操作か（空回りしないか）は、適合性テストを前の版に当てて確かめる仕事で、ここでは見ない
 
 import { canonical } from './lib/chain.mjs';
+import { policyLineOf } from './lib/vocab.mjs';
 
 export const CLASSES = ['neutral', 'tightening', 'loosening', 'indeterminate'];
 // 対応表は null プロトタイプ（'constructor' などの名前を既知の値と取り違えない。F11）
@@ -45,13 +46,15 @@ function nullProto(v) {
   return v;
 }
 
-// 法律の系統（SPEC §4-6・INV-06）：kernel_version は pN.N.N（末尾に英小文字1つを許す）。系統は先頭の pN.N
+// 法律の系統（SPEC §4-6・INV-06）：kernel_version は pN.N.N（末尾に英小文字1つを許す）。系統（先頭の pN.N）の取り出しは lib/vocab.mjs の policyLineOf。
+// 役割の種類の判定は vocab を参照しない（分類器は権限の表 capabilities.json の roles だけを見る）。
+// VERSION_RE は同じ系統の中の版の上下を比べるためだけに使う（系統の語彙ではない）
 const VERSION_RE = /^p(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)([a-z]?)$/; // 先頭の 0（p0.4.015 など）は形の崩れ
 /** kernel_version の変更の分類。同じ系統の中で末尾が増えるだけなら neutral、それ以外（系統の変更・下げ・形の崩れ・追加・削除）は indeterminate（F1） */
 function classifyVersion(a, b) {
   const x = typeof a === 'string' ? VERSION_RE.exec(a) : null; const y = typeof b === 'string' ? VERSION_RE.exec(b) : null;
   if (!x || !y) return ['indeterminate', `kernel_version の形が pN.N.N でない・欠けている（${a} → ${b}）。系統が読めないと承認の有効性が決まらない`];
-  if (x[1] !== y[1] || x[2] !== y[2]) return ['indeterminate', `法律の系統の変更（p${x[1]}.${x[2]} → p${y[1]}.${y[2]}）は承認の有効性を変える（戻せば無効になった承認が復活しうる）`];
+  if (policyLineOf(a) !== policyLineOf(b)) return ['indeterminate', `法律の系統の変更（${policyLineOf(a)} → ${policyLineOf(b)}）は承認の有効性を変える（戻せば無効になった承認が復活しうる）`];
   const up = Number(y[3]) > Number(x[3]) || (Number(y[3]) === Number(x[3]) && y[4] > x[4]);
   return up ? ['neutral', `同じ系統の中の版の上がり（${a} → ${b}）`] : ['indeterminate', `同じ系統の中の版の下げ（${a} → ${b}）`];
 }

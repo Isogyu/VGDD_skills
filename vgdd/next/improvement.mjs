@@ -44,10 +44,12 @@
 
 import { openChain, digest, canonical, Refused } from './lib/chain.mjs';
 import { authorityDelta, routeFor } from './authority-delta.mjs';
+import { parseActor, normActor, isOwner as vocabIsOwner, isJudicialRole, normLineage, differentLineage, policyLineOf as vocabPolicyLineOf, isPolicyLine, ROLES, refusal } from './lib/vocab.mjs';
 
 export const RECORD_TYPE = 'vgdd.improvement.v1';
 export const TIERS = ['experience', 'playbook', 'composition', 'law', 'verifier', 'constitution'];
-export const JUDICIAL_ROLES = ['judge', 'codex_judge', 'constitutional_review'];
+/** 審査者になれる役割（vocab の表で判定する司法。完全一致） */
+export const JUDICIAL_ROLES = Object.freeze(ROLES.filter(isJudicialRole));
 export const DEFAULT_MAX_OPEN = 5;
 const OPS = ['propose', 'amend', 'evaluate', 'review', 'adopt', 'reject', 'withdraw', 'rollback', 'dismiss_cr', 'epoch'];
 /**
@@ -56,11 +58,12 @@ const OPS = ['propose', 'amend', 'evaluate', 'review', 'adopt', 'reject', 'withd
  * あってそれに覆われるときだけ、構造の検査（遷移の表・id の順番・鎖）だけで状態に入れる。覆われない古い版の行は bad_record。
  * 限界：鎖を書ける者（オーナーの権限）は、古い版の印を付けた偽の行を移行の記録の前に作り直せる（鎖の限界と同じ根）。
  */
-export const RULES = 'im.v2';
+export const RULES = 'im.v3';
+// im.v3：行為者・系統・司法の役割・法律の系統は lib/vocab.mjs の語彙。各行に設定の写し（cfg: { max_open }）を持ち、写しが開く側の設定と違う
+//   今の版の行は、移行の記録（epoch）に覆われるまで再生で拒む（開き方で過去の行の扱いを変えない）。今の権限の表と法律の系統は「設定」でなく
+//   書く時の事実（法律そのもの）なので、開く側の引数のまま（再生で確かめない。REPLAY_SKIP）。
 const OPEN = new Set(['proposed', 'evaluated', 'reviewed']);
-const KINDS = new Set(['human', 'ai', 'script']);
 const VERDICTS = new Set(['APPROVED', 'CHANGES_REQUIRED']);
-const POLICY_RE = /^p\d+\.\d+$/;
 export const CAPS_PATH = 'vgdd/kernel/capabilities.json';
 
 // 対象のパスと、それを扱ってよい階層（小文字にそろえたパスに当て、最初に当たった規則を使う）。どれにも当たらないパスは階層を問わない
@@ -168,9 +171,9 @@ export const reviewInputDigest = (state) => digest(reviewInput(state));
 // ---- 状態の補助 ----
 // id の照合は NFKC・小文字にそろえる（大文字小文字・全角の違いで別人を装わせない）
 const norm = (v) => String(v).normalize('NFKC').trim().toLowerCase();
-const idOf = (a) => (isObj(a) && typeof a.id === 'string' ? norm(a.id) : undefined);
-const lineageOf = (a) => (isObj(a) && typeof a.lineage === 'string' ? norm(a.lineage) : undefined);
-const TOKEN_RE = /^[^\s\p{Cc}]+$/u; // 空白・制御文字を含まない（id・lineage）
+/** 行為者の id・系統は vocab で正規化した形で比べる（読めない行為者は undefined。IM-ACTOR-SHAPE が拒む） */
+const idOf = (a) => { const x = normActor(a); return x ? x.id : undefined; };
+const lineageOf = (a) => { const x = normActor(a); return x ? x.lineage : undefined; };
 /**
  * 差し戻しを引き継ぐかを決める target の鍵（N1）：paths は normalizePath（小文字）した各パス、ほかの最上位の文字列・数の項目は
  * 「名前=値」（NFKC・trim・小文字）。順序・大文字小文字・余分な項目では外れない。change（add 等）は鍵にしない。
@@ -185,7 +188,7 @@ function targetKeys(t) {
 const overlaps = (a, b) => { for (const x of a) if (b.has(x)) return true; return false; };
 const curEvals = (p) => p.evaluations.filter((e) => e.digest === p.digest);
 const curReviews = (p) => p.reviews.filter((r) => r.digest === p.digest);
-const isOwner = (a) => isObj(a) && a.kind === 'human' && a.role === 'owner';
+const isOwner = vocabIsOwner;
 const shrinkExempt = (p) => p.tier === 'verifier' && p.target && p.target.change !== 'add';
 /** 前の版で差し戻した審査者と、前の提案から引き継いだ差し戻しの審査者（今の版の審査に依らない） */
 function priorCR(p) {
@@ -293,6 +296,7 @@ function coveredCount(records) {
  * @param {{ pendingEpoch?: boolean }} [o] 移行の記録を書く直前の検査だけが使う（今ある全行を、書こうとする移行の記録が覆うとみなす）
  */
 export function replay(records, o = {}) {
+  const cfgNow = cfgCopy(o.config || {});
   const m = new Map();
   const guards = Object.keys(GUARDS).filter((g) => !REPLAY_SKIP.has(g));
   const covered = o.pendingEpoch ? records.length : coveredCount(records);
@@ -302,6 +306,7 @@ export function replay(records, o = {}) {
     if (!isObj(r) || r.type !== RECORD_TYPE || !OPS.includes(r.op) || typeof r.id !== 'string') throw bad(r, '知らない行');
     const current = r.rules === RULES;
     if (!current && i >= covered) throw bad(r, `規則の版が今（${RULES}）と違う（${r.rules ?? '印なし＝im.v1'}）。古い版の行を受け入れるにはオーナーの移行の記録（epoch）が要る`);
+    if (current && r.op !== 'epoch' && i >= covered && canonical(r.cfg ?? null) !== canonical(cfgNow)) throw bad(r, '設定の写し（cfg）が開く側の設定と違う（別の設定で開いている）。受け入れるにはオーナーの移行の記録（epoch）が要る');
     if (r.op === 'epoch') {
       if (current) {
         const res = check(contextOf(m, { ok: true }, 'epoch', r.actor, null, { reason: r.reason }, REPLAY_CONFIG), guards);
@@ -337,13 +342,15 @@ export function replay(records, o = {}) {
 
 // 採用の有効性（INV-06 と同じ考え方）。公開するのは記録を読み直す im.adoptionValid(id) だけ（F5 の残り：古い写しを有効と見ない）
 function adoptionValidState(state, currentPolicyLine) {
-  if (typeof currentPolicyLine !== 'string' || !POLICY_RE.test(currentPolicyLine) || !isObj(state)) return false;
+  if (!isPolicyLine(currentPolicyLine) || !isObj(state)) return false;
   return state.status === 'adopted' && isObj(state.adoption) && state.adoption.policy_line === currentPolicyLine && state.adoption.digest === state.digest;
 }
 const issue = (s) => deepFreeze(clone(s));
 
-/** 権限の表の kernel_version から法律の系統（pN.N）を取る。読めなければ null */
-export function policyLineOf(caps) { const m = /^(p\d+\.\d+)\.\d+[a-z]?$/.exec(isObj(caps) && typeof caps.kernel_version === 'string' ? caps.kernel_version : ''); return m ? m[1] : null; }
+/** 権限の表（kernel_version）から法律の系統（pN.N）を取る（lib/vocab.mjs の policyLineOf）。読めなければ null */
+export const policyLineOf = (caps) => (isObj(caps) ? vocabPolicyLineOf(caps) : null);
+/** 行に残す設定の写し（im.v3） */
+export const cfgCopy = (config) => ({ max_open: Number.isSafeInteger(config.maxOpen) ? config.maxOpen : DEFAULT_MAX_OPEN });
 
 // ---- 文脈（ctx）の組み立て。状態を書かない ----
 
@@ -374,7 +381,7 @@ function contextOf(m, chain, op, actor, id, input, config) {
  */
 export function buildContext({ records, chain = { ok: true }, op, actor, id = null, input = {}, config }) {
   let m = new Map(); let ch = chain;
-  if (ch.ok) { try { m = replay(records, { pendingEpoch: op === 'epoch' }); } catch (e) { if (!(e instanceof Refused)) throw e; ch = { ok: false, code: e.code, detail: e.detail }; } }
+  if (ch.ok) { try { m = replay(records, { pendingEpoch: op === 'epoch', config }); } catch (e) { if (!(e instanceof Refused)) throw e; ch = { ok: false, code: e.code, detail: e.detail }; } }
   return contextOf(m, ch, op, snapshot(actor), id, snapshot(input), config);
 }
 
@@ -438,13 +445,8 @@ export const GUARDS = {
   // 記録の鎖が無傷で、全行が規則どおりに再生できること（壊れていれば何もしない）
   'IM-CHAIN-INTACT': (ctx) => (ctx.chain && ctx.chain.ok ? null : `記録の鎖が壊れている・再生できない（${ctx.chain && ctx.chain.code}）`),
   // 行為者の形：kind は human・ai・script、lineage は人なら 'human'、AI・スクリプトなら 'human' 以外
-  'IM-ACTOR-SHAPE': (ctx) => {
-    const a = ctx.actor;
-    if (!isObj(a) || !nonEmpty(a.role, 100) || !KINDS.has(a.kind) || !nonEmpty(a.id, 200) || !nonEmpty(a.lineage, 100)) return '行為者に role・kind（human・ai・script）・id・lineage が要る';
-    if (!TOKEN_RE.test(a.id) || !TOKEN_RE.test(a.lineage)) return 'id・lineage に空白・制御文字を含められない';
-    if ((a.kind === 'human') !== (a.lineage === 'human')) return 'lineage の human は人だけが名乗れ、人の lineage は human';
-    return null;
-  },
+  // 行為者の形（vocab）：役割は表の名前で種類が合う。lineage は人なら human、スクリプトなら script、AI なら知っている AI の系統（別名は拒む）
+  'IM-ACTOR-SHAPE': (ctx) => { const a = parseActor(ctx.actor); return a.ok ? null : `行為者が vocab の形でない：${a.errors[0]}`; },
   // 操作ごとの入力の形（自己申告の数の矛盾、JSON として写せない値を含む）
   'IM-INPUT-SHAPE': (ctx) => inputShape(ctx),
   // 状態機械：終わった提案は動かない。rollback は採用済みだけ、それ以外は未決だけ
@@ -495,14 +497,15 @@ export const GUARDS = {
   // 審査者は司法の役割
   'IM-JUDICIAL-REVIEWER': (ctx) => {
     if (ctx.op !== 'review') return null;
-    const a = ctx.actor || {};
-    return JUDICIAL_ROLES.includes(a.role) && a.kind !== 'script' ? null : `審査は司法の役割（${JUDICIAL_ROLES.join('・')}）だけ`;
+    const a = normActor(ctx.actor) || {};
+    return isJudicialRole(a.role) && a.kind !== 'script' ? null : `審査は司法の役割（${JUDICIAL_ROLES.join('・')}）だけ`;
   },
   // 審査者は提案者と別の系統（tier によらず例外なし。経験の汚染も同系統の見落としを突くため）
   'IM-CROSS-LINEAGE': (ctx) => {
     if (ctx.op !== 'review' || !cur(ctx)) return null;
+    // 系統は vocab の知っている系統で比べる（anthropic・openai のような別名は形の検査で拒まれ、ここでも違う系統とみなさない）
     const pl = lineageOf(cur(ctx).proposer); const al = lineageOf(ctx.actor);
-    return al && al !== pl ? null : `審査者が提案者と同じ系統（${pl}）`;
+    return differentLineage(al, pl) ? null : `審査者が提案者と同じ系統（${pl}）か、系統が読めない`;
   },
   // 評価・審査・採用は提案の今の指紋に結び付ける
   'IM-DIGEST-BOUND': (ctx) => {
@@ -608,7 +611,7 @@ export const GUARDS = {
   'IM-POLICY-LINE': (ctx) => {
     if (ctx.op !== 'adopt') return null;
     const line = ctx.config.policyLine;
-    if (typeof line !== 'string' || !POLICY_RE.test(line)) return '今の法律の系統が分からない（採用できない）';
+    if (!isPolicyLine(line)) return '今の法律の系統が分からない（採用できない）';
     return isObj(ctx.input) && ctx.input.policy_line === line ? null : `policy_line が今の系統（${line}）と違う`;
   },
 };
@@ -643,9 +646,9 @@ export function openImprovements(file, opt = {}) {
     chain.append(body, (records) => {
       const ctx = buildContext({ records, op, actor, id, input, config: config() });
       const r = check(ctx); // 全ガード（絞らない）
-      if (!r.ok) { const e = new Refused('guard_violation', r.violations.map((v) => `${v.guard}: ${v.reason}`).join(' / ')); e.violations = r.violations; throw e; }
+      if (!r.ok) throw refusal(r.violations);
       const nid = id ?? (op === 'epoch' ? `EPOCH-${records.filter((x) => x.op === 'epoch').length + 1}` : `IMP-${String(ctx.proposals.length + 1).padStart(4, '0')}`);
-      Object.assign(body, { id: nid, rules: RULES, actor: clone(ctx.actor) }, makeBody(ctx, records));
+      Object.assign(body, { id: nid, rules: RULES, cfg: cfgCopy(ctx.config), actor: normActor(ctx.actor) }, makeBody(ctx, records));
     });
     return op === 'epoch' ? clone(body) : get(body.id);
   }
@@ -661,7 +664,7 @@ export function openImprovements(file, opt = {}) {
     };
   };
 
-  function state() { return replay(chain.read()); }
+  function state() { return replay(chain.read(), { config: config() }); }
   function get(id) { const s = state().get(id); return s ? issue(s) : null; }
 
   return {
@@ -693,6 +696,6 @@ export function openImprovements(file, opt = {}) {
       try { records = chain.read(); } catch (e) { if (!(e instanceof Refused)) throw e; ch = { ok: false, code: e.code, detail: e.detail }; }
       return buildContext({ records, chain: ch, op, actor, id, input, config: config() });
     },
-    verify: () => { const v = chain.verify(); if (!v.ok) return v; try { const m = replay(chain.read()); return { ...v, unverified_law_baselines: m.meta.unverified_law_baselines }; } catch (e) { if (!(e instanceof Refused)) throw e; return { ok: false, code: e.code, detail: e.detail }; } },
+    verify: () => { const v = chain.verify(); if (!v.ok) return v; try { const m = replay(chain.read(), { config: config() }); return { ...v, unverified_law_baselines: m.meta.unverified_law_baselines }; } catch (e) { if (!(e instanceof Refused)) throw e; return { ok: false, code: e.code, detail: e.detail }; } },
   };
 }

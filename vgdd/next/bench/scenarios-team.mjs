@@ -13,7 +13,7 @@ const DEEP_CATALOG = { ...CATALOG, worker: { ...CATALOG.worker, may_delegate: tr
 const CTX = (o = {}) => ({
   catalog: CATALOG,
   ticket: { resources: ['src/**', 'test/**'], risk: 'low' },
-  limits: { workers: 2, depth: 2 },
+  limits: { concurrent_work: 2, depth: 2 },
   required: { judicial_min: 1, judicial_distinct_lineage: true },
   ...o,
 });
@@ -41,7 +41,7 @@ export const SCENARIOS = [
   { id: 'TM-A7', kind: 'attack', title: '委任できない型（worker）の子を作る', expectGuards: ['TM-DELEG-ALLOWED'],
     run: run(P([W('w1', ['src/**']), W('w2', ['src/a/**'], { parent: 'w1' }), J()])) },
   { id: 'TM-A8', kind: 'attack', title: '委任の深さが上限（2）を超える', expectGuards: ['TM-DELEG-DEPTH'],
-    run: run(P([W('w1', ['src/**']), W('w2', ['src/a/**'], { parent: 'w1' }), W('w3', ['src/a/**'], { parent: 'w2' }), W('w4', ['src/a/**'], { parent: 'w3' }), J()]), CTX({ catalog: DEEP_CATALOG, limits: { workers: 5, depth: 2 } })) },
+    run: run(P([W('w1', ['src/**']), W('w2', ['src/a/**'], { parent: 'w1' }), W('w3', ['src/a/**'], { parent: 'w2' }), W('w4', ['src/a/**'], { parent: 'w3' }), J()]), CTX({ catalog: DEEP_CATALOG, limits: { concurrent_work: 5, depth: 2 } })) },
   { id: 'TM-A9', kind: 'attack', title: '委任が循環する', expectGuards: ['TM-DELEG-CYCLE'],
     run: run(P([W('w1', ['src/a/**'], { parent: 'w2' }), W('w2', ['src/a/**'], { parent: 'w1' }), J()]), CTX({ catalog: DEEP_CATALOG })) },
   { id: 'TM-A10', kind: 'attack', title: '司法を行政の長の子にする', expectGuards: ['TM-JUDICIAL-INDEPENDENT'],
@@ -56,10 +56,10 @@ export const SCENARIOS = [
     run: run(P([W('w1'), J(), { id: 'o', template: 'owner', scope: { resources: [], tools: [] } }])) },
   { id: 'TM-A15', kind: 'attack', title: '立法補佐・オーナー権限の gate_runner を編成に入れる', expectGuards: ['TM-HUMAN-SEAT'],
     run: run(P([W('w1'), J(), { id: 'l', template: 'legislative_assistant', lineage: 'claude', scope: { resources: [], tools: [] } }, { id: 'g', template: 'gate_runner', scope: { resources: [], tools: [] } }])) },
-  { id: 'TM-A16', kind: 'attack', title: '行政の member が workers の上限を超える', expectGuards: ['TM-WORKER-LIMIT'],
+  { id: 'TM-A16', kind: 'attack', title: '作業員の数が concurrent_work の上限を超える', expectGuards: ['TM-WORKER-LIMIT'],
     run: run(P([W('w1', ['src/a/**']), W('w2', ['src/b/**']), W('w3', ['src/c/**']), J()])) },
-  { id: 'TM-A17', kind: 'attack', title: '編成案が自分で上限を広げる要求（workers: 8）', expectGuards: ['TM-LIMITS-NO-RAISE'],
-    run: run(P([W('w1'), J()], { limits_requested: { workers: 8 } })) },
+  { id: 'TM-A17', kind: 'attack', title: '編成案が自分で上限を広げる要求（concurrent_work: 8）', expectGuards: ['TM-LIMITS-NO-RAISE'],
+    run: run(P([W('w1'), J()], { limits_requested: { concurrent_work: 8 } })) },
   { id: 'TM-A18', kind: 'attack', title: '形が壊れた編成（scope がない）', expectGuards: ['TM-PLAN-SHAPE'],
     run: run(P([{ id: 'w1', template: 'worker', lineage: 'claude' }, J()])) },
   { id: 'TM-B1', kind: 'benign', title: '単一の作業員＋別系統の司法',
@@ -68,8 +68,8 @@ export const SCENARIOS = [
     run: run(P([W('w1', ['src/a/**']), W('w2', ['src/b/**']), J()])) },
   { id: 'TM-B3', kind: 'benign', title: '行政の長が範囲を狭めて作業員に委任する',
     run: run(P([{ id: 'h', template: 'executive_head', lineage: 'claude', scope: { resources: ['src/**'], tools: ['Read', 'Edit', 'Agent'] } }, W('w1', ['src/a/**'], { parent: 'h' }), J()])) },
-  { id: 'TM-B4', kind: 'benign', title: '上限以下の要求（workers: 2）を添えた編成',
-    run: run(P([W('w1'), J()], { limits_requested: { workers: 2 } })) },
+  { id: 'TM-B4', kind: 'benign', title: '上限以下の要求（concurrent_work: 2）を添えた編成',
+    run: run(P([W('w1'), J()], { limits_requested: { concurrent_work: 2 } })) },
 ];
 
 // ---- 審査 B の判例（B-F1・B-F3・B-F13）----------------------------------------
@@ -104,7 +104,7 @@ const ONE = P([W('w1', ['src/a/**']), J()]);
 A('TM-A31', 'B-F13: required.judicial_min が文字列 "1"', ['TM-CONTEXT-SHAPE'], ONE, CTX({ required: { judicial_min: '1' } }));
 A('TM-A32', 'B-F13: required.judicial_min が 0（司法を要らないことにする）', ['TM-CONTEXT-SHAPE'], ONE, CTX({ required: { judicial_min: 0 } }));
 A('TM-A33', 'B-F13: judicial_distinct_lineage が文字列 "false"', ['TM-CONTEXT-SHAPE'], ONE, CTX({ required: { judicial_distinct_lineage: 'false' } }));
-A('TM-A34', 'B-F13: limits.workers が 2.5', ['TM-CONTEXT-SHAPE', 'TM-WORKER-LIMIT'], ONE, CTX({ limits: { workers: 2.5, depth: 2 } }));
+A('TM-A34', 'B-F13: limits.concurrent_work が 2.5', ['TM-CONTEXT-SHAPE', 'TM-WORKER-LIMIT'], ONE, CTX({ limits: { concurrent_work: 2.5, depth: 2 } }));
 A('TM-A35', 'B-F13: judicial_min が NaN で司法ゼロ（既定値が上書きされて通る抜け道）', ['TM-JUDICIARY-PRESENT', 'TM-CONTEXT-SHAPE'],
   P([W('w1', ['src/a/**'])]), CTX({ required: { judicial_min: NaN } }));
 A('TM-A36', 'B-F13: judicial_min が undefined で司法ゼロ', ['TM-JUDICIARY-PRESENT'], P([W('w1', ['src/a/**'])]), CTX({ required: { judicial_min: undefined } }));
@@ -114,8 +114,16 @@ A('TM-A38', 'B-F13: 書記 20 体（上限 16 を超える）', ['TM-MEMBER-LIMI
   P([W('w1', ['src/a/**']), J(), ...Array.from({ length: 20 }, (_, i) => ({ id: `s${i}`, template: 'scribe', scope: { resources: [], tools: [] } }))]));
 A('TM-A39', 'B-F13: 委任の深い長い鎖（深さの検査が線形で終わる。上限超過）', ['TM-DELEG-DEPTH'],
   P([J(), ...Array.from({ length: 12 }, (_, i) => W(`w${i}`, ['src/a/**'], { parent: i ? `w${i - 1}` : null }))]),
-  CTX({ catalog: DEEP_CATALOG, limits: { workers: 20, depth: 2, members_total: 16 } }));
+  CTX({ catalog: DEEP_CATALOG, limits: { concurrent_work: 20, depth: 2, members_total: 16 } }));
+
+// 共通の語彙（vocab）で足した攻撃：limits の名前と意味、系統の別名
+const HEAD = (id) => ({ id, template: 'executive_head', lineage: 'claude', scope: { resources: ['src/**'], tools: ['Read', 'Edit', 'Agent'] } });
+A('TM-A40', '語彙：行政の長を 2 体置く（作業員の数に数えない長を増やして並列を広げる）', ['TM-WORKER-LIMIT'], P([HEAD('h1'), HEAD('h2'), J()]));
+A('TM-A41', '語彙：旧名の limits.workers（行政の総数）だけを渡す', ['TM-CONTEXT-SHAPE', 'TM-WORKER-LIMIT'], ONE, CTX({ limits: { workers: 2, depth: 2 } }));
+A('TM-A42', '語彙：行政が同じ系統の別名（anthropic）を名乗る', ['TM-LINEAGE-HONEST'], P([W('w1', ['src/a/**'], { lineage: 'anthropic' }), J()]));
+A('TM-A43', '語彙：司法が系統の別名（openai）を名乗る', ['TM-LINEAGE-HONEST'], P([W('w1', ['src/a/**']), J('j1', { lineage: 'openai' })]));
+B('TM-B8', '語彙：行政の長 1 体＋作業員 2 体（concurrent_work 2。長は数えない）', P([HEAD('h'), W('w1', ['src/a/**'], { parent: 'h' }), W('w2', ['src/b/**'], { parent: 'h' }), J()]));
 
 B('TM-B5', 'B-F3: lineage の表記が Claude でも、型の系統（claude）と同じなら正当（別系統の司法で通る）', P([W('w1', ['src/a/**'], { lineage: 'Claude' }), J()]));
 B('TM-B6', 'B-F1: 票の範囲の中の src/a*（src/ の直下の名前）は通る', P([W('w1', ['src/a*']), J()]));
-B('TM-B7', 'B-F13: members_total を明示した小さな編成', P([W('w1', ['src/a/**']), J()]), CTX({ limits: { workers: 2, depth: 2, members_total: 4 } }));
+B('TM-B7', 'B-F13: members_total を明示した小さな編成', P([W('w1', ['src/a/**']), J()]), CTX({ limits: { concurrent_work: 2, depth: 2, members_total: 4 } }));

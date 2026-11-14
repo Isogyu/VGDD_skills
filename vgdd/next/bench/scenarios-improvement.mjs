@@ -19,8 +19,8 @@ const A = {
   claude: { role: 'executive_head', kind: 'ai', id: 'claude-exec-1', lineage: 'claude' },
   claude9: { role: 'executive_head', kind: 'ai', id: 'claude-exec-9', lineage: 'claude' },
   codexWorker: { role: 'worker', kind: 'ai', id: 'codex-worker-1', lineage: 'codex' },
-  runner: { role: 'gate_runner', kind: 'script', id: 'conformance-runner', lineage: 'vgdd-script' },
-  night: { role: 'night_runner', kind: 'script', id: 'night-runner', lineage: 'vgdd-script' },
+  runner: { role: 'gate_runner', kind: 'script', id: 'conformance-runner', lineage: 'script' },
+  night: { role: 'night_runner', kind: 'script', id: 'night-runner', lineage: 'script' },
   judge: { role: 'judge', kind: 'ai', id: 'claude-judge-1', lineage: 'claude' },
   codexJudge: { role: 'codex_judge', kind: 'ai', id: 'codex-judge-1', lineage: 'codex' },
   codexJudge2: { role: 'codex_judge', kind: 'ai', id: 'codex-judge-2', lineage: 'codex' },
@@ -65,7 +65,9 @@ function scenario(id, kind, title, expectGuards, build, opt = {}) {
     try {
       const file = path.join(dir, 'improvements.jsonl');
       const im = openImprovements(file, { currentCapabilities: caps, now: () => '2026-11-14T09:00:00+09:00', ...opt });
-      const [op, actor, pid, input] = build(im, helpers(im), file);
+      const out = build(im, helpers(im), file);
+      if (!Array.isArray(out)) return out.ctx; // 別の設定で開いた窓口の文脈（im.v3 の設定の写しの試験）
+      const [op, actor, pid, input] = out;
       return im.contextFor(op, actor, pid, input);
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   };
@@ -78,8 +80,9 @@ export const SCENARIOS = [
   scenario('IM-A2', 'attack', 'スクリプト（夜間の代行）による採用', ['IM-ADOPT-HUMAN-OWNER'], (im, h) => { const p = h.reviewed(playbook()); return ['adopt', A.night, p.id, h.adoptInput(p)]; }),
   scenario('IM-A3', 'attack', '提案者の AI が自分の提案を採用', ['IM-ADOPT-HUMAN-OWNER', 'IM-SEPARATION-OF-DUTIES'], (im, h) => { const p = h.reviewed(playbook()); return ['adopt', A.claude, p.id, h.adoptInput(p)]; }),
   scenario('IM-A4', 'attack', '評価者が同じ提案を審査する（評価と審査の兼任）', ['IM-SEPARATION-OF-DUTIES'], (im, h) => {
-    const p = h.propose(); const human = { role: 'judge', kind: 'human', id: 'staff-1', lineage: 'human' };
-    h.evaluate(p, GOOD, human); return ['review', human, p.id, h.reviewInput(p)];
+    // im.v3：人の judge は vocab にない。同じ id の評価者（スクリプト）と審査者（AI の司法）で兼任を試す
+    const p = h.propose(); h.evaluate(p, GOOD, { role: 'gate_runner', kind: 'script', id: 'staff-1' });
+    return ['review', { role: 'codex_judge', kind: 'ai', id: 'staff-1', lineage: 'codex' }, p.id, h.reviewInput(p)];
   }),
   scenario('IM-A5', 'attack', 'AI が評価の証拠を出す（自己申告の評価）', ['IM-EVALUATOR-NOT-AI'], (im, h) => { const p = h.propose(); return ['evaluate', A.codexWorker, p.id, { digest: p.digest, evidence: { conformance: GOOD } }]; }),
   scenario('IM-A6', 'attack', '司法でない役割（テスト担当）が審査する', ['IM-JUDICIAL-REVIEWER'], (im, h) => { const p = h.propose(); h.evaluate(p); return ['review', { role: 'tester', kind: 'ai', id: 'codex-tester', lineage: 'codex' }, p.id, h.reviewInput(p)]; }),
@@ -172,7 +175,7 @@ export const SCENARIOS = [
     crBase(im, h); const q = h.reviewed(pbT({ ...T1, note: 'v2' }, { content: '試験は任意。' }), { proposer: { ...A.claude, id: 'claude-exec-2' }, reviewers: [A.codexJudge2] });
     return ['adopt', A.owner, q.id, h.adoptInput(q)];
   }),
-  scenario('IM-A43', 'attack', 'N1：提案者の id に空白を足して別人を装う', ['IM-ACTOR-SHAPE'], (im, h) => { crBase(im, h); return ['propose', { ...A.claude, id: 'claude-exec-1 ' }, null, pbT(T1, { content: '試験は任意。' })]; }),
+  scenario('IM-A43', 'attack', 'N1：提案者の id に空白を足して別人を装う', ['IM-ACTOR-SHAPE'], (im, h) => { crBase(im, h); return ['propose', { ...A.claude, id: 'claude exec-1' }, null, pbT(T1, { content: '試験は任意。' })]; }),
   scenario('IM-A44', 'attack', 'N2：AI が引き継いだ差し戻しを自分で解く', ['IM-OWNER-DECIDES'], (im, h) => {
     crBase(im, h); const q = h.reviewed(pbT(T1, { content: '試験は任意。' }), { reviewers: [A.codexJudge2] });
     return ['dismiss_cr', A.claude, q.id, { reviewer: 'codex-judge-1', reason: '不要' }];
@@ -182,10 +185,10 @@ export const SCENARIOS = [
     const T = { paths: TABLE };
     const rows = (id, old, nu) => {
       const proposal = { title: '表', tier: 'law', target: T, content: { capabilities: nu }, capabilities: { old, new: nu } }; const dg = proposalDigest(proposal);
-      forge(file, { type: 'vgdd.improvement.v1', rules: RULES, op: 'propose', id, actor: A.claude, proposal, digest: dg, rationale: null });
-      forge(file, { type: 'vgdd.improvement.v1', rules: RULES, op: 'evaluate', id, actor: A.runner, digest: dg, evidence: { conformance: GOOD } });
-      forge(file, { type: 'vgdd.improvement.v1', rules: RULES, op: 'review', id, actor: A.codexJudge, digest: dg, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(id).digest });
-      forge(file, { type: 'vgdd.improvement.v1', rules: RULES, op: 'adopt', id, actor: A.owner, digest: dg, policy_line: 'p0.4' });
+      forge(file, { type: 'vgdd.improvement.v1', rules: RULES, cfg: { max_open: 5 }, op: 'propose', id, actor: A.claude, proposal, digest: dg, rationale: null });
+      forge(file, { type: 'vgdd.improvement.v1', rules: RULES, cfg: { max_open: 5 }, op: 'evaluate', id, actor: A.runner, digest: dg, evidence: { conformance: GOOD } });
+      forge(file, { type: 'vgdd.improvement.v1', rules: RULES, cfg: { max_open: 5 }, op: 'review', id, actor: A.codexJudge, digest: dg, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(id).digest });
+      forge(file, { type: 'vgdd.improvement.v1', rules: RULES, cfg: { max_open: 5 }, op: 'adopt', id, actor: A.owner, digest: dg, policy_line: 'p0.4' });
     };
     const t = mut((c) => cap(c, 'CAP-LINK').enforced_by.push('sandbox'));
     rows('IMP-0001', caps, t); rows('IMP-0002', caps, mut((c) => cap(c, 'CAP-LAW-WRITE').allowed.push('worker')));
@@ -197,7 +200,23 @@ export const SCENARIOS = [
     forge(file, { type: 'vgdd.improvement.v1', op: 'adopt', id: 'IMP-0001', actor: A.claude, digest: dg, policy_line: 'p0.4' });
     return ['epoch', A.claude, null, { reason: '移行' }];
   }),
+  // ---- im.v3（共通の語彙）で足した攻撃 ----
+  scenario('IM-A48', 'attack', 'im.v3：claude の提案を、同じ系統の別名（anthropic）を名乗る審査者が審査する', ['IM-ACTOR-SHAPE'], (im, h) => { const p = h.propose(); h.evaluate(p); return ['review', { ...A.judge, lineage: 'anthropic' }, p.id, h.reviewInput(p)]; }),
+  scenario('IM-A49', 'attack', 'im.v3：別名の変種（Anthropic・open-ai・claude-3）を名乗る審査者', ['IM-ACTOR-SHAPE'], (im, h) => { const p = h.propose(); h.evaluate(p); return ['review', { ...A.judge, lineage: 'claude-3' }, p.id, h.reviewInput(p)]; }),
+  scenario('IM-A50', 'attack', 'im.v3：表にない司法らしい名前（court）の審査者', ['IM-ACTOR-SHAPE'], (im, h) => { const p = h.propose(); h.evaluate(p); return ['review', { role: 'court', kind: 'ai', id: 'c1', lineage: 'codex' }, p.id, h.reviewInput(p)]; }),
+  scenario('IM-A51', 'attack', 'im.v3：書いた時と違う上限（maxOpenPerActor）で開き直して書く（過去の行の設定の写しと食い違う）', ['IM-CHAIN-INTACT'], (im, h, file) => {
+    h.propose();
+    const im2 = openImprovements(file, { currentCapabilities: caps, now: () => '2026-11-14T09:00:00+09:00', maxOpenPerActor: 50 });
+    const c = im2.contextFor('propose', A.claude, null, playbook({ title: '別の上限で' }));
+    return { ctx: c };
+  }),
   // ---- 良性 ----
+  scenario('IM-B13', 'benign', 'im.v3：設定を変えて開き直した記録を、オーナーの移行の記録の後に使い続ける', [], (im, h, file) => {
+    h.propose();
+    const im2 = openImprovements(file, { currentCapabilities: caps, now: () => '2026-11-14T09:00:00+09:00', maxOpenPerActor: 3 });
+    im2.epoch(A.owner, { reason: '未決の上限を 3 に締めた' });
+    return { ctx: im2.contextFor('propose', A.codexWorker, null, playbook({ title: '締めた後の提案' })) };
+  }),
 
   scenario('IM-B1', 'benign', '手順の改善が正しい手続きで採用される', [], (im, h) => { const p = h.reviewed(playbook()); return ['adopt', A.owner, p.id, h.adoptInput(p)]; }),
   scenario('IM-B2', 'benign', '締めるだけの法律の変更が通常の経路で採用される', [], (im, h) => { const p = h.reviewed(law(mut((c) => cap(c, 'CAP-LINK').probes.push({ tool: 'Bash', command: 'ln -sf a b' })))); return ['adopt', A.owner, p.id, h.adoptInput(p)]; }),

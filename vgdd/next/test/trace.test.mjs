@@ -5,11 +5,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Refused, sha256, canonical } from '../lib/chain.mjs';
+import { normActor } from '../lib/vocab.mjs';
 import {
   openTrace, check, GUARDS, replay, buildContext, traceOf, coverageOf, gapsOf, linksFromEvidence, parseTs, integrityOf, ROOT_GUARDS,
   REL_TABLE, RELS, KINDS, RULES, RECORD_TYPE, NOT_PROOF_NOTE, CYCLE_RELS,
 } from '../trace.mjs';
-import { SCENARIOS, A, R, FLOW, forge, benchTrace, benchPairs } from '../bench/scenarios-trace.mjs';
+import { SCENARIOS, A, R, FLOW, CFG, forge, benchTrace, benchPairs } from '../bench/scenarios-trace.mjs';
 
 const NOW = () => '2026-11-14T09:00:00+09:00';
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'vgdd-next-'));
@@ -239,7 +240,7 @@ test('循環：supersedes・derives・depends_on の循環を拒む（反復。�
   t.link(A.importer, L(R.req3, 'supersedes', R.req));
   // 3000 段の鎖を再生して、さらに閉じる辺を拒む（再帰なら深すぎる）
   const rows = []; const N = 3000;
-  const row = (i, from, to, rel) => ({ type: RECORD_TYPE, op: 'link', rules: RULES, actor: A.importer, seq: i + 1, at: 'x', link: L(from, rel, to) });
+  const row = (i, from, to, rel) => ({ type: RECORD_TYPE, op: 'link', rules: RULES, cfg: CFG, actor: A.importer, seq: i + 1, at: 'x', link: L(from, rel, to) });
   for (let i = 0; i < N; i += 1) rows.push(row(i, { kind: 'requirement', id: `R-${i}` }, { kind: 'requirement', id: `R-${i + 1}` }, 'supersedes'));
   const st = replay(rows);
   assert.equal(st.meta.rejected.length, 0); assert.equal(st.links.length, N);
@@ -283,7 +284,7 @@ test('trace の上限：深さ・訪れる数・direction の範囲外は拒む�
 test('記録に直接書いた偽の行は状態に入れず、verify に出す（正規の書き込みは続けられる）', () => {
   const { t, file } = open();
   t.link(A.importer, L(R.t1, 'satisfies', R.req));
-  const row = (x) => forge(file, { type: RECORD_TYPE, op: 'link', rules: RULES, actor: A.importer, ...x });
+  const row = (x) => forge(file, { type: RECORD_TYPE, op: 'link', rules: RULES, cfg: CFG, actor: A.importer, ...x });
   row({ actor: A.exec, link: L(R.t2, 'satisfies', R.req) });                         // AI の行
   row({ actor: { kind: 'script', role: 'executive_head', id: 'x' }, link: L(R.t2, 'satisfies', R.req) });
   row({ link: L(R.t1, 'satisfies', R.req) });                                        // 重複
@@ -291,8 +292,8 @@ test('記録に直接書いた偽の行は状態に入れず、verify に出す�
   row({ link: L(R.acc, 'approves', R.t1) });                                         // 表にない組
   row({ link: L(R.req, 'supersedes', R.req) });                                      // 自己
   row({ link: { ...L(R.t3, 'satisfies', R.req), extra: 1 } });                       // 知らない項目
-  forge(file, { type: RECORD_TYPE, op: 'retract', rules: RULES, actor: A.importer, target_seq: 1, reason: 'x' }); // script の取り消し
-  forge(file, { type: RECORD_TYPE, op: 'retract', rules: RULES, actor: A.owner, target_seq: 99, reason: 'x' });   // 存在しない対象
+  forge(file, { type: RECORD_TYPE, op: 'retract', rules: RULES, cfg: CFG, actor: A.importer, target_seq: 1, reason: 'x' }); // script の取り消し
+  forge(file, { type: RECORD_TYPE, op: 'retract', rules: RULES, cfg: CFG, actor: A.owner, target_seq: 99, reason: 'x' });   // 存在しない対象
   forge(file, { type: 'other', op: 'link' });
   forge(file, { op: 'link' });
   const v = t.verify();
@@ -458,10 +459,11 @@ test('linksFromEvidence：外から来た文字列（理由・メモ）はデー
 });
 
 test('parseTs：タイムゾーンつきの時刻だけ読み、現在時刻を使わない', () => {
-  assert.equal(parseTs('2026-11-10T09:00:00+0900'), Date.UTC(2026, 10, 10, 0, 0, 0));
-  assert.equal(parseTs('2026-11-10T09:00:00+09:00'), parseTs('2026-11-10T09:00:00+0900'));
-  assert.equal(parseTs('2026-11-10T00:00:00.123Z'), Date.UTC(2026, 10, 10));
-  for (const bad of ['2026-11-10', 'now', 5, null, '2026-11-10T09:00:00']) assert.equal(parseTs(bad), null);
+  // vocab の parseTs：秒まで必須、時差は Z か ±HH:MM だけ。Kernel の +0900（コロンなし）は読まない（取り込みが kernelTsToIso で +09:00 に写す）
+  assert.equal(parseTs('2026-11-10T09:00:00+09:00'), Date.UTC(2026, 10, 10, 0, 0, 0));
+  assert.equal(parseTs('2026-11-10T09:00:00+0900'), null, 'コロンなしの時差は読まない（vocab）');
+  assert.equal(parseTs('2026-11-10T00:00:00.123Z'), Date.UTC(2026, 10, 10, 0, 0, 0, 123), '小数秒はミリ秒まで読む（vocab）');
+  for (const bad of ['2026-11-10', 'now', 5, null, '2026-11-10T09:00:00', '2026-11-10T09:00+09:00', '2026-11-10 09:00:00+09:00']) assert.equal(parseTs(bad), null);
 });
 
 // ---- 性能の足切り（目安。実測は報告に書く） ----
@@ -548,9 +550,13 @@ test('F3：判定は種類ごとの最新が全部 APPROVED のときだけ承�
   u.t.link(A.importer, L(vd('d', 'judge'), 'verifies', R.rq)); u.t.link(A.importer, L(au('d'), 'verifies', R.rq, ev('not_run')));
   assert.equal(row(u.t).unknown_verdict_requests, 1); assert.equal(row(u.t).stages.verdict, false); assert.equal(row(u.t).audit_other_requests, 1); assert.equal(row(u.t).stages.audit, false);
   assert.ok(codes(u.t).includes('REQUEST_VERDICT_UNKNOWN') && codes(u.t).includes('REQUEST_AUDIT_NOT_RUN'));
+  // 知らない結論の綴り（MAYBE・ok）は、tr.v3 では書く時に TR-INPUT-SHAPE で拒む（記録に入らない）。
+  // 結論の読めない判定・監査の数え方は、result のない evidence（時刻・出所だけ）で確かめる
   const w = open(); base(w.t);
-  w.t.link(A.importer, L(vd('d', 'judge'), 'verifies', R.rq, ev('MAYBE'))); w.t.link(A.importer, L(au('d'), 'verifies', R.rq, ev('ok')));
-  assert.equal(row(w.t).approved_requests, 0); assert.ok(codes(w.t).includes('REQUEST_AUDIT_UNKNOWN'));
+  refuse(() => w.t.link(A.importer, L(vd('d', 'judge'), 'verifies', R.rq, ev('MAYBE'))), 'TR-INPUT-SHAPE');
+  refuse(() => w.t.link(A.importer, L(au('d'), 'verifies', R.rq, ev('ok'))), 'TR-INPUT-SHAPE');
+  w.t.link(A.importer, L(vd('d', 'judge'), 'verifies', R.rq, { evidence: { at: '2026-11-10T10:00:00+09:00' } })); w.t.link(A.importer, L(au('d'), 'verifies', R.rq, { evidence: { source: 'x' } }));
+  assert.equal(row(w.t).approved_requests, 0); assert.equal(row(w.t).unknown_verdict_requests, 1); assert.ok(codes(w.t).includes('REQUEST_AUDIT_UNKNOWN'));
   // 陽性の対照：全部が APPROVED・監査 passed
   const g = open(); base(g.t);
   g.t.link(A.importer, L(vd('d', 'judge'), 'verifies', R.rq, ev('APPROVED'))); g.t.link(A.importer, L(vd('d', 'codex-judge'), 'verifies', R.rq, ev('APPROVED'))); g.t.link(A.importer, L(au('d'), 'verifies', R.rq, ev('passed')));
@@ -567,7 +573,9 @@ test('F3/F4：同じ種類の判定が再実行されたら、時刻（evidence.
   assert.equal(mk(ev('APPROVED', T1), ev('CHANGES_REQUIRED', T2)).returned_requests, 1, '後の判定が CHANGES_REQUIRED なら差し戻し');
   assert.equal(mk(ev('CHANGES_REQUIRED', T1), ev('APPROVED')).approved_requests, 0, '時刻のない判定が混じれば厳しい側');
   assert.equal(mk(ev('APPROVED', T1), ev('CHANGES_REQUIRED', T1)).returned_requests, 1, '同時刻で割れれば厳しい側');
-  assert.equal(mk(ev('CHANGES_REQUIRED', 'yesterday'), ev('APPROVED', T2)).approved_requests, 0, '読めない時刻は厳しい側');
+  // 読めない時刻（yesterday）は、tr.v3 では書く時に TR-INPUT-SHAPE で拒む（記録に入らない）。時刻の決まらない行が厳しい側に倒れることは、
+  // 時刻のない判定（上）と、記録の時刻が読めない tr.v1 の行（N5/N6）で確かめる
+  { const { t } = open(); base(t); refuse(() => t.link(A.importer, L(vd('d', 'judge', '-11111111'), 'verifies', R.rq, ev('CHANGES_REQUIRED', 'yesterday'))), 'TR-INPUT-SHAPE'); }
 });
 
 test('F4：判定を再実行して指紋が変わっても取り込みが詰まらない（節の id に内容の指紋を含める）。digest の行き止まりもオーナーの取り消しで解ける', () => {
@@ -600,7 +608,7 @@ test('F4：判定を再実行して指紋が変わっても取り込みが詰ま
 
 test('F5/F16：循環の検査は増分。20000 本の鎖（どちら向きに積んでも）で state が2秒以内、上限で正当な行が拒まれない', () => {
   const act = A.importer;
-  const mkrows = (links) => links.map((l, i) => ({ type: RECORD_TYPE, op: 'link', rules: RULES, actor: act, seq: i + 1, at: 'x', link: l }));
+  const mkrows = (links) => links.map((l, i) => ({ type: RECORD_TYPE, op: 'link', rules: RULES, cfg: CFG, actor: act, seq: i + 1, at: 'x', link: l }));
   const spc = (i) => ({ kind: 'spec', id: `sha256:${i.toString(16).padStart(64, '0')}` });
   const N = 20000;
   const fwd = []; for (let i = 1; i < N; i += 1) fwd.push(L(spc(i + 1), 'supersedes', spc(i)));
@@ -635,7 +643,7 @@ test('F5：増分の循環検査が、素朴な全探索と一致する（乱数
       // 同じ組の別の rel は重複でなく、循環の検査は群で見る
       if (got) { assert.equal(want, true, `round ${round} step ${step}: ${a}>${b}`); continue; }
       assert.equal(want, false, `round ${round} step ${step}: ${a}>${b}`);
-      rows.push({ type: RECORD_TYPE, op: 'link', rules: RULES, actor: A.importer, seq: rows.length + 1, at: 'x', link: L(id(a), rel, id(b)) }); edges.set(`${a}>${b}`, true);
+      rows.push({ type: RECORD_TYPE, op: 'link', rules: RULES, cfg: CFG, actor: A.importer, seq: rows.length + 1, at: 'x', link: L(id(a), rel, id(b)) }); edges.set(`${a}>${b}`, true);
     }
   }
 });
@@ -677,7 +685,7 @@ test('F6：gaps の TICKET_NO_REQUIREMENT は satisfies・derives・depends_on �
 test('F7：trace・coverage・gaps の結果に integrity が付き、偽の行・覆われない古い行があれば警告する', () => {
   const { t, file } = open(); t.link(A.importer, L(R.t1, 'satisfies', R.req));
   for (const q of [t.trace(R.req), t.coverage(), t.gaps()]) { assert.equal(q.integrity.ok, true); assert.equal(q.integrity.warning, null); }
-  forge(file, { type: RECORD_TYPE, op: 'link', rules: RULES, actor: A.exec, link: L(R.t2, 'satisfies', R.req) });
+  forge(file, { type: RECORD_TYPE, op: 'link', rules: RULES, cfg: CFG, actor: A.exec, link: L(R.t2, 'satisfies', R.req) });
   forge(file, { type: RECORD_TYPE, op: 'link', rules: 'tr.v0', actor: A.importer, link: L(R.t3, 'satisfies', R.req) });
   for (const q of [t.trace(R.req), t.coverage(), t.gaps()]) {
     assert.equal(q.integrity.ok, false); assert.equal(q.integrity.rejected_count, 2); assert.equal(q.integrity.legacy_uncovered, 1); assert.match(q.integrity.warning, /状態に入れなかった行/);
@@ -831,11 +839,11 @@ test('取り込み：要素の toString が投げても、関数は投げない�
 /** 有効な鎖つきの記録のファイルを作る（追記を使わず行とハッシュを直接作る。準備だけに使う） */
 function genFile(links, rules = RULES, actor = A.importer) {
   const d = tmp(); const file = path.join(d, 't.jsonl'); let prev = 'genesis'; const out = [];
-  links.forEach((link, i) => { const full = { type: RECORD_TYPE, op: 'link', rules, actor, link, seq: i + 1, at: '2026-11-14T09:00:00+09:00', prev }; const hash = sha256(canonical(full)); out.push(JSON.stringify({ ...full, hash })); prev = hash; });
+  links.forEach((link, i) => { const full = { type: RECORD_TYPE, op: 'link', rules, cfg: CFG, actor, link, seq: i + 1, at: '2026-11-14T09:00:00+09:00', prev }; const hash = sha256(canonical(full)); out.push(JSON.stringify({ ...full, hash })); prev = hash; });
   fs.writeFileSync(file, `${out.join('\n')}\n`); fs.writeFileSync(`${file}.head`, `${JSON.stringify({ seq: links.length, hash: prev })}\n`);
   return file;
 }
-const mkrows = (links, rules = RULES) => links.map((l, i) => ({ type: RECORD_TYPE, op: 'link', rules, actor: A.importer, seq: i + 1, at: 'x', link: l }));
+const mkrows = (links, rules = RULES) => links.map((l, i) => ({ type: RECORD_TYPE, op: 'link', rules, cfg: CFG, actor: A.importer, seq: i + 1, at: 'x', link: l }));
 const spx = (i) => ({ kind: 'spec', id: `sha256:${i.toString(16).padStart(64, '0')}` });
 
 test('N1：循環の検査の最悪の形（2節の鎖を K 個作って順に結ぶ）で、再生・verify・追記1回が2秒以内', () => {
@@ -861,7 +869,7 @@ test('N1：偽の循環の行は、遅い道（追記の順に入れ直す）で
   const st = replay(rows);
   assert.deepEqual(st.meta.rejected.map((x) => [x.seq, x.reason]), [[3, 'TR-NO-CYCLE']]); assert.equal(st.links.length, 3);
   // A→B を取り消した後の B→A は循環でない（全辺の集まりは循環でも、順に見れば正しい）
-  const rr = [...mkrows([L(R.t1, 'depends_on', R.t2)]), { type: RECORD_TYPE, op: 'retract', rules: RULES, actor: A.owner, seq: 2, at: 'x', target_seq: 1, reason: 'x' }, { type: RECORD_TYPE, op: 'link', rules: RULES, actor: A.importer, seq: 3, at: 'x', link: L(R.t2, 'derives', R.t1) }];
+  const rr = [...mkrows([L(R.t1, 'depends_on', R.t2)]), { type: RECORD_TYPE, op: 'retract', rules: RULES, cfg: CFG, actor: A.owner, seq: 2, at: 'x', target_seq: 1, reason: 'x' }, { type: RECORD_TYPE, op: 'link', rules: RULES, cfg: CFG, actor: A.importer, seq: 3, at: 'x', link: L(R.t2, 'derives', R.t1) }];
   const s2 = replay(rr); assert.equal(s2.meta.rejected.length, 0); assert.equal(s2.active.size, 1);
 });
 
@@ -878,7 +886,7 @@ test('N1：増分でない循環の検査（再生の速い道＋追記の探索
       if (rnd() < 0.25 && active.size) {
         const e = [...active.values()][ri(active.size)];
         assert.equal(check(buildContext({ records, op: 'retract', actor: A.owner, input: { link_seq: e.seq, reason: 'r' }, config: {}, state: st })).ok, true);
-        push({ type: RECORD_TYPE, op: 'retract', rules: RULES, actor: A.owner, target_seq: e.seq, reason: 'r' }); active.delete(e.key); retractedKeys.add(e.key); continue;
+        push({ type: RECORD_TYPE, op: 'retract', rules: RULES, cfg: CFG, actor: A.owner, target_seq: e.seq, reason: 'r' }); active.delete(e.key); retractedKeys.add(e.key); continue;
       }
       let rel; let f; let t;
       if (mode === 0 || (mode === 2 && rnd() < 0.5)) { rel = 'supersedes'; f = sid(ri(N)); t = sid(ri(N)); } else { rel = ['derives', 'depends_on'][ri(2)]; f = tid(ri(N)); t = tid(ri(N)); }
@@ -894,7 +902,7 @@ test('N1：増分でない循環の検査（再生の速い道＋追記の探索
       const gs = r.violations.map((v) => v.guard);
       const got = r.ok ? 'ok' : gs.includes('TR-NO-SELF') ? 'self' : gs.includes('TR-NO-DUPLICATE') ? 'dup' : gs.includes('TR-NO-CYCLE') ? 'cycle' : `other:${gs}`;
       assert.equal(got, expect, `g${g} step${step} ${rel} ${f.id.slice(-3)}→${t.id.slice(-3)}`); checked += 1;
-      if (r.ok) { push({ type: RECORD_TYPE, op: 'link', rules: RULES, actor, link: { from: f, to: t, rel } }); active.set(key, { seq: records.length, rel, f: f.id, t: t.id, key }); }
+      if (r.ok) { push({ type: RECORD_TYPE, op: 'link', rules: RULES, cfg: CFG, actor, link: { from: f, to: t, rel } }); active.set(key, { seq: records.length, rel, f: f.id, t: t.id, key }); }
     }
     const st = replay(records); assert.equal(st.meta.rejected.length, 0, `g${g}`); assert.equal(st.active.size, active.size);
   }
@@ -973,8 +981,8 @@ test('N4：仕様を変えて承認し直した票が、取り込みだけで解
   assert.deepEqual(chain.links.filter((l) => l.rel === 'supersedes').map((l) => [l.from.id.slice(7, 9), l.to.id.slice(7, 9)]), [['22', '11'], ['33', '22']]);
 });
 
-test('N5/N6：RULES は tr.v2。覆われた tr.v1 の行は、根幹の検査と v1 の書式で受け、綴りの衝突は外す。時刻のない v1 の行は記録の時刻で代用する', () => {
-  assert.equal(RULES, 'tr.v2');
+test('N5/N6：RULES は tr.v3。覆われた tr.v1 の行は、根幹の検査と v1 の書式で受け、綴りの衝突は外す。時刻のない v1 の行は記録の時刻で代用する', () => {
+  assert.equal(RULES, 'tr.v3');
   const { t, file } = open();
   const v1 = (x) => forge(file, { type: RECORD_TYPE, op: 'link', rules: 'tr.v1', actor: A.importer, ...x });
   v1({ link: L({ kind: 'release', id: 'REL-v1' }, 'deploys', R.mg) });                        // v1 の規則で正しい（v2 では大文字だけ）
@@ -1046,4 +1054,91 @@ test('N8：判定ファイル名は ticketId の宣言に追随する。shaIndex
   refuse(() => t.link(A.importer, L({ kind: 'audit', id: 'AUD-dddddddddddd-11111111', digest: S('2') }, 'verifies', R.rq)), 'TR-DIGEST-CONSISTENT');
   t.link(A.importer, L({ kind: 'verdict', id: 'VRD-dddddddddddd-judge-11111111', digest: `sha256:11111111${'0'.repeat(56)}` }, 'verifies', R.rq)); // 一致
   t.link(A.importer, L({ kind: 'verdict', id: 'VRD-eeeeeeeeeeee-judge' }, 'verifies', R.rq)); // 指紋なしの旧い形は、そのまま通る
+});
+
+// =====================================================================
+// 共通の語彙（lib/vocab.mjs）への移行（tr.v3）
+// =====================================================================
+
+test('語彙：vocab の行為者の形をそのまま受け、記録の行為者は vocab.normActor の正規化した4欄になる', () => {
+  const { t, file } = open();
+  const gate = { role: 'gate_runner', kind: 'script', id: 'gate', lineage: 'script' };
+  const rec = t.link(gate, L(R.t1, 'satisfies', R.req));
+  assert.deepEqual(rec.actor, normActor(gate));
+  assert.deepEqual(t.state().links[0].actor, normActor(gate));
+  const line = JSON.parse(fs.readFileSync(file, 'utf8').trim().split('\n')[0]);
+  assert.deepEqual(line.actor, normActor(gate), '記録の行にも正規化した形で残す');
+  // lineage を省いた script・human は補われ、表記ゆれ（全角・大文字・前後の空白）は正規化して同じ形で記録する
+  t.link({ kind: 'script', role: 'GATE_RUNNER', id: ' Gate ' }, L(R.t2, 'satisfies', R.req));
+  assert.deepEqual(t.state().links[1].actor, { role: 'gate_runner', kind: 'script', id: 'gate', lineage: 'script' });
+  t.link({ kind: 'human', role: 'ｏｗｎｅｒ', id: 'Owner' }, L(R.t3, 'satisfies', R.req));
+  assert.deepEqual(t.state().links[2].actor, { role: 'owner', kind: 'human', id: 'owner', lineage: 'human' });
+  // 形の合わない行為者は TR-ACTOR-SHAPE（表にない役割・種類の食い違い・ai の lineage なし・知らない系統・知らない欄）
+  for (const bad of [
+    { kind: 'human', role: 'judge', id: 'staff-1' }, { kind: 'ai', role: 'owner', id: 'x', lineage: 'claude' }, { kind: 'script', role: 'release_script', id: 'r' },
+    { kind: 'ai', role: 'worker', id: 'w' }, { kind: 'ai', role: 'worker', id: 'w', lineage: 'anthropic' }, { kind: 'human', role: 'owner', id: 'owner', lineage: 'claude' },
+    { ...gate, extra: 1 }, { kind: 'human', role: 'оwner', id: 'owner' },
+  ]) refuse(() => t.link(bad, L(R.d1, 'satisfies', R.req)), 'TR-ACTOR-SHAPE');
+  // 形は正しいが書けない（AI）・script の許可リスト外（night_runner・reaper）
+  refuse(() => t.link({ kind: 'ai', role: 'codex_judge', id: 'cj', lineage: 'codex' }, L(R.d1, 'satisfies', R.req)), 'TR-WRITER-ALLOWED');
+  for (const role of ['night_runner', 'reaper']) refuse(() => t.link({ kind: 'script', role, id: 's' }, L(R.d1, 'satisfies', R.req)), 'TR-SCRIPT-ROLE');
+  assert.equal(t.verify().ok, true);
+});
+
+test('語彙：書いた行は設定の写し（cfg.ticket_id）を持つ。別の ticketId で開くと過去の行は覆われない行になり、オーナーの epoch で解ける', () => {
+  const { t, file } = open();
+  t.link(A.importer, L(R.t1, 'satisfies', R.req)); t.link(A.importer, L(R.t2, 'satisfies', R.req)); t.retract(A.owner, 2, { reason: '取り違え' });
+  for (const line of fs.readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse)) assert.deepEqual(line.cfg, { ticket_id: { prefix: 'T-', digits: [3, 4] } });
+  // 同じ設定で開き直せば、そのまま読める
+  assert.equal(openTrace(file, { now: NOW }).verify().ok, true);
+  // 別の票の ID の宣言で開き直す：過去の行は状態に入れず、書き込みも止める（開き方で過去の行の扱いを変えない）
+  const t2 = openTrace(file, { now: NOW, ticketId: { prefix: 'TK-', digits: [2, 2] } });
+  const v = t2.verify(); assert.equal(v.ok, false); assert.ok(v.legacy_uncovered > 0); assert.equal(v.legacy_uncovered, 3);
+  assert.equal(t2.state().links.length, 0);
+  refuse(() => t2.link(A.importer, L({ kind: 'ticket', id: 'TK-01' }, 'satisfies', R.req)), 'TR-RULES-VERSION');
+  refuse(() => t2.epoch(A.importer, { reason: '設定を変えた' }), 'TR-RETRACT-OWNER');
+  // オーナーが確かめて epoch を書けば、過去の行はその行の写しの宣言（T-）で確かめて入る
+  t2.epoch(A.owner, { reason: '票の ID の宣言を TK- に変えた' });
+  const v2 = t2.verify(); assert.equal(v2.ok, true); assert.equal(v2.legacy_uncovered, 0);
+  const st = t2.state();
+  assert.deepEqual(st.links.map((l) => l.from.id), ['T-001', 'T-002']); assert.notEqual(st.links[1].retracted, null, '取り消しの行も覆われて効く');
+  // 以後は新しい宣言で書く（新しい行の写しは TK-）。古い形の id は新しく書けない
+  t2.link(A.importer, L({ kind: 'ticket', id: 'TK-01' }, 'satisfies', R.req));
+  refuse(() => t2.link(A.importer, L(R.t3, 'satisfies', R.req)), 'TR-ID-FORMAT');
+  const last = JSON.parse(fs.readFileSync(file, 'utf8').trim().split('\n').pop());
+  assert.deepEqual(last.cfg, { ticket_id: { prefix: 'TK-', digits: [2, 2] } });
+  // 直接書いた今の版の行で、写しがない・形が違う行も、覆われない行として数える
+  const f = open();
+  forge(f.file, { type: RECORD_TYPE, op: 'link', rules: RULES, actor: A.importer, link: L(R.t1, 'satisfies', R.req) });
+  forge(f.file, { type: RECORD_TYPE, op: 'link', rules: RULES, cfg: { ticket_id: { prefix: 'T-', digits: [3, 4] }, extra: 1 }, actor: A.importer, link: L(R.t2, 'satisfies', R.req) });
+  forge(f.file, { type: RECORD_TYPE, op: 'link', rules: RULES, cfg: CFG, actor: A.importer, link: L(R.t3, 'satisfies', R.req) });
+  assert.equal(f.t.verify().legacy_uncovered, 2); assert.equal(f.t.state().links.length, 1);
+});
+
+test('語彙：evidence の時刻（at）と結論（result）は書く時に確かめる（陰性と陽性の対照）。取り込みの時刻は +09:00 に写す', () => {
+  const { t } = open(); base(t);
+  const at = '2026-11-10T10:00:00+09:00';
+  // 陰性：時刻の形
+  for (const bad of ['2026-11-10 10:00:00+09:00', '2026-11-10T10:00:00+0900', '2026-11-10T10:00+09:00', '2026-11-10T10:00:00', 'yesterday', '2026-02-30T10:00:00Z']) {
+    refuse(() => t.link(A.importer, L(au('d'), 'verifies', R.rq, ev('passed', bad))), 'TR-INPUT-SHAPE');
+  }
+  refuse(() => t.link(A.importer, L(R.t2, 'satisfies', R.req, { evidence: { at: '2026-11-10T10:00:00+0900' } })), 'TR-INPUT-SHAPE');
+  // 陰性：結論の名前（種類ごと）と、結論を持てないつながり
+  for (const [from, rel, result] of [[vd('d', 'judge'), 'verifies', 'approved'], [vd('d', 'judge'), 'verifies', 'passed'], [au('d'), 'verifies', 'PASS'], [au('d'), 'verifies', 'APPROVED'], [{ kind: 'ruling', id: 'RUL-aaaaaaaaaaaaaaaa' }, 'approves', 'reject']]) {
+    refuse(() => t.link(A.owner, L(from, rel, R.rq, ev(result, at))), 'TR-INPUT-SHAPE');
+  }
+  refuse(() => t.link(A.importer, L(R.t2, 'satisfies', R.req, ev('APPROVED'))), 'TR-INPUT-SHAPE');
+  refuse(() => t.link(A.importer, L(R.mg, 'integrates', R.rq, ev('merge'))), 'TR-INPUT-SHAPE');
+  // 陽性：vocab の形
+  for (const [i, r] of ['APPROVED', 'CHANGES_REQUIRED', 'UNAVAILABLE'].entries()) t.link(A.importer, L(vd('d', ['judge', 'codex-judge', 'codex-security'][i]), 'verifies', R.rq, ev(r, at)));
+  for (const [i, r] of ['passed', 'failed', 'not_run'].entries()) t.link(A.importer, L(au(String(i + 1)), 'verifies', R.rq, ev(r, ['2026-11-10T01:00:00Z', '2026-11-10T01:00:00.5Z', '2026-11-10T01:00:00-05:30'][i])));
+  t.link(A.owner, L({ kind: 'ruling', id: 'RUL-aaaaaaaaaaaaaaaa' }, 'approves', R.rq, ev('merge', at)));
+  t.link(A.importer, L(R.t2, 'satisfies', R.req, { evidence: { at, source: 'x' } }));
+  assert.equal(t.verify().ok, true);
+  // 取り込み：Kernel の +0900 は +09:00 に写して書く（そのまま追記できる）
+  const r = linksFromEvidence(sample());
+  const ats = r.links.map((l) => l.evidence && l.evidence.at).filter((x) => x !== undefined);
+  assert.ok(ats.length > 0); for (const x of ats) { assert.ok(!/[+-]\d{4}$/.test(x), x); assert.notEqual(parseTs(x), null, x); }
+  assert.equal(r.links.find((l) => l.from.kind === 'ruling').evidence.at, '2026-11-10T23:00:00+09:00');
+  assert.deepEqual(open().t.linkMany(A.importer, r.links).refused, []);
 });

@@ -10,8 +10,10 @@
 //
 // 保証しないこと:
 //   - 起動の窓口がこの検査を呼ぶ配線は、この試作にはない（呼ばなければ何も強制されない）
-//   - 役割→branch の表と tools の上限の表は、capabilities.json と vgdd/agents から**手で転記した仮の表**で、
-//     capabilities.json に branch の欄はない。実体との一致は検査していない
+//   - 役割→branch・既定の系統の表は lib/vocab.mjs の ROLE_TABLE（capabilities.json の roles と checkAgainstCapabilities で照合できる）。
+//     tools の上限の表は vgdd/agents から手で転記した仮の表で、実体との一致は検査していない
+//   - limits.concurrent_work は「同時に動かす作業員（worker・tester）の数」で、runstate の config.concurrent_work と同じ意味。
+//     行政の長（executive_head）は数えず、1 体まで（TM-WORKER-LIMIT）。旧名の limits.workers（行政の総数）は受けない
 //   - lineage（モデルの系統）は plan の自己申告。実際に起動したモデルの観測はない
 //   - グロブの包含は、文字どおりの一致と末尾 `/**`・`*` の単純な形だけ。それ以外は違反（fail-closed）
 //   - 提案者が人であることを plan の中身からは確かめない。requires_approval は常に true で、false になるのは
@@ -21,50 +23,38 @@
 //   context の値は型を検査し、不正なら違反（fail-closed）。値が undefined のとき既定値で補う（スプレッドで上書きしない）
 
 import { covers, recommend } from './taskgraph.mjs';
+import { ROLE_TABLE, BRANCHES as VOCAB_BRANCHES, normLineage as vocabNormLineage, isOwner } from './lib/vocab.mjs';
 
 export const MAX_RES = 64; // member の scope の要素数の上限（検査の作業量の上限）
 
-const BRANCHES = ['executive', 'judicial', 'legislative', 'sovereign', 'clerical'];
-
-// 役割名→branch（手で書いた表。表にない役割は使えない型）
-const ROLE_BRANCH = {
-  owner: 'sovereign',
-  legislative_assistant: 'legislative',
-  executive_head: 'executive',
-  worker: 'executive',
-  tester: 'executive',
-  night_runner: 'executive',
-  judge: 'judicial',
-  codex_judge: 'judicial',
-  constitutional_review: 'judicial',
-  gate_runner: 'judicial',
-  scribe: 'clerical',
-};
+const BRANCHES = VOCAB_BRANCHES;
+// 役割名→branch・系統は vocab の表（ROLE_TABLE）。表にない役割は使えない型
+const ROLE_BRANCH = Object.fromEntries(Object.entries(ROLE_TABLE).map(([k, v]) => [k, v.branch]));
 // 委任してよい型（SPEC §5 の起動の窓口：行政の長だけが作業員の起動を申請できる）
 const ROLE_MAY_DELEGATE = { executive_head: true };
-// 系統（capabilities.json の identity から。claude 系と codex 系）
-const ROLE_LINEAGE = { codex_judge: 'codex', judge: 'claude', constitutional_review: 'claude', worker: 'claude', tester: 'claude', executive_head: 'claude', legislative_assistant: 'claude' };
+// 型の系統（vocab の既定の系統。AI の型だけ。人・スクリプトの型は編成に入らない）
+const ROLE_LINEAGE = Object.fromEntries(Object.entries(ROLE_TABLE).filter(([, v]) => v.kind === 'ai').map(([k, v]) => [k, v.lineage]));
 // tools の上限（vgdd/agents の disallowedTools: Agent, WebFetch, WebSearch, NotebookEdit を除いたもの。司法はツールなし）
 const WORK_TOOLS = ['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep'];
 const ROLE_TOOLS = { executive_head: [...WORK_TOOLS, 'Agent'], worker: WORK_TOOLS, tester: WORK_TOOLS, judge: [], codex_judge: [], constitutional_review: [] };
-// 所有者の権限・sandbox の外で動く Kernel の処理。AI の編成に入れられない
-const OWNER_AUTHORITY = new Set(['gate_runner', 'night_runner']);
+// 所有者の権限・sandbox の外で動く Kernel の処理（vocab の kind: script の役割）。AI の編成に入れられない
+const OWNER_AUTHORITY = new Set(Object.entries(ROLE_TABLE).filter(([, v]) => v.kind === 'script').map(([k]) => k));
 
 /** capabilities.json の roles から承認済みの型を作る。表にない役割は branch: null・usable: false（fail-closed） */
 export function catalogFromCapabilities(caps) {
   const roles = (caps && caps.roles) || {};
   const catalog = {};
   for (const [id, r] of Object.entries(roles)) {
-    const branch = ROLE_BRANCH[id] || null;
+    const branch = Object.hasOwn(ROLE_BRANCH, id) ? ROLE_BRANCH[id] : null;
     catalog[id] = {
       id,
       kind: r.kind,
       branch,
       usable: branch !== null,
-      lineage: ROLE_LINEAGE[id],
-      may_delegate: ROLE_MAY_DELEGATE[id] === true,
+      lineage: Object.hasOwn(ROLE_LINEAGE, id) ? ROLE_LINEAGE[id] : undefined,
+      may_delegate: Object.hasOwn(ROLE_MAY_DELEGATE, id) && ROLE_MAY_DELEGATE[id] === true,
       owner_authority: OWNER_AUTHORITY.has(id),
-      scope_ceiling: { tools: ROLE_TOOLS[id] || [] }, // resources の上限は票の範囲が決める
+      scope_ceiling: { tools: Object.hasOwn(ROLE_TOOLS, id) ? ROLE_TOOLS[id] : [] }, // resources の上限は票の範囲が決める
     };
   }
   return catalog;
@@ -83,12 +73,8 @@ const memberById = (ctx) => {
 };
 const branchOf = (ctx, m) => { const t = tpl(ctx, m); return t && t.usable !== false ? t.branch : null; };
 
-/** 系統名の正規形。文字列だけを受け、trim と小文字化のあと許可リストの形（^[a-z][a-z0-9_-]{0,39}$）に合うものだけ。合わなければ null */
-export function normLineage(x) {
-  if (typeof x !== 'string') return null;
-  const v = x.trim().toLowerCase();
-  return /^[a-z][a-z0-9_-]{0,39}$/.test(v) ? v : null;
-}
+/** 系統名の正規形（lib/vocab.mjs の normLineage。知っている系統だけ。ハイフン・別名は null） */
+export const normLineage = vocabNormLineage;
 /** 実効の系統。catalog の型が系統を持てばその値（plan の申告で上書きできない）。持たなければ plan の申告 */
 const lineageOf = (ctx, m) => {
   const t = tpl(ctx, m);
@@ -160,7 +146,8 @@ const FINDERS = {
     const l = c.limits;
     if (!l || typeof l !== 'object') o.push({ reason: 'context.limits がオブジェクトでない' });
     else {
-      if (!intIn(l.workers, 0, 1000)) o.push({ reason: `limits.workers が 0〜1000 の整数でない: ${String(l.workers)}` });
+      for (const k of Object.keys(l)) if (!['concurrent_work', 'depth', 'members_total'].includes(k)) o.push({ reason: `limits に知らない欄: ${k.slice(0, 40)}${k === 'workers' ? '（旧名。同時の作業員の数は concurrent_work）' : ''}` });
+      if (!intIn(l.concurrent_work, 0, 1000)) o.push({ reason: `limits.concurrent_work が 0〜1000 の整数でない: ${String(l.concurrent_work)}` });
       if (l.depth !== undefined && !intIn(l.depth, 0, 8)) o.push({ reason: `limits.depth が 0〜8 の整数でない: ${String(l.depth)}` });
       if (l.members_total !== undefined && !intIn(l.members_total, 1, 64)) o.push({ reason: `limits.members_total が 1〜64 の整数でない: ${String(l.members_total)}` });
     }
@@ -199,7 +186,7 @@ const FINDERS = {
     for (const m of members(ctx)) {
       if (m.lineage === undefined) continue;
       const n = normLineage(m.lineage);
-      if (n === null) { out.push({ member: m.id, reason: '系統の申告が許可された形（文字列。^[a-z][a-z0-9_-]{0,39}$）でない' }); continue; }
+      if (n === null) { out.push({ member: m.id, reason: '系統の申告が知っている系統（vocab の LINEAGES）でない（別名・ハイフンは不可）' }); continue; }
       const t = tpl(ctx, m);
       if (t && t.lineage !== undefined && normLineage(t.lineage) !== n) out.push({ member: m.id, reason: `系統の申告 ${n} が型 ${m.template} の系統 ${String(t.lineage)} と違う（申告では上書きできない）` });
     }
@@ -306,11 +293,18 @@ const FINDERS = {
       const t = tpl(ctx, m);
       return t && (t.kind === 'human' || t.branch === 'sovereign' || t.branch === 'legislative' || t.owner_authority === true);
     }).map((m) => ({ member: m.id, reason: `AI の編成に入れられない席（人・主権者・立法・オーナーの権限の処理）: ${m.template}` })),
+  // 作業員（worker・tester）の数は limits.concurrent_work まで（runstate の同時の作業の数と同じ意味）。行政の長は数えず、1 体まで。
+  // ほかの行政の型（表にあって使える行政の型）は作業に数える（厳しい側）
   'TM-WORKER-LIMIT': (ctx) => {
-    const w = limitsOf(ctx).workers;
-    const n = members(ctx).filter((m) => branchOf(ctx, m) === 'executive').length;
-    if (!Number.isInteger(w) || w < 0) return [{ reason: 'limits.workers が不正（拒否する）' }];
-    return n > w ? [{ reason: `行政の member の数が上限を超える（${n} > ${w}）` }] : [];
+    const w = limitsOf(ctx).concurrent_work;
+    if (!Number.isInteger(w) || w < 0) return [{ reason: 'limits.concurrent_work が不正（拒否する）' }];
+    const ex = members(ctx).filter((m) => branchOf(ctx, m) === 'executive');
+    const heads = ex.filter((m) => m.template === 'executive_head').length;
+    const n = ex.length - heads;
+    const out = [];
+    if (heads > 1) out.push({ reason: `行政の長（executive_head）は 1 体まで（${heads} 体）` });
+    if (n > w) out.push({ reason: `作業員（worker・tester）の数が同時の作業の上限を超える（${n} > ${w}）` });
+    return out;
   },
   'TM-LIMITS-NO-RAISE': (ctx) => {
     const req = ctx.plan && ctx.plan.limits_requested;
@@ -351,13 +345,13 @@ export function validateTeam(plan, context) {
   const { ok, violations } = check({ plan, context });
   const warnings = [];
   const pr = context && context.proposer;
-  const requires_approval = !(pr && typeof pr === 'object' && pr.kind === 'human' && pr.role === 'owner');
+  const requires_approval = !isOwner(pr);
   try {
     const ctx = { plan, context };
     const exec = members(ctx).filter((m) => branchOf(ctx, m) === 'executive').length;
     if (exec >= 2) {
       if (context && context.graph) {
-        const rec = recommend(context.graph, { workers: limitsOf(ctx).workers });
+        const rec = recommend(context.graph, { workers: limitsOf(ctx).concurrent_work }); // taskgraph の workers は同時の作業の数
         if (rec.topology === 'single') warnings.push({ guard: 'TM-UNNEEDED-AGENTS', reason: `行政の member が ${exec} 体だが、taskgraph.recommend は single を勧めている（${rec.reasons[rec.reasons.length - 1]}）。人が見て決める` });
       } else warnings.push({ guard: 'TM-UNNEEDED-AGENTS', reason: `行政の member が ${exec} 体。context.graph がないため、並列が要るかを確かめていない` });
     }

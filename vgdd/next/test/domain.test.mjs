@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { validateDomainPack, check, GUARDS, idPatternProblem, JUDGE_INPUTS, AUDIT_EXECUTABLES } from '../domain.mjs';
+import { validateDomainPack, check, GUARDS, workItemIdProblem, JUDGE_INPUTS, AUDIT_EXECUTABLES } from '../domain.mjs';
 import { SCENARIOS, base } from '../bench/scenarios-domain.mjs';
 
 const load = (n) => JSON.parse(fs.readFileSync(new URL(`../domains/${n}.json`, import.meta.url), 'utf8'));
@@ -104,11 +104,11 @@ test('核の欄・未知の欄は違反（別のガード）', () => {
   assert.ok(check({ pack: p }).violations.some((v) => v.guard === 'DP-UNKNOWN-FIELD'));
 });
 
-test('id_pattern（B-F16）: 許可された構文だけ。ReDoS の形・アンカーなし・長すぎるものは違反', () => {
-  assert.equal(idPatternProblem('^T-[0-9]{3,4}$'), null);
-  assert.equal(idPatternProblem('^[A-Z]{1,3}-[0-9]{3}$'), null);
-  for (const bad of ['(', '^(a+)+$', '^((a+))+$', '^(.*a){25}$', '^(a|aa)+$', 'T-[0-9]{3}', '^T-[0-9]+$', '^T-[0-9]{4,3}$', '^T-[0-9]{99}{99}$', '^[0-9]{60}[a-z]{60}$', '^a.*$', '', '^T-\\d{3}$']) assert.notEqual(idPatternProblem(bad), null, bad);
-  assert.equal(idPatternProblem('^' + 'a'.repeat(80) + '$') !== null, true);
+test('票の ID の宣言（B-F16。語彙で正規表現の方式から宣言の形に替えた）: { prefix, digits } だけ。正規表現・範囲外・長すぎる・知らない欄は違反', () => {
+  assert.equal(workItemIdProblem({ prefix: 'T-', digits: [3, 4] }), null);
+  assert.equal(workItemIdProblem({ prefix: 'ABC-', digits: [3, 3] }), null);
+  for (const bad of ['^T-[0-9]{3,4}$', null, {}, { prefix: '^(a+)+$', digits: [3, 4] }, { prefix: '(', digits: [1, 2] }, { prefix: 'T-', digits: [4, 3] }, { prefix: 'T-', digits: [0, 3] }, { prefix: 'T-', digits: [99, 99] }, { prefix: 'T-', digits: [3] }, { prefix: '', digits: [1, 2] }, { prefix: 'T-', digits: [1, 2], pattern: '.*' }, { prefix: '1-', digits: [1, 2] }]) assert.notEqual(workItemIdProblem(bad), null, JSON.stringify(bad));
+  assert.equal(workItemIdProblem({ prefix: 'a'.repeat(80), digits: [1, 2] }) !== null, true);
   // 許可された構文は、どんな入力でも線形時間で終わる
   const re = new RegExp('^[0-9]{3,4}-[a-z]{1,10}$');
   const t = Date.now(); re.test('1'.repeat(10000) + '!'); assert.ok(Date.now() - t < 100);
@@ -232,7 +232,7 @@ test('B-F16: どんな入力でも例外を投げず違反を返す', () => {
   mutate((p) => { p.judiciary.categories = [null, {}]; });
   mutate((p) => { p.protected = [null, 1, {}]; });
   mutate((p) => { p.work_item = []; });
-  mutate((p) => { p.work_item.id_pattern = 5; });
+  mutate((p) => { p.work_item.id = 5; });
   mutate((p) => { p.disclosures = [1, null]; });
   mutate((p) => { p.audits[0].command = [Symbol('x')]; });
   weird.push({ get schema() { throw new Error('boom'); } });

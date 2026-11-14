@@ -18,7 +18,7 @@ const A = {
   claude: { role: 'executive_head', kind: 'ai', id: 'claude-exec-1', lineage: 'claude' },
   claude2: { role: 'worker', kind: 'ai', id: 'claude-worker-2', lineage: 'claude' },
   codexWorker: { role: 'worker', kind: 'ai', id: 'codex-worker-1', lineage: 'codex' },
-  runner: { role: 'gate_runner', kind: 'script', id: 'conformance-runner', lineage: 'vgdd-script' },
+  runner: { role: 'gate_runner', kind: 'script', id: 'conformance-runner', lineage: 'script' },
   judge: { role: 'judge', kind: 'ai', id: 'claude-judge-1', lineage: 'claude' },
   codexJudge: { role: 'codex_judge', kind: 'ai', id: 'codex-judge-1', lineage: 'codex' },
   codexConst: { role: 'constitutional_review', kind: 'ai', id: 'codex-const-1', lineage: 'codex' },
@@ -87,7 +87,7 @@ test('自己採用：AI・スクリプト・AI がオーナーを名乗る採用
 test('役割の分離：自己評価・提案者や評価者の審査・同じ審査者の二度目・関与者の採用は止まる', () => {
   const { im } = open();
   const p = im.propose(A.claude, playbook());
-  refusedBy(() => im.evaluate({ ...A.claude, kind: 'script', lineage: 'x' }, p.id, { digest: p.digest, evidence: { conformance: GOOD } }), 'IM-SEPARATION-OF-DUTIES');
+  refusedBy(() => im.evaluate({ role: 'gate_runner', kind: 'script', id: A.claude.id }, p.id, { digest: p.digest, evidence: { conformance: GOOD } }), 'IM-SEPARATION-OF-DUTIES');
   im.evaluate(A.runner, p.id, { digest: p.digest, evidence: { conformance: GOOD } });
   const rid = () => im.reviewInputFor(p.id).digest;
   refusedBy(() => im.review({ ...A.codexJudge, id: A.claude.id }, p.id, { digest: p.digest, verdict: 'APPROVED', findings: [], review_input_digest: rid() }), 'IM-SEPARATION-OF-DUTIES');
@@ -105,7 +105,7 @@ test('評価の証拠は AI が出せない', () => {
   const p = im.propose(A.claude, playbook());
   refusedBy(() => im.evaluate(A.codexWorker, p.id, { digest: p.digest, evidence: { conformance: GOOD } }), 'IM-EVALUATOR-NOT-AI');
   // 人の評価は通る
-  im.evaluate({ role: 'owner_delegate', kind: 'human', id: 'reviewer-human', lineage: 'human' }, p.id, { digest: p.digest, evidence: { conformance: GOOD } });
+  im.evaluate({ role: 'owner', kind: 'human', id: 'reviewer-human', lineage: 'human' }, p.id, { digest: p.digest, evidence: { conformance: GOOD } });
 });
 
 test('審査者：司法の役割だけ・提案者と別系統（経験の層でも例外なし）', () => {
@@ -496,8 +496,8 @@ test('N1：差し戻しの引き継ぎは target の表記・tier・同じ系統
     assert.deepEqual(q.inheritedCR, ['codex-judge-1'], label);
     refusedBy(() => adopt(im, q), 'IM-CR-STICKY');
   }
-  // 空白を含む id は形として拒む
-  { const { im } = crBase(); refusedBy(() => im.propose({ ...A.claude, id: 'claude-exec-1 ' }, pbT(T1)), 'IM-ACTOR-SHAPE'); }
+  // 空白を含む id は形として拒む（前後の空白は vocab が落とすので、途中の空白で確かめる）
+  { const { im } = crBase(); refusedBy(() => im.propose({ ...A.claude, id: 'claude exec-1' }, pbT(T1)), 'IM-ACTOR-SHAPE'); }
   // 陽性の対照：別の系統の提案者の、別の中身は引き継がない
   { const { im } = crBase(); const q = toReviewed(im, pbT(T1, { content: '別の中身' }), { proposer: A.codexWorker, reviewers: [{ ...A.judge, id: 'claude-judge-2' }] });
     assert.deepEqual(q.inheritedCR, []); assert.equal(adopt(im, q).status, 'adopted'); }
@@ -542,10 +542,10 @@ test('N4：法律の採用の旧版は直前に採用された法律の新版か
   const lawRows = (id, old, nu) => {
     const proposal = { title: '表', tier: 'law', target: T, content: { capabilities: nu }, capabilities: { old, new: nu } };
     const dgst = IMOD.proposalDigest(proposal);
-    forge(file, { type: 'vgdd.improvement.v1', rules: R, op: 'propose', id, actor: A.claude, proposal, digest: dgst, rationale: null });
-    forge(file, { type: 'vgdd.improvement.v1', rules: R, op: 'evaluate', id, actor: A.runner, digest: dgst, evidence: { conformance: GOOD } });
-    forge(file, { type: 'vgdd.improvement.v1', rules: R, op: 'review', id, actor: A.codexJudge, digest: dgst, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(id).digest });
-    forge(file, { type: 'vgdd.improvement.v1', rules: R, op: 'adopt', id, actor: A.owner, digest: dgst, policy_line: 'p0.4' });
+    forge(file, { type: 'vgdd.improvement.v1', rules: R, cfg: { max_open: 5 }, op: 'propose', id, actor: A.claude, proposal, digest: dgst, rationale: null });
+    forge(file, { type: 'vgdd.improvement.v1', rules: R, cfg: { max_open: 5 }, op: 'evaluate', id, actor: A.runner, digest: dgst, evidence: { conformance: GOOD } });
+    forge(file, { type: 'vgdd.improvement.v1', rules: R, cfg: { max_open: 5 }, op: 'review', id, actor: A.codexJudge, digest: dgst, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(id).digest });
+    forge(file, { type: 'vgdd.improvement.v1', rules: R, cfg: { max_open: 5 }, op: 'adopt', id, actor: A.owner, digest: dgst, policy_line: 'p0.4' });
   };
   lawRows('IMP-0001', loose, loose); // 旧版も新版も緩めた表（書く時の IM-LAW-BASELINE を迂回した偽の行）
   const v = im.verify();
@@ -609,4 +609,47 @@ test('N2：引き継ぎの元で一度解けば、そこから引き継いだ未
   const z = toReviewed(im, pbT({ name: 'worker-playbook' }, { content: '案3' }), { reviewers: [{ ...A.codexJudge, id: 'codex-judge-3' }] });
   assert.deepEqual(z.inheritedCR, []);
   assert.equal(adopt(im, z).status, 'adopted');
+});
+
+// ---- im.v3：共通の語彙（lib/vocab.mjs） ----
+test('im.v3 判例：claude の提案を、同じ系統の別名（anthropic・openai・Claude-3）を名乗る審査者は審査できない。codex は通る', () => {
+  for (const alias of ['anthropic', 'Anthropic', 'openai', 'claude-3', 'claude ai']) {
+    const { im } = open();
+    const p = im.propose(A.claude, playbook());
+    im.evaluate(A.runner, p.id, { digest: p.digest, evidence: { conformance: GOOD } });
+    refusedBy(() => im.review({ ...A.judge, id: 'alias-judge', lineage: alias }, p.id, { digest: p.digest, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(p.id).digest }), 'IM-ACTOR-SHAPE');
+  }
+  const { im } = open();
+  const p = toReviewed(im, playbook(), { reviewers: [A.codexJudge] });
+  assert.equal(p.status, 'reviewed');
+  // 大文字の Claude は vocab で claude にそろうので、claude の提案に対しては同じ系統として拒む
+  const q = im.propose({ ...A.claude, id: 'claude-exec-5' }, playbook({ title: '別' }));
+  im.evaluate(A.runner, q.id, { digest: q.digest, evidence: { conformance: GOOD } });
+  refusedBy(() => im.review({ ...A.judge, lineage: 'Claude' }, q.id, { digest: q.digest, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(q.id).digest }), 'IM-CROSS-LINEAGE');
+});
+
+test('im.v3：審査者は vocab の表で判定する司法の役割だけ（court・表にない名前・gate_runner は不可。codex_security は可）', () => {
+  const { im } = open();
+  const p = im.propose(A.claude, playbook());
+  im.evaluate(A.runner, p.id, { digest: p.digest, evidence: { conformance: GOOD } });
+  const inp = () => ({ digest: p.digest, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(p.id).digest });
+  refusedBy(() => im.review({ role: 'court', kind: 'ai', id: 'c', lineage: 'codex' }, p.id, inp()), 'IM-ACTOR-SHAPE');
+  refusedBy(() => im.review({ role: 'gate_runner', kind: 'script', id: 'g' }, p.id, inp()), 'IM-JUDICIAL-REVIEWER');
+  assert.equal(im.review({ role: 'codex_security', kind: 'ai', id: 'sec-1', lineage: 'codex' }, p.id, inp()).status, 'reviewed');
+  assert.deepEqual([...IMOD.JUDICIAL_ROLES].sort(), ['codex_judge', 'codex_security', 'constitutional_review', 'judge']);
+});
+
+test('im.v3：行に設定の写し（cfg.max_open）を残し、別の上限で開き直すと再生で拒む。オーナーの epoch の後は使える', () => {
+  const { im, file } = open();
+  im.propose(A.claude, playbook());
+  const row = JSON.parse(fs.readFileSync(file, 'utf8').split('\n')[0]);
+  assert.deepEqual(row.cfg, { max_open: DEFAULT_MAX_OPEN });
+  assert.deepEqual(row.actor, { role: 'executive_head', kind: 'ai', id: 'claude-exec-1', lineage: 'claude' });
+  const im2 = openImprovements(file, { currentCapabilities: caps, now: () => '2026-11-14T09:00:00+09:00', maxOpenPerActor: 50 });
+  assert.equal(im2.verify().ok, false);
+  refusedBy(() => im2.propose(A.claude, playbook({ title: '上限を広げて出す' })), 'IM-CHAIN-INTACT');
+  im2.epoch(A.owner, { reason: '上限を見直した' });
+  assert.equal(im2.verify().ok, true);
+  assert.equal(im2.propose(A.claude, playbook({ title: '移行の後' })).status, 'proposed');
+  assert.equal(open().im.verify().ok, true);
 });

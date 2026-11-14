@@ -21,13 +21,14 @@
 //   - 司法の入力名は許可リストで固定するが、名前が正しくても中身が行政の説明でないことは、この検査では確かめない
 
 import { parsePattern } from './taskgraph.mjs';
+import { parseWorkItemSpec } from './lib/vocab.mjs';
 
 export const SCHEMA = 'vgdd.domain-pack.v1';
 
 // 各階層で受ける欄（許可リスト）
 const TOP_FIELDS = ['schema', 'id', 'title', 'work_item', 'artifact', 'lifecycle', 'audits', 'judiciary', 'protected', 'disclosures'];
 const FIELDS = {
-  work_item: ['id_pattern', 'store', 'spec_sections', 'resource_field'],
+  work_item: ['id', 'store', 'spec_sections', 'resource_field'],
   artifact: ['kind', 'integrate'],
   stage: ['stage', 'produces', 'gate', 'status'],
   audit: ['id', 'command', 'required', 'sandbox'],
@@ -86,22 +87,11 @@ function allKeys(root) {
   return out;
 }
 
-// id_pattern の許可リスト: ^ で始まり $ で終わり、文字・単純な文字クラス（[0-9] [A-Za-z0-9_] など）の並びで、
-// 量指定子は固定の {m} か {m,n} だけ。括弧・選択・+ * ? . は使えない（破滅的バックトラックが起きない形だけ）。
-const ID_PATTERN_GRAMMAR = /^\^(?:(?:[A-Za-z0-9_-]|\[(?:[A-Za-z0-9_]-[A-Za-z0-9_]|[A-Za-z0-9_])+\])(?:\{\d{1,2}(?:,\d{1,2})?\})?)+\$$/;
-export function idPatternProblem(pat) {
-  if (typeof pat !== 'string' || pat.length === 0 || pat.length > 64) return '長さが 1〜64 字でない';
-  if (!ID_PATTERN_GRAMMAR.test(pat)) return '許可された構文（^ … $ の、文字・文字クラスと固定の {m,n}）でない';
-  let total = 0;
-  for (const m of pat.matchAll(/\{(\d{1,2})(?:,(\d{1,2}))?\}/g)) {
-    const lo = Number(m[1]);
-    const hi = m[2] === undefined ? lo : Number(m[2]);
-    if (lo > hi) return '量指定子の下限が上限より大きい';
-    total += hi;
-  }
-  if (total > 64) return '量指定子の合計が大きすぎる';
-  try { new RegExp(pat); } catch { return '正規表現として読めない'; }
-  return null;
+// 票の ID は vocab の宣言の形 { prefix, digits: [最小, 最大] }（正規表現は受けない。照合は vocab の makeWorkItemId で線形時間）。
+// runstate の config.work_item・trace の ticketId・experience の workItem に、そのまま渡せる（bridge.workItemFromDomainPack）。
+// 旧版の id_pattern（正規表現の許可リストの方式）は廃止した（未知の欄として違反）。
+export function workItemIdProblem(spec) {
+  return parseWorkItemSpec(spec) ? null : '票の ID の宣言 { prefix: ^[A-Za-z][A-Za-z0-9._-]{0,15}$, digits: [最小, 最大]（各 1〜12、最小 ≦ 最大） } でない（ほかの欄は不可）';
 }
 
 function commandProblem(cmd) {
@@ -133,7 +123,7 @@ const FINDERS = {
     const w = p.work_item;
     if (!isObj(w)) o.push('work_item がオブジェクトでない');
     else {
-      if (typeof w.id_pattern !== 'string') o.push('work_item.id_pattern が文字列でない');
+      if (!isObj(w.id)) o.push('work_item.id が票の ID の宣言（オブジェクト）でない');
       const st = parsePattern(w.store);
       if (!st || st.type !== 'literal') o.push('work_item.store が相対パス（ワイルドカードなし）でない');
       if (!strArr(w.spec_sections, 16) || w.spec_sections.length === 0) o.push('work_item.spec_sections が文字列の配列（1〜16 個）でない');
@@ -249,11 +239,11 @@ const FINDERS = {
     for (const e of p.protected) if (!parsePattern(e)) o.push(`protected の ${JSON.stringify(e)} は扱える形（literal・dir/**・prefix*）でない（否定・.. ・先頭の / ・[?{}] は不可）`);
     return o;
   },
-  'DP-ID-PATTERN': (p) => {
-    const pat = isObj(p) && isObj(p.work_item) && p.work_item.id_pattern;
-    if (typeof pat !== 'string') return [];
-    const r = idPatternProblem(pat);
-    return r ? [`work_item.id_pattern ${JSON.stringify(pat.slice(0, 80))}: ${r}`] : [];
+  'DP-WORK-ITEM-ID': (p) => {
+    const spec = isObj(p) && isObj(p.work_item) && p.work_item.id;
+    if (!isObj(spec)) return []; // 形は DP-SHAPE が見る
+    const r = workItemIdProblem(spec);
+    return r ? [`work_item.id ${JSON.stringify(spec).slice(0, 80)}: ${r}`] : [];
   },
 };
 

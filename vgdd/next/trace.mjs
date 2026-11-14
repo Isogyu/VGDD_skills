@@ -10,6 +10,7 @@
 // つながりの向き（1か所で決める）：link は「下流の成果物 from」から「上流の成果物 to」へ向く（from は to から導かれた・to に依る）。
 //   trace の 'up' は from → to の向きにたどる（要求の側）、'down' は to → from の向きにたどる（運用の側）。
 //
+// 語彙（役割・行為者・票の ID・指紋・判定と監査の id・審査の種類・時刻・結論の名前）は lib/vocab.mjs。行為者は { role, kind, id, lineage }。
 // 書けるのは：kind: 'script'（裁判所の側のプロセス。役割は SCRIPT_ROLES の許可リスト）と、kind: 'human' かつ role: 'owner'。
 //   AI の役割は書けない（行政が自分の成果物に都合のよいつながりを作れない）。取り消し（retract）・移行（epoch）はオーナーだけ。
 //
@@ -27,7 +28,9 @@
 //     要件・票）は、expected を渡さない限り欠けとして見えない。
 //   - 申請が「どの仕様の指紋に対するものか」は Kernel の held に書かれていない。取り込みでは直前の承認からの推定で、evidence.basis に残す。
 //   - 規則を変えたとき、記録の鎖を書き換えられる者（オーナーの権限）が古い版の印を付けた偽の行を移行の記録の前に作り直す余地は、鎖の限界と同じ根。
-//   - 票の id の形の宣言（ticketId）は、開く側の設定で、記録には残らない。後で変えると、過去の行が再生で外れる。正規表現は受けない。
+//   - 票の id の形の宣言（ticketId）は開く側の設定だが、書く行に設定の写し（cfg.ticket_id）を残す（tr.v3）。再生では、写しが開く側の設定と
+//     違う行は状態に入れず（古い版の行と同じ扱い）、書き込みも止める。オーナーの epoch に覆われた行は、その行の写しの宣言で確かめる。
+//     正規表現は受けない。
 //   - coverage の段階（stages）は「少なくとも1本」の道の存在で、全部の票・申請が満たされたことではない（tickets_without_spec・unsettled を併せて見る）。
 //     判定の最新は evidence.at（判定の記録の collected_at）で決め、時刻がなければ厳しい側に倒す。この時刻は記録を書く側（取り込み）の申告。
 //   - Kernel の gate_events の merged は統合のコミットを12桁しか持たない（gate-runner.sh:404、release.sh:111）。受け入れの記録か shaIndex
@@ -43,10 +46,14 @@
 //   - 件数・深さ・訪れる数の上限は資源の保護で、正しさの保証ではない（上限に達した結果は truncated で示す）。
 
 import { openChain, digest, canonical, Refused } from './lib/chain.mjs';
+import {
+  parseActor, normActor, isOwner as vocabIsOwner, makeWorkItemId, parseWorkItemSpec, sameWorkItemSpec, DEFAULT_WORK_ITEM, isDigest, isArtifactRef, isGitSha,
+  parseVerdictId, isAuditId, isRequirementId, isPolicyLine, parseTs as vocabParseTs, kernelTsToIso, VERDICTS, AUDIT_RESULTS, MODE_NAMES, refusal,
+} from './lib/vocab.mjs';
 
 export const RECORD_TYPE = 'vgdd.trace.v1';
 /** 規則の版。ガードの規則を変えるたびに上げ、各行に rules として記録する。古い版の行はオーナーの移行の記録（epoch）に覆われるまで状態に入れない */
-export const RULES = 'tr.v2';
+export const RULES = 'tr.v3';
 export const DEFAULT_MAX_LINKS = 20000;
 export const MAX_DEPTH = 64;
 export const DEFAULT_DEPTH = 16;
@@ -68,20 +75,25 @@ export const KINDS = Object.freeze([
 ]);
 const KIND_SET = new Set(KINDS);
 
-const SHA256 = /^sha256:[0-9a-f]{64}$/;
-/** id の書式（kind ごとの許可リスト。ticket は opt.ticketIdPattern で差し替えられる）。null プロトタイプ */
+/** 述語を test の形にする（ID_RE の表で vocab の述語と正規表現を同じに扱う） */
+const P = (fn) => ({ test: fn });
+/**
+ * id の書式（kind ごとの許可リスト）。null プロトタイプ。
+ * 票・要件・仕様と承認の指紋・申請と統合の参照・判定と監査の id は lib/vocab.mjs の語彙。ほかの kind（目標・設計・裁定・受け入れ・リリース・障害・
+ * 改善提案・経験）は、この部品だけが扱う成果物の名前で、ここに持つ（改善提案・経験の id は improvement.mjs・experience.mjs の採番と同じ形）
+ */
 const ID_RE = Object.assign(Object.create(null), {
   goal: /^G-[0-9]{1,4}$/,
-  requirement: /^[A-Z][A-Z0-9]{0,11}(?:[.-][A-Z0-9]{1,12}){0,3}$/, // A1、R-12、FR-1.2
+  requirement: P(isRequirementId),                // A1、R-12、FR-1.2（vocab）
   design: /^(?:DES|ADR)-[0-9]{3,4}$/,
-  spec: SHA256,                                   // 仕様の指紋（spec-digest.mjs。SPEC §4）
-  approval: SHA256,                               // 承認の記録の1行の指紋（digest(行)）
-  request: /^[0-9a-f]{40}$/,                      // 申請の SHA
-  // ticket の書式は ticketMatcher（既定 T-+3〜4桁。opt.ticketId で差し替え）。正規表現は利用者から受けない
-  audit: /^AUD-[0-9a-f]{12}(?:-[0-9a-f]{8})?$/,   // 判定の記録の head（12桁）＋内容の指紋の先頭8桁（再判定は別の節。F4。8桁は省略可）
-  verdict: /^VRD-[0-9a-f]{12}-(?:judge|codex-judge|codex-security|codex-ux)(?:-[0-9a-f]{8})?$/,
+  spec: P(isDigest),                              // 仕様の指紋（spec-digest.mjs。SPEC §4）
+  approval: P(isDigest),                          // 承認の記録の1行の指紋（sha256: ＋ 行の hash）
+  request: P(isArtifactRef),                      // 申請の参照（40桁の Git の SHA か sha256: 形。vocab）
+  // ticket の書式は vocab の票の ID の宣言（既定 T-+3〜4桁。opt.ticketId で差し替え）。正規表現は利用者から受けない
+  audit: P(isAuditId),                            // 判定の記録の head（12桁）＋内容の指紋の先頭8桁（vocab）
+  verdict: P((x) => parseVerdictId(x) !== null),  // VRD-<12桁>-<審査の種類>[-<8桁>]（vocab）
   ruling: /^RUL-[0-9a-f]{16}$/,                   // 裁定の記録の1行の指紋の先頭
-  merge: /^[0-9a-f]{40}$/,                        // 統合のコミット
+  merge: P(isArtifactRef),                        // 統合のコミット（40桁）か、Git でない領域の統合の指紋（vocab）
   acceptance: /^ACC-[0-9a-f]{16}$/,
   release: /^REL-[A-Z0-9][A-Z0-9._-]{0,38}$/,        // 大文字だけ（F11）
   incident: /^INC-[0-9]{3,5}$/,
@@ -136,14 +148,11 @@ const PAIR_SET = new Set(REL_TABLE.map((r) => `${r[0]}|${r[1]}|${r[2]}`));
 /** 循環を拒む rel。supersedes は単独、derives と depends_on は1つの群として見る（互いに逆向きの組み合わせも循環） */
 export const CYCLE_RELS = Object.freeze(['supersedes', 'derives', 'depends_on']);
 
-/** script の役割の許可リスト（裁判所の側。行政の役割は入れない） */
-export const SCRIPT_ROLES = Object.freeze(['gate_runner', 'release_script', 'trace_importer', 'court_script']);
-const ACTOR_KINDS = new Set(['human', 'ai', 'script']);
+/** script の役割の許可リスト（vocab の役割。裁判所の執行と取り込み。行政の代行 night_runner・回収 reaper は入れない） */
+export const SCRIPT_ROLES = Object.freeze(['gate_runner', 'trace_importer']);
 const WRITE_OPS = ['link', 'retract', 'epoch'];
 const ALL_OPS = new Set([...WRITE_OPS, 'query']);
 const DIRECTIONS = new Set(['up', 'down', 'both']);
-const ROLE_RE = /^[a-z][a-z0-9_]{0,39}$/;
-const ACTOR_ID_RE = /^[a-z0-9][a-z0-9_.-]{0,63}$/;
 const EVKEY_RE = /^[a-z][a-z_]{0,23}$/;
 const CTRL = /[\p{Cc}\p{Cf}\u2028\u2029]/u;
 
@@ -162,30 +171,15 @@ const normKey = (s) => String(s).normalize('NFKC').trim();
 export const nodeKey = (ref) => `${normKey(ref.kind)}:${normKey(ref.id)}`;
 const linkKey = (rel, f, t) => `${normKey(rel)}|${nodeKey(f)}|${nodeKey(t)}`;
 const refOk = (r) => isObj(r) && Object.keys(r).every((k) => k === 'kind' || k === 'id' || k === 'digest') && typeof r.kind === 'string' && typeof r.id === 'string' && (r.digest === undefined || typeof r.digest === 'string');
-const isOwner = (a) => isObj(a) && a.kind === 'human' && a.role === 'owner';
-const actorOk = (a) => isObj(a) && Object.keys(a).every((k) => ['kind', 'role', 'id', 'lineage'].includes(k))
-  && typeof a.kind === 'string' && ACTOR_KINDS.has(a.kind) && typeof a.role === 'string' && ROLE_RE.test(a.role)
-  && typeof a.id === 'string' && ACTOR_ID_RE.test(a.id) && (a.lineage === undefined || (typeof a.lineage === 'string' && ACTOR_ID_RE.test(a.lineage)));
+const isOwner = vocabIsOwner;
+const actorOk = (a) => parseActor(a).ok;
 
 /** どの kind の id にも共通の検査：1〜128 字、制御文字・書式文字（ゼロ幅）・空白・行区切りを含まず、NFKC で変わらない */
 const SAFE_ID_BAD = /[\p{Cc}\p{Cf}\p{Z}\u2028\u2029]/u;
 const safeId = (id) => typeof id === 'string' && id.length > 0 && id.length <= 128 && !SAFE_ID_BAD.test(id) && id.normalize('NFKC') === id;
-/** 票の id の宣言 { prefix, digits: [最小, 最大] } を、線形時間の照合関数にする。正規表現は利用者から受けない */
-function ticketMatcher(spec) {
-  if (!isObj(spec) || Object.keys(spec).some((k) => k !== 'prefix' && k !== 'digits')) return null;
-  const { prefix, digits } = spec;
-  if (typeof prefix !== 'string' || !/^[A-Za-z][A-Za-z0-9._-]{0,15}$/.test(prefix)) return null;
-  if (!Array.isArray(digits) || digits.length !== 2 || !isInt(digits[0], 1, 12) || !isInt(digits[1], 1, 12) || digits[0] > digits[1]) return null;
-  const [lo, hi] = digits;
-  return (id) => {
-    if (!id.startsWith(prefix)) return false;
-    const n = id.length - prefix.length;
-    if (n < lo || n > hi) return false;
-    for (let i = prefix.length; i < id.length; i += 1) { const c = id.charCodeAt(i); if (c < 48 || c > 57) return false; }
-    return true;
-  };
-}
-const DEFAULT_TICKET = ticketMatcher({ prefix: 'T-', digits: [3, 4] });
+/** 票の id の宣言 { prefix, digits: [最小, 最大] } を照合関数にする（vocab の makeWorkItemId。線形時間。正規表現は利用者から受けない） */
+const ticketMatcher = (spec) => makeWorkItemId(spec);
+const DEFAULT_TICKET = makeWorkItemId(DEFAULT_WORK_ITEM);
 const RELEASE_V1 = /^REL-[A-Za-z0-9][A-Za-z0-9._-]{0,38}$/; // tr.v1 の release の id（大文字小文字を区別しない綴りを許していた）
 /**
  * id の書式の検査（safeId ＋ kind ごとの固定の書式）。ticket は cfg.ticketMatch で差し替わる。
@@ -199,16 +193,8 @@ function idOk(kind, id, cfg) {
   return !!re && re.test(id);
 }
 
-/** 秒までのタイムゾーンつきの時刻の文字列 → ミリ秒（取り込み用。解釈できなければ null。現在時刻は使わない） */
-export function parseTs(s) {
-  const m = typeof s === 'string' ? /^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.\d+)?(Z|[+-]\d\d:?\d\d)$/.exec(s) : null;
-  if (!m) return null;
-  const [, y, mo, d, h, mi, se, tz] = m;
-  let off = 0;
-  if (tz !== 'Z') { const sign = tz[0] === '-' ? -1 : 1; const t = tz.slice(1).replace(':', ''); off = sign * (Number(t.slice(0, 2)) * 60 + Number(t.slice(2))); }
-  const ms = Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(se)) - off * 60000;
-  return Number.isFinite(ms) ? ms : null;
-}
+/** 時刻 → ミリ秒（lib/vocab.mjs の parseTs。秒まで必須・時差は Z か ±HH:MM。読めなければ null） */
+export const parseTs = vocabParseTs;
 
 // ---- 状態 ----
 
@@ -303,7 +289,7 @@ function applyLink(st, r, input) {
   const entry = {
     seq: r.seq, rules: r.rules ?? null, rel: input.rel, from: { kind: f.kind, id: f.id, digest: f.digest ?? null }, to: { kind: t.kind, id: t.id, digest: t.digest ?? null },
     fk, tk, key, evidence: input.evidence === undefined ? null : clone(input.evidence), note: input.note === undefined ? null : input.note,
-    actor: { kind: r.actor.kind, role: r.actor.role, id: r.actor.id }, at: typeof r.at === 'string' ? r.at : null, retracted: null,
+    actor: normActor(r.actor), at: typeof r.at === 'string' ? r.at : null, retracted: null,
   };
   st.links.push(entry); st.bySeq.set(r.seq, idx); st.active.set(key, idx);
   nodeTouch(st, f, fk, f.digest ?? null, 1); nodeTouch(st, t, tk, t.digest ?? null, 1);
@@ -312,7 +298,7 @@ function applyLink(st, r, input) {
 }
 function applyRetract(st, r) {
   const idx = st.bySeq.get(r.target_seq); const l = st.links[idx];
-  l.retracted = { seq: r.seq, actor: { kind: r.actor.kind, role: r.actor.role, id: r.actor.id }, reason: r.reason, at: typeof r.at === 'string' ? r.at : null };
+  l.retracted = { seq: r.seq, actor: normActor(r.actor), reason: r.reason, at: typeof r.at === 'string' ? r.at : null };
   st.active.delete(l.key); st.retractedKeys.add(l.key);
   nodeTouch(st, l.from, l.fk, l.from.digest, -1); nodeTouch(st, l.to, l.tk, l.to.digest, -1);
   const g = cycGroup(l.rel); if (g && l.fk !== l.tk && st.cyc) cycDel(st, g, l.fk, l.tk);
@@ -382,16 +368,21 @@ function replayWith(records, config, o, pk) {
     if (!isObj(r) || r.type !== RECORD_TYPE || !WRITE_OPS.includes(r.op) || !Number.isSafeInteger(r.seq)) { reject(r, '知らない行'); return; }
     const current = r.rules === RULES;
     if (!current && i >= covered) { st.meta.uncoveredLegacy += 1; reject(r, `規則の版が今（${RULES}）と違う（${String(r.rules).slice(0, 20)}）。オーナーの移行の記録（epoch）が要る`); return; }
+    // 設定の写し（tr.v3）：今の版の行は、書いた時の票の ID の宣言が開く側の宣言と同じでなければ状態に入れない（覆われていない古い版の行と同じ扱い）。
+    // オーナーの epoch に覆われた行は、その行の写しの宣言で確かめる（開き方で過去の行の扱いを変えない）
+    const rowSpec = isObj(r.cfg) && Object.keys(r.cfg).every((k) => k === 'ticket_id') ? parseWorkItemSpec(r.cfg.ticket_id) : null;
+    if (current && r.op !== 'epoch' && i >= covered && !sameWorkItemSpec(rowSpec, ticketSpecOf(cfg))) { st.meta.uncoveredLegacy += 1; reject(r, '設定の写し（cfg.ticket_id）が開く側の票の ID の宣言と違う（書いた時と別の設定で開いている）。オーナーの移行の記録（epoch）が要る'); return; }
+    const rowCfg = i < covered && rowSpec ? { ...(r.rules === 'tr.v1' ? v1cfg : cfg), ticketMatch: makeWorkItemId(rowSpec) } : (!current && r.rules === 'tr.v1' ? v1cfg : cfg);
     const actor = snapshot(r.actor); const input = inputOf(r);
     if (!actorOk(actor)) { reject(r, '行為者の形が合わない'); return; }
-    const ctx = { op: r.op, actor, input: snapshot(input), state: st, chain: { ok: true }, config: !current && r.rules === 'tr.v1' ? v1cfg : cfg };
+    const ctx = { op: r.op, actor, input: snapshot(input), state: st, chain: { ok: true }, config: rowCfg };
     if (r.op === 'epoch') {
       const res = check(ctx, guards.filter((g) => g !== 'TR-RETRACT-TARGET'));
       const c = isObj(r.covers) ? r.covers.count : null;
       const okCover = current && Number.isSafeInteger(c) && c === i && r.covers.last_hash === (c === 0 ? 'genesis' : (records[c - 1] || {}).hash);
       if (!res.ok) { reject(r, res.violations.map((v) => v.guard).join('・')); return; }
       if (current && !okCover) { reject(r, '移行の記録の覆う範囲が、その前の行と一致しない'); return; }
-      st.epochs.push({ seq: r.seq, actor: { kind: actor.kind, role: actor.role, id: actor.id }, reason: r.reason, covers: clone(r.covers), at: r.at ?? null });
+      st.epochs.push({ seq: r.seq, actor: normActor(actor), reason: r.reason, covers: clone(r.covers), at: r.at ?? null });
       return;
     }
     const res = check(ctx, current ? guards : noCycle(ROOT_GUARDS[r.op]));
@@ -444,6 +435,21 @@ function evidenceProblem(e) {
   return null;
 }
 
+/**
+ * evidence の値の検査（tr.v3。書く時に拒む）：at は vocab の時刻の形、result はつながりの種類ごとの結論の名前（vocab）だけ。
+ *   判定 → 申請（verifies）：APPROVED・CHANGES_REQUIRED・UNAVAILABLE。監査 → 申請：passed・failed・not_run。裁定 → 申請（approves）：merge。
+ *   ほかのつながりは result を持てない（読む側が「不明」に倒すだけの綴りの誤りを、記録に入れさせない）
+ */
+function evidenceValueProblem(i) {
+  const e = i.evidence;
+  if (e.at !== undefined && vocabParseTs(e.at) === null) return 'evidence.at が時刻の形（秒まで・時差は Z か ±HH:MM）でない';
+  if (e.result === undefined) return null;
+  const fk = isObj(i.from) ? i.from.kind : null;
+  const allowed = i.rel === 'verifies' && fk === 'verdict' ? VERDICTS : i.rel === 'verifies' && fk === 'audit' ? AUDIT_RESULTS : i.rel === 'approves' && fk === 'ruling' ? ['merge'] : null;
+  if (!allowed) return `このつながり（${String(fk)} -${String(i.rel)}->）は evidence.result を持てない`;
+  return allowed.includes(e.result) ? null : `evidence.result が ${allowed.join('・')} のどれでもない：${String(e.result).slice(0, 30)}`;
+}
+
 /** 名前 → (ctx) => null | string（違反の理由。日本語） */
 export const GUARDS = {
   'TR-CHAIN-INTACT': (ctx) => (ctx.chain && ctx.chain.ok ? null : `記録の鎖が壊れている（${ctx.chain && ctx.chain.code}）`),
@@ -452,18 +458,21 @@ export const GUARDS = {
 
   'TR-ACTOR-SHAPE': (ctx) => {
     if (ctx.op === 'query') return null;
-    return actorOk(ctx.actor) ? null : '行為者が { kind: human|ai|script, role: ^[a-z][a-z0-9_]{0,39}$, id: ^[a-z0-9][a-z0-9_.-]{0,63}$ } の形でない（空白・全角・ゼロ幅文字・大文字を含む）';
+    const a = parseActor(ctx.actor);
+    return a.ok ? null : `行為者が vocab の形（{ role, kind, id, lineage }。役割は表の名前、種類は役割と合う）でない：${a.errors[0]}`;
   },
 
   'TR-WRITER-ALLOWED': (ctx) => {
     if (ctx.op === 'query' || !actorOk(ctx.actor)) return null;
-    if (ctx.actor.kind === 'script' || isOwner(ctx.actor)) return null;
-    return `書けるのは script とオーナー（human・owner）だけ。${ctx.actor.kind}・${ctx.actor.role} は書けない（成果物を作る側が自分のつながりを作れない）`;
+    const a = normActor(ctx.actor);
+    if (a.kind === 'script' || isOwner(a)) return null;
+    return `書けるのは script とオーナー（human・owner）だけ。${a.kind}・${a.role} は書けない（成果物を作る側が自分のつながりを作れない）`;
   },
 
   'TR-SCRIPT-ROLE': (ctx) => {
-    if (ctx.op === 'query' || !actorOk(ctx.actor) || ctx.actor.kind !== 'script') return null;
-    return SCRIPT_ROLES.includes(ctx.actor.role) ? null : `script の役割が許可リスト（${SCRIPT_ROLES.join('・')}）にない：${ctx.actor.role}`;
+    const a = ctx.op === 'query' ? null : normActor(ctx.actor);
+    if (!a || a.kind !== 'script') return null;
+    return SCRIPT_ROLES.includes(a.role) ? null : `script の役割が許可リスト（${SCRIPT_ROLES.join('・')}）にない：${a.role}`;
   },
 
   'TR-INPUT-SHAPE': (ctx) => {
@@ -475,7 +484,7 @@ export const GUARDS = {
       for (const k of ['from', 'to']) if (!refOk(i[k])) return `${k} が { kind, id, digest? } の形でない`;
       if (typeof i.rel !== 'string') return 'rel が文字列でない';
       if (i.note !== undefined && !cleanText(i.note, MAX_NOTE)) return `note が 1〜${MAX_NOTE} 字の文字列でない（制御文字・ゼロ幅文字を含む）`;
-      if (i.evidence !== undefined) return evidenceProblem(i.evidence);
+      if (i.evidence !== undefined) return evidenceProblem(i.evidence) || evidenceValueProblem(i);
       return null;
     }
     if (ctx.op === 'retract') {
@@ -511,7 +520,7 @@ export const GUARDS = {
     for (const r of refsOf(ctx)) {
       if (!KIND_SET.has(r.kind)) continue;
       if (!idOk(r.kind, r.id, ctx.config)) return `${r.kind} の id が書式に合わない（制御文字・ゼロ幅文字・空白・128字超・kind ごとの形）：${r.id.slice(0, 40)}`;
-      if (r.digest !== undefined && !SHA256.test(r.digest)) return `digest が sha256:<64桁の16進> でない：${r.digest.slice(0, 20)}`;
+      if (r.digest !== undefined && !isDigest(r.digest)) return `digest が sha256:<64桁の16進> でない：${r.digest.slice(0, 20)}`;
     }
     return null;
   },
@@ -530,7 +539,7 @@ export const GUARDS = {
   'TR-DIGEST-CONSISTENT': (ctx) => {
     for (const r of refsOf(ctx)) {
       if ((r.kind === 'verdict' || r.kind === 'audit') && r.digest === undefined && /-[0-9a-f]{8}$/.test(r.id) && idOk(r.kind, r.id, ctx.config)) return `${r.kind} の id に指紋（8桁）があるのに digest がない`;
-      if (!KIND_SET.has(r.kind) || r.digest === undefined || !SHA256.test(r.digest)) continue;
+      if (!KIND_SET.has(r.kind) || r.digest === undefined || !isDigest(r.digest)) continue;
       if (!idOk(r.kind, r.id, ctx.config)) continue;
       if (ID_IS_DIGEST.has(r.kind) && r.digest !== r.id) return `${r.kind} は id が指紋なので、digest は id と同じでなければならない`;
       // 判定・監査の節の id の末尾8桁は、内容の指紋（digest）の先頭8桁（sha256: の後）と一致しなければならない（F4 の残り。8桁を付けるなら digest も要る）
@@ -730,7 +739,6 @@ function expectedList(v, kind, config) {
 // 申請が2つ以上の仕様に結び付くときは ambiguous（未確定）。
 const VERDICT_RANK = { CHANGES_REQUIRED: 2, unknown: 1, APPROVED: 0 };
 const AUDIT_RANK = { failed: 3, not_run: 2, unknown: 1, passed: 0 };
-const VERDICT_MODE = /^VRD-[0-9a-f]{12}-(judge|codex-judge|codex-security|codex-ux)(?:-[0-9a-f]{8})?$/;
 /** つながりの時刻：evidence.at。なければ、tr.v1 の行に限り記録の at（鎖の時刻）で代用する（v1 は at を必須にしていなかった。N6）。v2 の行は evidence.at が必須 */
 const timeOf = (l) => { const t = l.evidence ? parseTs(l.evidence.at) : null; return t !== null ? t : (l.rules === 'tr.v1' ? parseTs(l.at) : null); };
 function resultOf(l, rank) {
@@ -764,7 +772,7 @@ function analyze(st) {
         if (!e.no_codex) { required.push('codex-judge'); if (e.security_required) required.push('codex-security'); }
       }
       const byMode = new Map();
-      for (const l of activeIn(st, rk, 'verifies', 'verdict')) { const m = VERDICT_MODE.exec(l.from.id); const k = m ? m[1] : 'unknown_mode'; (byMode.get(k) || byMode.set(k, []).get(k)).push(resultOf(l, VERDICT_RANK)); }
+      for (const l of activeIn(st, rk, 'verifies', 'verdict')) { const m = parseVerdictId(l.from.id); const k = m ? m.mode : 'unknown_mode'; (byMode.get(k) || byMode.set(k, []).get(k)).push(resultOf(l, VERDICT_RANK)); }
       const entries = [...byMode].map(([mode, list]) => ({ mode, ...latestOf(list, VERDICT_RANK) }));
       const missing = required ? required.filter((m) => !byMode.has(m)) : [];
       for (const m of missing) entries.push({ mode: m, result: 'unknown', at: null }); // 必須の種類がなければ、結論が不明（承認に数えない）
@@ -960,6 +968,11 @@ export function gapsOf(st, opt = {}, config = {}) {
 
 // ---- 記録を開く ----
 
+/** 開く側の票の ID の宣言（設定がなければ既定） */
+const ticketSpecOf = (cfg) => (cfg && cfg.ticketMatch && cfg.ticketMatch.spec) || DEFAULT_WORK_ITEM;
+/** 行に残す設定の写し（tr.v3） */
+const cfgCopy = (cfg) => { const t = ticketSpecOf(cfg); return { ticket_id: { prefix: t.prefix, digits: [t.digits[0], t.digits[1]] } }; };
+
 function validConfig(opt) {
   const o = opt || {};
   let maxLinks = DEFAULT_MAX_LINKS;
@@ -998,7 +1011,7 @@ export function openTrace(file, opt = {}) {
       const ctx = buildContext({ records, op, actor, input, config, state: op === 'epoch' ? undefined : stateOf(records) });
       const r = check(ctx); // 全ガード（絞らない）
       if (!r.ok) { const e = new Refused('guard_violation', r.violations.map((v) => `${v.guard}: ${v.reason}`).join(' / ')); e.violations = r.violations; throw e; }
-      Object.assign(body, { rules: RULES, actor: { kind: ctx.actor.kind, role: ctx.actor.role, id: ctx.actor.id } }, makeBody(ctx, records));
+      Object.assign(body, { rules: RULES, cfg: cfgCopy(config), actor: normActor(ctx.actor) }, makeBody(ctx, records));
     });
     return rec;
   }
@@ -1078,7 +1091,7 @@ export function openTrace(file, opt = {}) {
 //   tickets：main の票の front matter から取った { id, requirements:[..], depends_on:[..] }（spec-digest.mjs:63-77 の list の読み方）
 // checkpoints.jsonl（gate-runner.sh:503）は鎖の切り詰めの検出用で、つながりを持たないので読まない。
 
-const SHA40 = /^[0-9a-f]{40}$/;
+const SHA40 = { test: isGitSha }; // Kernel の記録は Git の SHA（40桁）
 const HEX12 = /^[0-9a-f]{12}$/;
 const STATELESS = ['TR-INPUT-SHAPE', 'TR-KIND-ALLOWLIST', 'TR-ID-FORMAT', 'TR-REL-ALLOWLIST', 'TR-REL-KIND-PAIR', 'TR-NO-SELF'];
 const VERDICT_NAME = /^(.{1,64})-([0-9a-f]{12})(?:-codex-(judge|security|ux))?\.json$/; // 票の部分は、あとで ticketId の宣言で確かめる
@@ -1122,6 +1135,9 @@ export function linksFromEvidence(ev, opt = {}) {
   };
   const dig = (row) => { try { return digest(row); } catch { return null; } };
 
+  // Kernel の記録の時刻（date +%z の +0900）は、vocab の形（+09:00）に写してから読む・書く（kernelTsToIso）
+  const kts = (x) => kernelTsToIso(x);
+  const kms = (x) => { const t = kernelTsToIso(x); return t === null ? null : parseTs(t); };
   const approvals = arr('approvals'); const held = arr('held'); const events = arr('gateEvents'); const verdicts = arr('verdicts');
   const rulings = arr('rulings'); const acceptance = arr('acceptance'); const tickets = arr('tickets');
 
@@ -1148,14 +1164,14 @@ export function linksFromEvidence(ev, opt = {}) {
   approvals.forEach((r, i) => {
     if (!isObj(r) || r.schema !== 'vgdd.spec-approval.v1') return skip('approvals', i, '知らない schema（vgdd.spec-approval.v1 でない）', r);
     if (r.approved_by !== 'owner') return skip('approvals', i, 'approved_by が owner でない', r);
-    const ms = parseTs(r.ts);
+    const ms = kms(r.ts);
     if (typeof r.task !== 'string' || typeof r.digest !== 'string' || ms === null) return skip('approvals', i, 'task・digest・ts のどれかが文字列・時刻として読めない', r);
     const ad = dig(r); if (!ad) return skip('approvals', i, '正規形にできない', r);
     const spec = { kind: 'spec', id: r.digest, digest: r.digest }; const ticket = { kind: 'ticket', id: r.task };
-    const evd = { source: 'spec_approvals.jsonl', at: r.ts, ...(typeof r.policy_line === 'string' && /^p\d+\.\d+$/.test(r.policy_line) ? { policy_line: r.policy_line } : {}) };
-    if (!emit('approvals', i, spec, ticket, 'specifies', { source: 'spec_approvals.jsonl', at: r.ts }, r)) return undefined;
+    const evd = { source: 'spec_approvals.jsonl', at: kts(r.ts), ...(isPolicyLine(r.policy_line) ? { policy_line: r.policy_line } : {}) };
+    if (!emit('approvals', i, spec, ticket, 'specifies', { source: 'spec_approvals.jsonl', at: kts(r.ts) }, r)) return undefined;
     if (!emit('approvals', i, { kind: 'approval', id: ad, digest: ad }, spec, 'approves', evd, r, r.note === undefined || r.note === '' ? undefined : sane(r.note))) return undefined;
-    (approvalsByTask.get(r.task) || approvalsByTask.set(r.task, []).get(r.task)).push({ ms, i, digest: r.digest, ts: r.ts });
+    (approvalsByTask.get(r.task) || approvalsByTask.set(r.task, []).get(r.task)).push({ ms, i, digest: r.digest, ts: kts(r.ts) });
     return undefined;
   });
 
@@ -1181,7 +1197,7 @@ export function linksFromEvidence(ev, opt = {}) {
   const heldByCand = new Map();
   held.forEach((r, i) => {
     if (!isObj(r) || typeof r.task !== 'string' || typeof r.request !== 'string' || !SHA40.test(r.request) || typeof r.candidate !== 'string' || !SHA40.test(r.candidate)) return skip('held', i, 'task・request・candidate（40桁）が読めない', r);
-    const ms = parseTs(r.ts); if (ms === null) return skip('held', i, 'ts が読めない', r);
+    const ms = kms(r.ts); if (ms === null) return skip('held', i, 'ts が読めない', r);
     noteReq(r.task, r.request);
     const key = r.candidate.slice(0, 12);
     (heldByCand.get(key) || heldByCand.set(key, []).get(key)).push({ task: r.task, request: r.request, i });
@@ -1202,10 +1218,10 @@ export function linksFromEvidence(ev, opt = {}) {
 
   // 3 裁定：ruling -approves-> request
   rulings.forEach((r, i) => {
-    if (!isObj(r) || r.by !== 'owner' || r.decision !== 'merge' || typeof r.sha !== 'string' || !SHA40.test(r.sha) || typeof r.task !== 'string' || parseTs(r.ts) === null) return skip('rulings', i, 'by:owner・decision:merge・sha（40桁）・task・ts のどれかが合わない', r);
+    if (!isObj(r) || r.by !== 'owner' || r.decision !== 'merge' || typeof r.sha !== 'string' || !SHA40.test(r.sha) || typeof r.task !== 'string' || kms(r.ts) === null) return skip('rulings', i, 'by:owner・decision:merge・sha（40桁）・task・ts のどれかが合わない', r);
     const d = dig(r); if (!d) return skip('rulings', i, '正規形にできない', r);
     noteReq(r.task, r.sha);
-    return emit('rulings', i, { kind: 'ruling', id: `RUL-${d.slice(7, 23)}`, digest: d }, { kind: 'request', id: r.sha }, 'approves', { source: 'rulings.jsonl', at: r.ts, result: 'merge' }, r, typeof r.reason === 'string' ? sane(r.reason) : undefined);
+    return emit('rulings', i, { kind: 'ruling', id: `RUL-${d.slice(7, 23)}`, digest: d }, { kind: 'request', id: r.sha }, 'approves', { source: 'rulings.jsonl', at: kts(r.ts), result: 'merge' }, r, typeof r.reason === 'string' ? sane(r.reason) : undefined);
   });
 
   // 4 判定の記録のファイル：verdict -verifies-> request、audit -verifies-> request
@@ -1220,7 +1236,7 @@ export function linksFromEvidence(ev, opt = {}) {
     const req = resolveRequest(task, head);
     if (!req) return skip('verdicts', i, '申請の完全な SHA を決められない（同じ票の held の candidate・申請と前方一致しない、または複数ある）', { name: v.name });
     const vd = dig(c); if (!vd) return skip('verdicts', i, '正規形にできない', { name: v.name });
-    const base = { source: `verdicts/${v.name}`.slice(0, MAX_STR), mode, ...(parseTs(c.collected_at) !== null ? { at: c.collected_at } : {}) }; // 最新の結論を決める時刻（なければ厳しい側）
+    const base = { source: `verdicts/${v.name}`.slice(0, MAX_STR), mode, ...(kms(c.collected_at) !== null ? { at: kts(c.collected_at) } : {}) }; // 最新の結論を決める時刻（なければ厳しい側）
     if (!emit('verdicts', i, { kind: 'verdict', id: `VRD-${head}-${mode}-${vd.slice(7, 15)}`, digest: vd }, { kind: 'request', id: req }, 'verifies', { ...base, result: c.final_verdict }, { name: v.name })) return undefined;
     if (mode === 'judge' && ['passed', 'failed', 'not_run'].includes(c.deterministic_audits)) {
       const ad = dig({ audit: c.deterministic_audits, verdict_file: vd });
@@ -1233,7 +1249,7 @@ export function linksFromEvidence(ev, opt = {}) {
   events.forEach((r, i) => {
     if (!isObj(r) || typeof r.type !== 'string') return skip('gateEvents', i, 'type が読めない', r);
     if (r.type !== 'merged') { ignoredEvents[r.type.slice(0, 40)] = (ignoredEvents[r.type.slice(0, 40)] || 0) + 1; return undefined; }
-    if (typeof r.task !== 'string' || typeof r.main !== 'string' || parseTs(r.ts) === null) return skip('gateEvents', i, 'merged の task・main・ts が読めない', r);
+    if (typeof r.task !== 'string' || typeof r.main !== 'string' || kms(r.ts) === null) return skip('gateEvents', i, 'merged の task・main・ts が読めない', r);
     const key = typeof r.candidate === 'string' && HEX12.test(r.candidate) ? r.candidate : r.main.slice(0, 12); // release は candidate、gate-runner の直接の統合は main が候補と同じ
     const req = resolveRequest(r.task, key);
     const mainFull = SHA40.test(r.main) ? r.main : (HEX12.test(r.main) ? uniq(mergeFull, r.main) : null);
@@ -1243,14 +1259,14 @@ export function linksFromEvidence(ev, opt = {}) {
         reason: !mainFull ? '統合のコミットの完全な SHA を決められない（12桁だけ。受け入れの記録・shaIndex から1つに決まらない）' : '申請の完全な SHA を決められない' });
       return undefined;
     }
-    return emit('gateEvents', i, { kind: 'merge', id: mainFull }, { kind: 'request', id: req }, 'integrates', { source: 'gate_events.jsonl', at: r.ts, via: r.via === 'release' ? 'release' : 'gate_runner' }, r);
+    return emit('gateEvents', i, { kind: 'merge', id: mainFull }, { kind: 'request', id: req }, 'integrates', { source: 'gate_events.jsonl', at: kts(r.ts), via: r.via === 'release' ? 'release' : 'gate_runner' }, r);
   });
 
   // 6 受け入れ：acceptance -approves-> merge
   acceptance.forEach((r, i) => {
-    if (!isObj(r) || typeof r.merge !== 'string' || !SHA40.test(r.merge) || typeof r.task !== 'string' || parseTs(r.ts) === null) return skip('acceptance', i, 'merge（40桁）・task・ts が読めない', r);
+    if (!isObj(r) || typeof r.merge !== 'string' || !SHA40.test(r.merge) || typeof r.task !== 'string' || kms(r.ts) === null) return skip('acceptance', i, 'merge（40桁）・task・ts が読めない', r);
     const d = dig(r); if (!d) return skip('acceptance', i, '正規形にできない', r);
-    return emit('acceptance', i, { kind: 'acceptance', id: `ACC-${d.slice(7, 23)}`, digest: d }, { kind: 'merge', id: r.merge }, 'approves', { source: 'acceptance.jsonl', at: r.ts }, r);
+    return emit('acceptance', i, { kind: 'acceptance', id: `ACC-${d.slice(7, 23)}`, digest: d }, { kind: 'merge', id: r.merge }, 'approves', { source: 'acceptance.jsonl', at: kts(r.ts) }, r);
   });
 
   // 7 票：ticket -satisfies-> requirement、ticket -depends_on-> ticket

@@ -20,7 +20,10 @@
 //     包含の判定は文字どおり（厳しい側）。シンボリックリンク・ハードリンクで同じ実体を指す場合は見ない
 //   - metrics.conflicts は参考の数で、作業量の上限を超えたら途中までの数（conflicts_truncated: true）
 
-export const STATUSES = ['ready', 'in_progress', 'review', 'held', 'merged', 'blocked'];
+import { STATUSES as VOCAB_STATUSES } from './lib/vocab.mjs';
+
+/** 状態の名前（lib/vocab.mjs の STATUSES） */
+export const STATUSES = VOCAB_STATUSES;
 export const MAX_NODES = 2000;
 const MAX_ID = 128;
 const MAX_RES = 64;

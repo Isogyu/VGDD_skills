@@ -40,8 +40,8 @@ export const SCENARIOS = [
     run: run(mut((p) => { p.capabilities = { worker: { can_merge: true } }; p.budget = { workers: 99 }; p.stop = { disabled: true }; })) },
   { id: 'DP-A12', kind: 'attack', title: '未知の最上位の欄', expectGuards: ['DP-UNKNOWN-FIELD'],
     run: run(mut((p) => { p.auto_approve = true; })) },
-  { id: 'DP-A13', kind: 'attack', title: '読めない id_pattern', expectGuards: ['DP-ID-PATTERN'],
-    run: run(mut((p) => { p.work_item.id_pattern = '^T-[0-9{3,4}$('; })) },
+  { id: 'DP-A13', kind: 'attack', title: '読めない票の ID の宣言（digits が 1 つだけ）', expectGuards: ['DP-WORK-ITEM-ID'],
+    run: run(mut((p) => { p.work_item.id = { prefix: 'T-', digits: [3] }; })) },
   { id: 'DP-A14', kind: 'attack', title: '形が違うパック（schema の版が違う）', expectGuards: ['DP-SHAPE'],
     run: run(mut((p) => { p.schema = 'vgdd.domain-pack.v0'; })) },
   { id: 'DP-A15', kind: 'attack', title: 'パックがオブジェクトでない', expectGuards: ['DP-SHAPE'],
@@ -95,13 +95,14 @@ A('DP-A43', 'B-F16: 入れ子の judiciary.roles', ['DP-FORBIDDEN-FIELD'], (p) =
 A('DP-A44', 'B-F16: 入れ子の audits[0].permissions', ['DP-FORBIDDEN-FIELD'], (p) => { p.audits[0].permissions = ['all']; });
 A('DP-A45', 'B-F16: 入れ子の work_item.budget・artifact.hooks・lifecycle[0].Owner', ['DP-FORBIDDEN-FIELD'], (p) => { p.work_item.budget = 1e9; p.artifact.hooks = ['x']; p.lifecycle[0].Owner = 'x'; });
 A('DP-A46', 'B-F16: 入れ子の未知の欄（judiciary.auto_pass）', ['DP-UNKNOWN-FIELD'], (p) => { p.judiciary.auto_pass = true; p.audits[0].timeout_override = 1; });
-A('DP-A47', 'B-F16: id_pattern の ReDoS（入れ子の量指定子）', ['DP-ID-PATTERN'], (p) => { p.work_item.id_pattern = '^((a+))+$'; });
-A('DP-A48', 'B-F16: id_pattern が許可された構文の外（括弧・+・. ・アンカーなし）', ['DP-ID-PATTERN'], (p) => { p.work_item.id_pattern = '^(a+)+$'; });
-A('DP-A49', 'B-F16: id_pattern にアンカーがない／長すぎる', ['DP-ID-PATTERN'], (p) => { p.work_item.id_pattern = `T-[0-9]{3}${'a'.repeat(80)}`; });
+A('DP-A47', 'B-F16: 票の ID の宣言の prefix に正規表現（ReDoS の形）を入れる', ['DP-WORK-ITEM-ID'], (p) => { p.work_item.id = { prefix: '^((a+))+$', digits: [3, 4] }; });
+A('DP-A48', 'B-F16: 票の ID の宣言の桁数が範囲の外（0〜99・逆順）', ['DP-WORK-ITEM-ID'], (p) => { p.work_item.id = { prefix: 'T-', digits: [0, 99] }; });
+A('DP-A49', 'B-F16: 票の ID の宣言の prefix が長すぎる・知らない欄（pattern）を足す', ['DP-WORK-ITEM-ID'], (p) => { p.work_item.id = { prefix: `T${'a'.repeat(80)}-`, digits: [3, 4], pattern: '.*' }; });
+A('DP-A52', '語彙：廃止した id_pattern（正規表現）で票の ID を宣言する', ['DP-UNKNOWN-FIELD'], (p) => { delete p.work_item.id; p.work_item.id_pattern = '^T-[0-9]{3,4}$'; });
 A('DP-A50', 'B-F16: 「ないとは言えない」型の見せかけの公開', ['DP-DISCLOSE-NO-AUDIT'], (p) => { p.audits = []; p.disclosures = ['決定論的な監査があるので、ないとは言えない']; });
 A('DP-A51', 'B-F16: lifecycle の段の名前が空・重複', ['DP-SHAPE'], (p) => { p.lifecycle[0].stage = ''; p.lifecycle[1].stage = p.lifecycle[2].stage; });
 
 B('DP-B5', 'B-F7: node のスクリプト（引数つき）の監査は許可リストの範囲で通る', cmd(['node', 'tools/check.mjs', '--max-chars', '20000']));
 B('DP-B6', 'B-F5: 許可リストの入力（requirements・document_diff・source_list）', (p) => { p.judiciary.inputs = ['diff', 'requirements', 'document_diff', 'source_list', 'source_excerpts']; });
 B('DP-B7', 'B-F6: 核に足して保護を広げる（dir/** と prefix*）', (p) => { p.protected.push('docs/laws/**', 'secrets*', 'config/prod.json'); });
-B('DP-B8', 'B-F16: 許可された id_pattern（固定の量指定子・文字クラス）', (p) => { p.work_item.id_pattern = '^[A-Z]{1,3}-[0-9]{3,4}$'; });
+B('DP-B8', 'B-F16: 許可された票の ID の宣言（別の prefix・桁数）', (p) => { p.work_item.id = { prefix: 'ABC-', digits: [2, 6] }; });

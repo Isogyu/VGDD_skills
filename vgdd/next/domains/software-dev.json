@@ -3,7 +3,7 @@
   "id": "software-dev",
   "title": "システム開発（今の VGDD の実装が前提にしていること）",
   "work_item": {
-    "id_pattern": "^T-[0-9]{3,4}$",
+    "id": { "prefix": "T-", "digits": [3, 4] },
     "store": "docs/tasks",
     "spec_sections": ["受け入れ条件"],
     "resource_field": "files_allowed"
