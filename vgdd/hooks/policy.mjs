@@ -53,6 +53,12 @@
 //   - リポジトリの外の読み取り専用（準備資料・作業記録）を Z3 の kernel.config.json から読む。なければ今までの2つ。読めない・形が違えば、すべて拒否
 //   - 既定と違う場所の Z3 では、フックの登録で VGDD_Z3_DIR を渡す（vgdd-setup.mjs render-settings が書く）
 //
+// p0.4.16 の変更点（入れ子の起動。2026-11-14 に Claude Code の公式の文書で確かめた弱点。実機では確かめていない）：
+//   - Bash のコマンドの中の claude・codex の CLI の起動を、どの役割からも拒む（judgeAgentCli。p0.4.10 の --agent worker|tester の拒否を広げた）。
+//     入れ子の claude（--bare・--settings '{"disableAllHooks":true}'・-p）は外側の sandbox の中で動くが、このフックと予算の台帳を通らないため。
+//     ほかの規則が通したコマンドにだけかける（既定の配置で、判定は止める側にだけ変わる）
+//   - ユーザーの ~/.claude/CLAUDE.md（すべてのセッションに読まれる指示）への書き込みも、ユーザー設定として拒む
+//
 // 保証できないこと（README に明記する）：
 //   - Bash の判定は文字列照合。パスの分割・変数展開・別名による回避は完全には防げない。書き込みは sandbox の denyWrite で補う
 //   - 人が承認画面で「許可」を押した操作は止められない（記録は残る）
@@ -65,7 +71,7 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 
-const POLICY_VERSION = 'p0.4.15'; // OBS-013（リンクの実体で判定、作業員の閉じ込め）、OBS-014（誤検知4件の修正）、Kernel の停止（ADR-027）、移植（p0.4.15）を含む
+const POLICY_VERSION = 'p0.4.16'; // OBS-013（リンクの実体で判定、作業員の閉じ込め）、OBS-014（誤検知4件の修正）、Kernel の停止（ADR-027）、移植（p0.4.15）、入れ子の起動の拒否（p0.4.16）を含む
 const HOME = os.homedir();
 const DEFAULT_Z3_NAME = 'tsubuyaki-z3';
 const Z3 = process.env.VGDD_Z3_DIR || path.join(HOME, DEFAULT_Z3_NAME);
@@ -328,6 +334,7 @@ function isUserConfig(absPath) {
     [path.join(HOME, '.claude', 'settings.json'), 'ユーザー設定 ~/.claude/settings.json'],
     [path.join(HOME, '.claude', 'settings.local.json'), 'ユーザー設定 ~/.claude/settings.local.json'],
     [path.join(HOME, '.claude.json'), 'ユーザー設定 ~/.claude.json'],
+    [path.join(HOME, '.claude', 'CLAUDE.md'), 'ユーザーの指示 ~/.claude/CLAUDE.md'],   // p0.4.16
   ];
   for (const [t, label] of targets) if (p === t) return label;
   for (const [d, label] of [
@@ -757,6 +764,203 @@ function judgeBash(command, git, agentType, cwd, projectDir, confine) {
   return { decision: 'allow', reason: `保護パス（${labels}）への読み取り専用コマンド` };
 }
 
+// ---- p0.4.16：AI の役割による claude・codex の CLI の起動の拒否（入れ子の起動でフックの層を外させない） --------------------------
+// 入れ子の claude（--bare・--settings '{"disableAllHooks":true}'・-p など）・codex は、外側の OS の sandbox の中では動くが、このフック（判定と
+//   証拠の記録・役割の閉じ込め・main への統合の照合）と予算の台帳（metered.sh）を通らないエージェントになる。そのため、Bash のコマンドの中の
+//   claude・codex の起動を、どの役割からも拒む（このフックを通るのは AI の役割だけ。裁判所・夜間の代行・朝刊などのオーナーのスクリプトはフックの外）。
+//   起動しない扱い（読み取り専用の先頭のコマンドの引数として名前が現れるだけ：cat・grep・ls・echo・which・type・command -v・git log など）は通す。
+//   --version・--help・doctor・update も起動として拒む（行政が版を知る必要はない。doctor・update は設定や本体を変えうる）。
+//   見る形：先頭の語（パスつき・大文字・引用符やバックスラッシュで分けた名前・代入の値・3字以上の字が決まったグロブを含む）、npx・npm exec などの
+//   パッケージの名前（@anthropic-ai/claude-code・@openai/codex）、env・command・exec・nohup・xargs などで包んだ形、$(…)・`…`・<(…) の中、
+//   シェルとスクリプトの言語（sh -c・bash -c・eval・node -e・python3 -c など）に渡す文字列、それらへのパイプとヒアドキュメント。
+//   文字列の照合なので、変数で組み立てた名前・別名・スクリプトのファイルを経た起動は見分けきれない（SPEC §12。最後に残るのは外側の sandbox）
+const AGENT_CLI_BASENAMES = new Set(['claude', 'codex', 'claude-code']);
+const AGENT_CLI_TEXT = /(?:^|[^\w.@-])(?:claude|codex)(?![\w.-])|@anthropic-ai\/claude-code|@openai\/codex|\/claude\/versions\//i;
+// 名前を引数として扱うだけの、起動しない先頭のコマンド（awk・sed・sort・xargs などはコマンドを実行できるので入れない）
+const CLI_SAFE_HEADS = new Set(['cat', 'ls', 'head', 'tail', 'wc', 'grep', 'egrep', 'fgrep', 'diff', 'stat', 'file', 'du', 'tree', 'jq', 'less', 'more', 'echo', 'printf',
+  'pwd', 'cut', 'uniq', 'tr', 'nl', 'column', 'basename', 'dirname', 'realpath', 'readlink', 'which', 'whereis', 'type', 'true', 'false', 'test', '[']);
+// 文字列やパイプの入力をコマンドとして実行しうるもの（シェル・スクリプトの言語・包むコマンド）
+const CLI_INTERP = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'csh', 'tcsh', 'eval', 'source', '.', 'xargs', 'su', 'script', 'parallel', 'watch', 'osascript',
+  'node', 'nodejs', 'deno', 'bun', 'bunx', 'npx', 'npm', 'pnpm', 'yarn', 'python', 'python2', 'python3', 'perl', 'ruby', 'php', 'lua', 'tclsh', 'expect', 'ssh', 'tmux', 'screen',
+  'at', 'batch', 'awk', 'gawk', 'nawk', 'make']);
+// どの位置にあってもシェル・スクリプトの言語として扱う名前（引数として現れることが少ないもの）
+const CLI_SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'csh', 'tcsh', 'eval', 'osascript', 'node', 'nodejs', 'deno', 'python', 'python2', 'python3', 'perl', 'ruby', 'php', 'lua', 'tclsh', 'expect']);
+// 包むコマンド（後ろの語が実際のコマンド）
+const CLI_WRAPPERS = new Set(['env', 'sudo', 'doas', 'nohup', 'nice', 'timeout', 'gtimeout', 'time', 'exec', 'command', 'builtin', 'xargs', 'caffeinate', 'arch', 'stdbuf', 'setsid',
+  'unbuffer', 'watch', 'parallel', 'script', 'chronic', 'taskpolicy', 'npx', 'bunx', 'then', 'do', 'else', 'elif', 'if', 'while', 'until']);
+
+/** 対応する ) の位置（引用符の中は数えない）。なければ末尾 */
+function closeParen(s, open) {
+  let d = 0; let q = null;
+  for (let i = open; i < s.length; i++) {
+    const c = s[i];
+    if (q) { if (c === '\\' && q === '"') { i++; continue; } if (c === q) q = null; continue; }
+    if (c === "'" || c === '"' || c === '`') { q = c; continue; }
+    if (c === '\\') { i++; continue; }
+    if (c === '(') d++; else if (c === ')') { d--; if (d === 0) return i; }
+  }
+  return s.length - 1;
+}
+/** $(…)・`…`・<(…)・>(…) の中身（一重引用符の中は除く） */
+function cliSubstitutions(s) {
+  const out = []; let q = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q === "'") { if (c === "'") q = null; continue; }
+    if (c === '\\') { i++; continue; }
+    if (c === "'" && q !== '"') { q = "'"; continue; }
+    if (c === '"') { q = q === '"' ? null : '"'; continue; }
+    if ((c === '$' || c === '<' || c === '>') && s[i + 1] === '(') { const e = closeParen(s, i + 1); out.push(s.slice(i + 2, e)); i = e; continue; }
+    if (c === '`') { const j = s.indexOf('`', i + 1); const e = j === -1 ? s.length : j; out.push(s.slice(i + 1, e)); i = e; continue; }
+  }
+  return out;
+}
+/** ヒアドキュメントの本文を取り出し、印（<<HD番号）に置き換える。<<< は対象外 */
+function cliHeredocs(s) {
+  const bodies = []; let out = ''; let i = 0;
+  const re = /(?<!<)<<(?!<)(-?)\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/g;
+  let m;
+  while ((m = re.exec(s))) {
+    const nl = s.indexOf('\n', m.index);
+    if (nl === -1) break;
+    const lines = s.slice(nl + 1).split('\n'); let n = 0; const body = [];
+    for (; n < lines.length; n++) { if ((m[1] ? lines[n].replace(/^\t+/, '') : lines[n]) === m[3]) break; body.push(lines[n]); }
+    const end = Math.min(s.length, nl + 1 + lines.slice(0, n + 1).join('\n').length);
+    out += s.slice(i, m.index) + `<<HD${bodies.length}` + s.slice(m.index + m[0].length, nl);
+    bodies.push(body.join('\n'));
+    i = end; re.lastIndex = end;
+  }
+  return { text: out + s.slice(i), bodies };
+}
+/** ; && || | & 改行でセグメントに分ける（引用符と $(…) の中では分けない）。各セグメントの後ろの区切りも返す */
+function cliSegments(s) {
+  const segs = []; let cur = ''; let q = null; let depth = 0;
+  const push = (sep) => { if (cur.trim()) segs.push({ raw: cur.trim(), sep }); cur = ''; };
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q) { cur += c; if (c === '\\' && q === '"' && i + 1 < s.length) { cur += s[++i]; continue; } if (c === q) q = null; continue; }
+    if (c === "'" || c === '"' || c === '`') { q = c; cur += c; continue; }
+    if (c === '\\' && i + 1 < s.length) { cur += c + s[++i]; continue; }
+    if ((c === '$' || c === '<' || c === '>') && s[i + 1] === '(') { depth++; cur += c + '('; i++; continue; }
+    if (depth > 0) { if (c === '(') depth++; else if (c === ')') depth--; cur += c; continue; }
+    const two = s.slice(i, i + 2);
+    if (two === '&&' || two === '||') { push(two); i++; continue; }
+    if (c === '|') { if (s[i + 1] === '&') i++; push('|'); continue; }
+    if (c === ';' || c === '\n') { push(';'); continue; }
+    if (c === '&' && s[i - 1] !== '>' && s[i - 1] !== '<' && s[i + 1] !== '>') { push('&'); continue; }
+    cur += c;
+  }
+  push(null);
+  return segs;
+}
+/** シェルの語（引用符とバックスラッシュを外す。$(…)・`…` は語の一部のまま）。spaced：引用の中に空白がある（文の引数） */
+function cliWords(s) {
+  const out = []; let w = ''; let on = false; let spaced = false;
+  const end = () => { if (on) out.push({ w, spaced }); w = ''; on = false; spaced = false; };
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (/\s/.test(c)) { end(); continue; }
+    on = true;
+    if (c === "'") { const j = s.indexOf("'", i + 1); const e = j === -1 ? s.length : j; const part = s.slice(i + 1, e); if (/\s/.test(part)) spaced = true; w += part; i = e; continue; }
+    if (c === '"') {
+      let j = i + 1; let part = '';
+      while (j < s.length && s[j] !== '"') {
+        if (s[j] === '\\' && j + 1 < s.length) { part += s[j + 1]; j += 2; continue; }
+        if (s[j] === '$' && s[j + 1] === '(') { const e = closeParen(s, j + 1); part += s.slice(j, e + 1); j = e + 1; continue; }   // 置き換えの中の空白は数えない
+        if (/\s/.test(s[j])) spaced = true;
+        part += s[j]; j++;
+      }
+      w += part; i = j; continue;
+    }
+    if (c === '\\' && i + 1 < s.length) { w += s[i + 1]; i++; continue; }
+    if ((c === '$' || c === '<' || c === '>') && s[i + 1] === '(') { const e = closeParen(s, i + 1); w += s.slice(i, e + 1); i = e; continue; }
+    if (c === '`') { const j = s.indexOf('`', i + 1); const e = j === -1 ? s.length : j; w += s.slice(i, e + 1); i = e; continue; }
+    w += c;
+  }
+  end();
+  return out;
+}
+/** グロブ（* ? [..]）の語が claude・codex に当たりうるか（決まった字が3字以上のときだけ） */
+function cliGlobHits(base) {
+  const lit = base.replace(/\[[^\]]*\]|[*?]/g, '');
+  if (lit.length < 3) return false;
+  let re = '';
+  for (let i = 0; i < base.length; i++) {
+    const c = base[i];
+    if (c === '*') re += '.*'; else if (c === '?') re += '.';
+    else if (c === '[') { const j = base.indexOf(']', i + 1); if (j === -1) { re += '\\['; continue; } re += '[' + base.slice(i + 1, j).replace(/^!/, '^').replace(/\\/g, '\\\\') + ']'; i = j; }
+    else re += c.replace(/[.+^${}()|\\/]/g, '\\$&');
+  }
+  try { const r = new RegExp(`^${re}$`, 'i'); return [...AGENT_CLI_BASENAMES].some((n) => r.test(n)); } catch { return true; }
+}
+/** 語が claude・codex を指すか（パス・大文字・代入の値・選択肢の値・中括弧・グロブ） */
+function isAgentCliWord(w0) {
+  const w = w0.replace(/^[({!]+/, '').replace(/[)};]+$/, '');
+  const cands = [w];
+  const eq = w.indexOf('='); if (eq !== -1) cands.push(w.slice(eq + 1));   // 代入・選択肢・設定の値（C=claude・--pre=claude・core.pager=claude）
+  return cands.some((x) => {
+    const lw = x.toLowerCase();
+    if (/@anthropic-ai\/claude-code|@openai\/codex|\/claude\/versions\//.test(lw)) return true;
+    const base = lw.replace(/\/+$/, '').split('/').pop();
+    if (AGENT_CLI_BASENAMES.has(base)) return true;
+    if (/[{}]/.test(w0) && /claude|codex/i.test(x)) return true;
+    if (/[*?[]/.test(base) && cliGlobHits(base)) return true;
+    return false;
+  });
+}
+/** 命令の位置の語（先頭と、包むコマンドの後の語。代入・( { ! と包むコマンドの選択肢を飛ばす）。語の名前（パスの最後の段・小文字）の配列 */
+function cliCommandWords(ws) {
+  const out = []; let k = 0;
+  while (k < ws.length) {
+    const w = ws[k].w.replace(/^[({!]+/, '');
+    if (!w || /^[A-Za-z_][A-Za-z0-9_]*=/.test(w)) { k++; continue; }
+    const b = w.split('/').pop().toLowerCase();
+    out.push(b);
+    if (!CLI_WRAPPERS.has(b)) break;
+    k++;
+    while (k < ws.length && (/^-/.test(ws[k].w) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(ws[k].w) || /^\d+(\.\d+)?[smhd]?$/.test(ws[k].w))) k++;
+  }
+  return out;
+}
+/** 名前を扱うだけの、起動しない先頭か（先頭の前に代入があれば起動しうるとみなす） */
+function cliSafeHead(ws) {
+  let k = 0; while (k < ws.length && /^[({!]+$/.test(ws[k].w)) k++;
+  const raw = (ws[k]?.w || '').replace(/^[({!]+/, '');
+  if (!raw || /[=/$`]/.test(raw)) return false;
+  const rest = ws.slice(k + 1).map((x) => x.w);
+  if (CLI_SAFE_HEADS.has(raw)) return true;
+  if (raw === 'rg') return !rest.some((x) => /^--pre(-glob)?(=|$)/.test(x));
+  if (raw === 'find') return !rest.some((x) => /^-(exec|execdir|ok|okdir|delete|fprint|fprint0|fprintf|fls)$/.test(x));
+  if (raw === 'git') return /^(log|diff|show|status|grep|ls-files|blame|branch|rev-parse|describe|shortlog)$/.test(rest[0] || '') && !rest.some((x) => /^(-O|--open-files-in-pager|--ext-diff$|--textconv$)/.test(x));
+  if (raw === 'command') return /^-[vV]$/.test(rest[0] || '');
+  return false;
+}
+/** コマンドの中の claude・codex の起動を探す。見つかれば理由を返す */
+function judgeAgentCli(cmd, depth = 0) {
+  if (depth > 6) return AGENT_CLI_TEXT.test(cmd) ? '入れ子が深すぎて決められない' : null;
+  const { text, bodies } = cliHeredocs(cmd);
+  const segs = cliSegments(text);
+  const interpOf = (seg) => { const ws = cliWords(seg.raw); return cliCommandWords(ws).some((b) => CLI_INTERP.has(b)) || ws.some((x) => CLI_SHELLS.has(x.w.split('/').pop().toLowerCase())); };
+  for (let i = 0; i < segs.length; i++) {
+    const seg = segs[i];
+    for (const sub of cliSubstitutions(seg.raw)) { const r = judgeAgentCli(sub, depth + 1); if (r) return r; }
+    const ws = cliWords(seg.raw);
+    const hit = ws.find((x) => !x.spaced && isAgentCliWord(x.w));
+    const lead = []; for (const x of ws) { if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(x.w)) lead.push(x.w); else break; }
+    const pipedToInterp = seg.sep === '|' && i + 1 < segs.length && interpOf(segs[i + 1]);
+    const interp = interpOf(seg);
+    const docs = [...seg.raw.matchAll(/<<HD(\d+)/g)].map((m) => bodies[Number(m[1])] || '');
+    if (hit && !cliSafeHead(ws)) return `「${hit.w.slice(0, 60)}」の起動`;
+    if (lead.some((x) => AGENT_CLI_TEXT.test(x.replace(/^[^=]*=/, '')))) return '環境変数の値の中の起動';
+    if (hit && pipedToInterp) return 'シェルへのパイプで渡す起動';
+    if ((interp || pipedToInterp) && AGENT_CLI_TEXT.test(seg.raw.replace(/<<HD\d+/g, ''))) return 'シェル・スクリプトの言語に渡す文字列の中の起動';
+    if ((interp || pipedToInterp) && docs.some((d) => AGENT_CLI_TEXT.test(d))) return 'シェル・スクリプトの言語に渡すヒアドキュメントの中の起動';
+    const first = (cliCommandWords(ws)[0] !== undefined) ? ws.find((x) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(x.w)) : null;
+    if (first && /^[({!]*(\$\(|`)/.test(first.w) && AGENT_CLI_TEXT.test(seg.raw)) return '置き換えの結果をコマンドとして使う起動';
+  }
+  return null;
+}
+
 // ---- ツールごとの判定 -----------------------------------------------------
 
 /** 作業員の閉じ込めの対象か（OBS-013②）。対象なら { root: 自分の worktree のルート, label } を返す */
@@ -840,6 +1044,11 @@ function judge(input, projectDir, git) {
         return { target: cmd.slice(0, 200), decision: 'deny', reason: '作業員（worker・tester）を claude の CLI で直接起動できない。起動の窓口（merge-requests/launch/T-NNN.json）を使う' };
       }
       const r = judgeBash(cmd, git, agentType, cwd, projectDir, confine);
+      // p0.4.16：ほかの規則が通したコマンドにだけ、claude・codex の CLI の起動の照合をかける（ほかの規則の拒否の理由は変えない）
+      if (r.decision === 'allow') {
+        const cli = judgeAgentCli(preprocessCommand(cmd));
+        if (cli) return { target: cmd.slice(0, 200), decision: 'deny', reason: `Bash: AI の役割から claude・codex の CLI を起動できない（${cli}）。入れ子の起動はフック・証拠の記録・予算の台帳の外で動く。作業員は起動の窓口（merge-requests/launch/T-NNN.json）、司法は裁判所が起動する` };
+      }
       return { target: cmd.slice(0, 200), ...r };
     }
     default:

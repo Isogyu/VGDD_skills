@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// VGDD Governance Kernel — 導入の道具（法律 p0.4.15、SPEC §11-移植。オーナーが sandbox の外で実行する。依存なし、Node 22 以上）
+// VGDD Governance Kernel — 導入の道具（法律 p0.4.16、SPEC §11-移植・設定の照合。オーナーが sandbox の外で実行する。依存なし、Node 22 以上）
 //
 // 元の案件（Z3 = ~/tsubuyaki-z3、リポジトリ = ~/tsubuyaki-worklog/app）と違う場所・違う名前に Kernel を置くための道具。
 // この道具は Kernel の強制の経路に入らない（フック・裁判所・夜間の代行はこのファイルを読まない）。配置の結果は、適合性テストの ST16 と
@@ -19,6 +19,8 @@
 //       docs/adoption.md §4 の確認の表を機械で確かめる。**診断は表示用で、合格しても Kernel が正しく動く証明ではない**。
 //       確かめられない項目は「確かめられない」、注意（既定の保護を外す設定・ありふれた名前の先頭）は「注意」と出し、どちらも合格に数えない。
 //       終了コード 0＝全部合格、1＝不合格あり、2＝確かめられない・注意の項目あり。配置と Kernel の設定の検査は、配置したフックを実際に起動して確かめる
+//       p0.4.16：配置済みの設定の厳しさ（sandbox の節は原本の項目だけ、フックを止める項目がない）と、上の層の設定（<repo>/.claude/settings.local.json、
+//       ~/.claude/settings.json・settings.local.json）を、適合性テストの ST16〜ST16c と同じ部品 settings-check.mjs で確かめる（規則を2つに書かない）
 //
 // 規則（フック policy.mjs と同じものを写して持つ。変えるときは両方を変える）：
 //   ・Z3 の名前は英数字と . _ - だけ（先頭は英数字）、4 文字以上、ありふれた名前でない
@@ -30,6 +32,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import { projectProblems, checkUpperLayers } from './settings-check.mjs';   // p0.4.16：設定の層の検査（適合性テストと同じ部品）
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ORIG = { z3: '~/tsubuyaki-z3', repo: '~/tsubuyaki-worklog/app', repoParent: '~/tsubuyaki-worklog', hook: 'node ~/tsubuyaki-z3/hooks/policy.mjs' };
@@ -325,7 +328,21 @@ function doctor(o) {
       const hs = JSON.stringify(canon(dep.hooks)) === JSON.stringify(canon(v2.hooks));
       add('settings-match', '配置済みの設定が、原本をこの場所に合わせて書き換えたもの（render-settings）の拒否の規則・禁止の一覧をすべて含み、sandbox の3つの値とフックの構造が同じ', pf(lacks.length === 0 && hs), `欠け ${lacks.length} 件 hooks=${hs ? '同じ' : '違う'}`);
     } else add('settings-match', '配置済みの設定と原本の一致', 'unverifiable', rr.error || '');
+    // p0.4.16：配置済みの設定の厳しさ（ST16 と同じ部品）。注意（フックに効きうる env）は合格に数えない
+    if (rr.settings) {
+      const pp = projectProblems(rr.settings, dep);
+      add('settings-strict', '配置済みの設定の sandbox の節が原本にある項目だけで（excludedCommands・allowRead・allowWrite・disabled・enableWeaker* などがない。宛先は原本の部分集合）、フックを止める項目（disableAllHooks など）がない',
+        pp.fail.length ? 'fail' : pp.warn.length ? 'warn' : 'pass', [...pp.fail, ...pp.warn].slice(0, 4).join('・'));
+    } else add('settings-strict', '配置済みの設定の厳しさ', 'unverifiable', rr.error || '');
   }
+  // p0.4.16：上の層の設定（値の設定は上の層が勝つ）。ファイルがなければ合格、読めなければ不合格。弱めるかを決められない項目は注意（合格に数えない）
+  if (rr.settings) {
+    const layers = checkUpperLayers({ repo, home: os.homedir(), want: rr.settings });
+    const LABEL = { 'project-local': '<repo>/.claude/settings.local.json', user: '~/.claude/settings.json', 'user-local': '~/.claude/settings.local.json' };
+    const nf = layers.flatMap((l) => l.fail.map((x) => `${LABEL[l.kind]}：${x}`)); const nw = layers.flatMap((l) => l.warn.map((x) => `${LABEL[l.kind]}：${x}`));
+    add('settings-layers', `上の層の設定（${Object.values(LABEL).join('・')}）に、Kernel の保護を弱める値がない（ファイルがなければ合格。管理者の設定・起動の引数・環境変数は見られない）`,
+      nf.length ? 'fail' : nw.length ? 'warn' : 'pass', [...nf, ...nw].slice(0, 4).join(' / ') || `あるファイル ${layers.filter((l) => l.present).length} 件`);
+  } else add('settings-layers', '上の層の設定に、Kernel の保護を弱める値がない', 'unverifiable', rr.error || '');
   // 原本と配置済みの写しの一致
   let files = null; try { files = lawFiles(law, repo, z3); } catch { files = null; }
   if (files) {

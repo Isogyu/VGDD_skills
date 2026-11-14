@@ -12,7 +12,7 @@
 
 **実際に確かめたのは A だけです。** Kernel を実稼働させたのは、この案件の、この開発の配置（オーナー1人・macOS の機械1台）だけです。B は、上の (1)〜(3) を適合性テストの水準（一時ディレクトリの写し・偽の CLI）で確かめただけです。B と C の手順どおりに実際に動くことは、まだ確かめていません。
 
-数字は法律 p0.4.15・適合性テスト 591 件の時点のものです（§1・§4 の一部の実例は p0.4.8 の時点のまま）。
+数字は法律 p0.4.16・適合性テスト 637 件の時点のものです（§1・§4 の一部の実例は p0.4.8 の時点のまま）。
 
 ## 1. A：clone で試す
 
@@ -124,7 +124,8 @@ B・C で、上から順に人が確かめます。p0.4.15 から、この表の
 
 | 確かめること | 方法 | 合格の目安 |
 |---|---|---|
-| 設定 | `vgdd-setup.mjs render-settings --repo <repo> --z3 <z3>` の出力と `.claude/settings.json` の `diff`、適合性テストの ST16（`--impl z3 --repo <repo>`） | 原本を指定の場所に合わせて書き換えたものの拒否の規則と禁止の一覧をすべて含み、sandbox の3つの値とフックの構造が同じ（p0.4.15 から ST16 は試す場所に合わせて書き換えた原本と比べる。比べる項目と厳しさは同じ） |
+| 設定 | `vgdd-setup.mjs render-settings --repo <repo> --z3 <z3>` の出力と `.claude/settings.json` の `diff`、適合性テストの ST16（`--impl z3 --repo <repo>`）、doctor の `settings-match`・`settings-strict` | 原本を指定の場所に合わせて書き換えたものの拒否の規則と禁止の一覧をすべて含み、sandbox の3つの値とフックの構造が同じ（p0.4.15 から ST16 は試す場所に合わせて書き換えた原本と比べる）。p0.4.16 から、sandbox の節は原本にある項目だけ（`excludedCommands`・`filesystem.allowRead`・`allowWrite`・`disabled`・`enableWeaker*`・`network` の緩める項目がない。`network.allowedDomains` は原本の部分集合で、宛先を足すのは原本を改める立法による）で、最上位に `disableAllHooks` などがない |
+| 上の層の設定（p0.4.16） | doctor の `settings-layers`、適合性テストの ST16b・ST16c。人の目では `jq . <repo>/.claude/settings.local.json ~/.claude/settings.json ~/.claude/settings.local.json`（あるものだけ） | ファイルがないか、あっても `sandbox.enabled` が true 以外・`allowUnsandboxedCommands` が false 以外・`failIfUnavailable` が true 以外・`excludedCommands`・`filesystem.disabled`・保護の場所に重なる `allowRead`・`allowWrite`・`network` の緩める項目と原本にない宛先・`enableWeaker*`・`disableAllHooks` がない。`hooks` の節・保護の外への `allowWrite`・フックに効きうる `env` は「注意」（doctor は終了 2）。値の設定は上の層が勝つ（文書。実機では未確認）ので、プロジェクトの `.claude/settings.json` が正しくても、上の層で sandbox を外せる。`/sandbox` の画面は `enabled` を `settings.local.json` に書く。管理者の設定・起動の引数・環境変数はファイルの検査では見られない |
 | エージェントの定義 | `diff -r vgdd/agents .claude/agents` | 違いがない |
 | フック | `diff vgdd/hooks/policy.mjs <z3>/hooks/policy.mjs`（オーナー） | 違いがない |
 | 裁判所のスクリプト | `vgdd/scripts/` の各ファイルと `<z3>/bin/` の同じ名前のファイルを `diff`（オーナー） | 違いがない |
@@ -132,6 +133,37 @@ B・C で、上から順に人が確かめます。p0.4.15 から、この表の
 **この開発の配置での実例**：11/7 12:3x の時点では、設定の `diff` に、原本にだけある4行が出ました（`Edit`・`Write` の `docs/governance` の deny。sandbox の `denyWrite` とフックでは守っていた）。法律 p0.4.8 で配置済みの設定に足し、判例 ST16 にしました。11/7 15:10 に原本と稼働中の写しの両方で 414/414 を確かめています。
 
 フックの版（`policy_version`）と法律の版（`kernel_version`）は別の数字です。法律を改めてもフックを変えなければ、前の版のままです（11/7 15:10 の時点でフックは p0.4.5、法律は p0.4.8）。
+
+### この改正（p0.4.16）を今の配置に入れるときにオーナーがすること
+
+1. **設定を更新する**：原本に拒否の規則を足した（`git push * --force*`・`git push * -f*`・`git push * +*`、`claude`・`codex` の CLI の起動の形、`~/.claude` の指示・エージェント・スキル・コマンド・規則・出力の形の `Edit`）ので、今の配置済みの `.claude/settings.json` は、更新するまで ST16（と doctor の `settings-match`）に通らない。`vgdd-setup.mjs render-settings --repo <repo> --z3 <z3>` の出力と `diff` を取り、足りない拒否の規則を足す（install は既にあるファイルを上書きしない）
+2. **配置済みの設定の緩める項目を外す**：`.claude/settings.json` の `sandbox` に原本にない項目（`excludedCommands`・`filesystem.allowRead` など）や原本にない宛先があれば、ST16 に通らない。宛先が要るなら、原本を改める（立法）
+3. **上の層の設定を点検する**：`<repo>/.claude/settings.local.json`、`~/.claude/settings.json`、`~/.claude/settings.local.json` を開き、上の表の値がないことを確かめる（doctor の `settings-layers`）。`/sandbox` の画面で設定を変えたことがあれば、`settings.local.json` に `enabled` が書かれている。個人の `hooks` の節があれば注意になる（Kernel の判定にどう効くかは確かめていない。不要なら外す）
+4. **フックとスクリプトの写しを更新する**：`vgdd/hooks/policy.mjs` を `<z3>/hooks/` に、`vgdd/scripts/` を `<z3>/bin/` に写す（`settings-check.mjs` が増えた）。フックの版は p0.4.16
+5. 適合性テスト（`--impl z3 --repo <repo>`）を動かし、ST16・ST16b・ST16c・LN1・LN2 と C1 の CAP-LAUNCH-AGENT-CLI が通ることを見る
+6. 行政の長のセッションで、`claude --version` などの起動が拒否されて記録に残ることを1回見る（行政が claude・codex の CLI を使う手順があれば、使わない形に直す）
+
+### 実際の環境で確かめること（文書で確かめた・実機では確かめていない。p0.4.16）
+
+2026-11-14 に、外部の調査の報告を、立法補佐が Claude Code の公式の文書と CHANGELOG で照合しました（取得した文書は随時更新の最新版で、手元の Claude Code の版は分かっていません）。**下の表は、文書では決まらないか、文書どおりに動くかを実機で確かめていないものです。** どれも本物の Z3 と作業記録には触れず、一時のリポジトリと一時のホーム（偽の Z3）で、オーナーが行います。先に `claude --version`、`/status`、`/permissions`、`/sandbox`、`claude doctor` で、版と実際に読み込まれた設定を記録してください。
+
+| ID | 確かめること（文書で分かっていること） | 手順 | 結果が違ったときに見直すもの |
+|---|---|---|---|
+| R1 | `..` を含む相対の規則 `Edit(../preparation/**)`・`Edit(../event_records/**)` が一致するか（文書に例も保証もない） | 一時のリポジトリにその deny だけを置き、Edit ツールで `../preparation/a.md` を書かせる | 一致しないなら、絶対の形（`~/…`）の規則・sandbox・フックだけが止めている。`..` の規則は補助と書き直す |
+| R2 | `.claude/settings.local.json` の `sandbox.enabled:false`・`allowUnsandboxedCommands:true`・`disableAllHooks:true` が `.claude/settings.json` の値を上書きするか（文書は「上の層が勝つ」）。worktree のセッションが main の checkout の `settings.local.json` を読むか（文書） | 一時のリポジトリで local に1つずつ書き、`/sandbox` の表示と、偽の Z3 への Bash の読み取りが止まるかを見る | 上書きしないなら、ST16b の不合格は止めすぎ（害はない）。上書きするなら、ST16b と doctor が実際の穴を見ていることになる |
+| R3 | 設定の `env`（`NODE_OPTIONS`・`PATH`）がフックのプロセスに渡るか | 一時のリポジトリで `env` に印を付け、試験用のフックで `process.env` を出す | 渡るなら、ST16c の注意を不合格に上げる候補 |
+| R4 | フックのコマンドの `~`・`$HOME`・行頭の `VAR=値 コマンド` が `sh -c` で期待どおり動くか。`node` が `sh -c` の PATH にあるか | 試験用のフックを動かし、`claude --debug-file` の記録を見る | 動かなければ、全操作が止まる（安全側だが止まる） |
+| R5 | `--agent` で起動したメインのセッションで、定義の `disallowedTools`・`isolation: worktree`・`maxTurns` が効くか（文書に書いていない） | `claude -p --agent judge` で Read を求め、拒否されるか。`--agent worker` が worktree に入るか | 効かないなら、司法の「ツールなし」は `--max-turns 1` と入力の組み立てだけに依る。起動の引数で道具を外す改正の候補 |
+| R6 | Linux：存在しない denyWrite のパスに作られるマウント点が git の状態を汚すか、`**/` で始まる Edit の規則が sandbox に反映されないこと | Linux の環境があるとき | 今は macOS だけを扱う |
+| R7 | 同じパスを denyRead と allowRead の両方に書いたときの優先、`excludedCommands` に `node *` を足した状態で偽の Z3 が読めるか、`filesystem.disabled` をプロジェクトの設定に書いたとき無視されるか | 一時のホームに偽の Z3 を置いて試す | 結果を SPEC §12 の文書の限界に反映する |
+| R8 | 入れ子の `claude --bare -p`・`claude --settings '{"disableAllHooks":true}' -p` が sandbox の中の Bash から起動できるか、そのときフックが走らないこと | 一時のリポジトリで、フックの LN の拒否を外した試験用の写しを使って試す（本物の配置の拒否は外さない） | 起動できないなら、LN の拒否は二重の守り。起動できれば、LN の拒否が唯一のフックの層 |
+| R9 | 信頼を承認していない対話のセッションでフックが動かないこと。`~/.claude.json` の `projects[…].hasTrustDialogAccepted` の読み方 | 新しい clone で `claude` を起動し、承認の前後で最初の Read の記録を見る | 導入の手順に「信頼の承認の後にフックの記録を見る」を足す（今は §4 の「記録が残る」で見る） |
+| R10 | `.claude/settings.json` が git で追跡されているか（追跡されていなければ、worktree の作業員のセッションに設定が入らない疑い） | sandbox の外で `git ls-files .claude/settings.json` | 追跡されていなければ、作業員のセッションの sandbox と権限の規則が外れている疑い。追跡するか、起動の引数で設定を渡す改正の候補 |
+| R11 | Grep・Glob を Z3 の親（ホーム）から実行したとき、`Read(~/<z3>/**)` の拒否が Z3 の中に効くか（文書は "best-effort"） | 一時のホームで試す（フックの拒否を外した試験用の写しで） | 効かなければ、Read 系のツールで Z3 を止めるのはフックだけ |
+| R12 | 親フォルダの信頼の扱い（文書のページの間で食い違う） | 版ごとの CHANGELOG と実機 | R9 の手順に反映する |
+| R13 | `autoAllowBashIfSandboxed` の既定の変更が 2.1.324 か 2.1.325 か（文書と CHANGELOG で食い違う）。手元の版 | `claude --version` | 原本は true を明示しているので、既定の変更の影響は受けない |
+
+**実機の確認の後の候補（今回はしない変更）**：文書が違っていた場合に、通す側に変わるか、起動の仕方を変えるものは、今回は入れていません。(1) 夜間の作業員・司法の起動に `--settings '<sandbox の3つの値と disableAllHooks:false>'` を渡して上の層を固定する（R2・R5 の後）、(2) 管理者の設定（managed settings）に sandbox の値を置く（オーナーの管理者権限が要る）、(3) 原本の `Write(...)` の規則と、死んでいる allow `Bash(npx --no-install *)` を外す（照合の期待が変わる。R13 と夜間の作業員の操作の確認の後）、(4) `..` を含む規則の書き直し（R1 の後）。
 
 ### 次に人が確かめること
 

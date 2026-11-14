@@ -28,6 +28,7 @@
 //   W  起動の窓口と前の試行の記録（申請の検証・night-runner --launch・指摘と仮説の区別。p0.4.10）            … SPEC §5-4
 //   B  予算の台帳（予約・精算・不明の扱い・同時の予約・重複・停止・期間・破損・超過。p0.4.9）               … SPEC §9
 //   P  移植（別の名前の Z3・別の場所のリポジトリでの強制、導入の道具 vgdd-setup.mjs。p0.4.15）              … SPEC §11-移植
+//   LN 入れ子の起動（AI の役割による claude・codex の CLI の起動の拒否と、起動しない扱いの陽性の対照。p0.4.16） … SPEC §5・§12
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -48,7 +49,7 @@ if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(Z3_NAME)) { console.error('--z3-name �
 const REPO_NAME = opt('--repo-name') || 'app';
 if (!REPO_NAME.split('/').every((x) => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(x))) { console.error('--repo-name は英数字と . _ - の段を / でつないだもの'); process.exit(2); }
 const ONLY = opt('--only') ? new Set(opt('--only').split(',').map((x) => x.trim()).filter(Boolean)) : null;
-const KNOWN_GROUPS = ['C1', 'A', 'C2', 'C3', 'G', 'ST', 'ST16', 'K', 'H', 'N', 'L', 'B', 'W', 'OC', 'P', 'INV'];
+const KNOWN_GROUPS = ['C1', 'A', 'C2', 'C3', 'G', 'ST', 'ST16', 'K', 'H', 'N', 'L', 'B', 'W', 'OC', 'P', 'LN', 'INV'];
 if (ONLY && (ONLY.size === 0 || [...ONLY].some((g) => !KNOWN_GROUPS.includes(g)))) { console.error(`--only に知らない群がある（使える群：${KNOWN_GROUPS.join(',')}）`); process.exit(2); }
 const runs = (g) => !ONLY || ONLY.has(g);
 const VG = path.resolve(HERE, '..');
@@ -77,6 +78,10 @@ if (RECORD) {
 // p0.4.8：試す実装の場所だけを出して終わる（ST17 が使う。中身は場所だけ）
 if (args.includes('--print-impl')) { console.log(JSON.stringify({ impl, ...IMPL })); process.exit(0); }
 const CAPS = JSON.parse(fs.readFileSync(path.join(VG, 'kernel/capabilities.json'), 'utf8'));
+// p0.4.16：設定の層の検査の部品（settings-check.mjs）は、試す実装の場所から読む（原本では vgdd/scripts、--impl z3 では Z3 の bin）。
+//   導入の道具の doctor と同じ部品を使い（規則を2つに書かない）、規則そのものは判例 ST16d・ST16e で、手で書いた設定にかけて確かめる。読めなければ ST16〜ST16e は不合格
+let SC = null; let SC_ERR = '';
+try { SC = await import(pathToFileURL(path.join(IMPL.bin, 'settings-check.mjs')).href); } catch (e) { SC = null; SC_ERR = (e && (e.code || e.name)) || 'error'; }
 const DECISION_SCHEMA = JSON.parse(fs.readFileSync(path.join(VG, 'schemas/kernel-decision.schema.json'), 'utf8'));
 const Z3_RE_SRC = Z3_NAME.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');   // 試験用の Z3 の名前（正規表現として安全に）
 const UTF8 = { LC_ALL: 'ja_JP.UTF-8', LANG: 'ja_JP.UTF-8' }; // OBS-043：本番と同じロケールで動かす
@@ -889,6 +894,18 @@ function groupST() {
   const v2 = JSON.parse(fs.readFileSync(path.join(VG, 'settings.v2.json'), 'utf8'));
   record('ST', 'ST15', '設定の原本 vgdd/settings.v2.json も docs/governance を保護する（Edit・Write の拒否4つと sandbox の denyWrite）',
     ['Edit(docs/governance/**)', 'Write(docs/governance/**)', 'Edit(**/docs/governance/**)', 'Write(**/docs/governance/**)'].every((x) => (v2.permissions?.deny || []).includes(x)) && (v2.sandbox?.filesystem?.denyWrite || []).includes('docs/governance'));
+  // ST15b・ST15c（p0.4.16、原本の規則の点検）：Write(...) の権限の規則は、パスの規則として一致しない（文書。ファイルの編集を止めるのは Edit(...) の規則）。
+  //   原本の Write の規則のそれぞれに、同じ一覧（deny・ask）の同じパスの Edit の規則が並んでいること。git push の強制の形・claude と codex の起動の拒否の規則があること
+  const pr16 = v2.permissions || {};
+  const noEdit = ['deny', 'ask'].flatMap((k) => (pr16[k] || []).filter((x) => /^Write\(/.test(x) && !(pr16[k] || []).includes(`Edit(${x.slice(6)}`)).map((x) => `${k}:${x}`));
+  const nWrite = ['deny', 'ask'].reduce((n, k) => n + (pr16[k] || []).filter((x) => /^Write\(/.test(x)).length, 0);
+  record('ST', 'ST15b', `設定の原本の Write(...) の規則（${nWrite} 件。パスの規則として一致しない）のそれぞれに、同じ一覧の同じパスの Edit(...) の規則が並んでいる（編集を止めるのは Edit の規則）`,
+    nWrite > 0 && noEdit.length === 0, noEdit.slice(0, 3).join(' / '));
+  const needDeny = ['Bash(git push --force*)', 'Bash(git push -f *)', 'Bash(git push * --force*)', 'Bash(git push * -f*)', 'Bash(git push * +*)', 'Bash(claude)', 'Bash(claude *)', 'Bash(codex)', 'Bash(codex *)', 'Bash(npx @anthropic-ai/claude-code*)', 'Bash(npx @openai/codex*)',
+    'Edit(~/.claude/CLAUDE.md)', 'Edit(~/.claude/agents/**)', 'Edit(~/.claude/skills/**)', 'Edit(~/.claude/commands/**)', 'Edit(~/.claude/rules/**)', 'Edit(~/.claude/output-styles/**)'];
+  const lackDeny = needDeny.filter((x) => !(pr16.deny || []).includes(x));
+  record('ST', 'ST15c', '設定の原本の拒否の規則に、git push の強制の形（--force・-f・+ を後ろに書く形も）、claude・codex の CLI の起動の形、ユーザーの ~/.claude の指示・エージェント・スキル・コマンド・規則・出力の形の編集の拒否がある（p0.4.16）',
+    lackDeny.length === 0, lackDeny.join(','));
   groupST16(v2);
   // p0.4.8：--impl z3 は VGDD_Z3_DIR の場所の写しを試す（--record の書き先と同じ場所）
   const pz = path.join(os.tmpdir(), 'vgdd-st17-z3');
@@ -989,13 +1006,90 @@ function settingsCover(want, dep) {
 function groupST16(v2) {
   // p0.4.8：配置済みの設定（リポジトリの .claude/settings.json）は、原本の保護をすべて持つ（拒否の規則・sandbox の書き込みと読み取りの禁止・フック）。
   //   11/7 まで、原本にある docs/governance の Edit・Write の拒否4つが、配置済みに欠けていた（フックと denyWrite では防いでいた）
+  // p0.4.16：照合を規範（§11「足してよいのは拒否の規則と禁止の一覧の項目だけ」）に合わせる。sandbox の節は原本の項目だけ（network.allowedDomains は部分集合）、
+  //   最上位にフックを止める項目がない（settings-check.mjs の projectProblems）。上の層の設定も読む（ST16b・ST16c）
   const deployedPath = path.join(DEPLOYED_REPO, '.claude/settings.json');
   const dep = fs.existsSync(deployedPath) ? JSON.parse(fs.readFileSync(deployedPath, 'utf8')) : null;
   const placed = !!opt('--repo') || impl === 'z3';
   const rr = placed ? renderForPlace(v2, DEPLOYED_REPO, Z3REAL) : { settings: v2 };
   const { lacks, hooksSame } = rr.settings ? settingsCover(rr.settings, dep) : { lacks: [rr.error], hooksSame: false };
-  record('ST', 'ST16', '配置済みの設定（.claude/settings.json）は、原本 vgdd/settings.v2.json（--repo・--impl z3 では試す場所に合わせて書き換えたもの）の拒否の規則・sandbox の書き込みと読み取りの禁止の一覧をすべて含み、sandbox の enabled・failIfUnavailable・allowUnsandboxedCommands は同じ値、フックは同じ構造',
-    lacks.length === 0 && hooksSame, `対象=${opt('--repo') ? '--repo' : impl === 'z3' ? '既定の本番のリポジトリ' : '原本のリポジトリ'} 欠け=${lacks.slice(0, 4).join(',') || 'なし'} hooks=${hooksSame ? '同じ' : '違う'}`);
+  const strict = !SC ? { fail: [`検査の部品（settings-check.mjs）を読めない（${SC_ERR}）`], warn: [] } : rr.settings ? SC.projectProblems(rr.settings, dep) : { fail: [rr.error], warn: [] };
+  record('ST', 'ST16', '配置済みの設定（.claude/settings.json）は、原本 vgdd/settings.v2.json（--repo・--impl z3 では試す場所に合わせて書き換えたもの）の拒否の規則・sandbox の書き込みと読み取りの禁止の一覧をすべて含み、sandbox の enabled・failIfUnavailable・allowUnsandboxedCommands は同じ値、フックは同じ構造。p0.4.16 から、sandbox の節は原本にある項目だけ（network.allowedDomains は原本の部分集合、ほかは同じ値）で、最上位にフックを止める項目がない',
+    lacks.length === 0 && hooksSame && strict.fail.length === 0 && strict.warn.length === 0,
+    `対象=${opt('--repo') ? '--repo' : impl === 'z3' ? '既定の本番のリポジトリ' : '原本のリポジトリ'} 欠け=${lacks.slice(0, 4).join(',') || 'なし'} hooks=${hooksSame ? '同じ' : '違う'} 原本にない・緩める項目=${[...strict.fail, ...strict.warn].slice(0, 3).join(',') || 'なし'}`);
+  // ST16b・ST16c（p0.4.16）：上の層の設定（配置先の .claude/settings.local.json、ホームの .claude/settings.json・settings.local.json）。試験ではホームは一時ディレクトリ
+  const layers = SC && rr.settings ? SC.checkUpperLayers({ repo: DEPLOYED_REPO, home: os.homedir(), want: rr.settings }) : null;
+  const ld = (sel) => layers ? layers.filter((l) => sel(l).length).map((l) => `${l.kind}:${sel(l).slice(0, 2).join(',')}`).join(' / ') : (SC ? rr.error : `検査の部品を読めない（${SC_ERR}）`);
+  record('ST', 'ST16b', '上の層の設定（配置先の .claude/settings.local.json、ホームの .claude/settings.json・settings.local.json）があれば、Kernel の保護を弱める値（sandbox の enabled・allowUnsandboxedCommands・failIfUnavailable の上書き、excludedCommands、filesystem.disabled、保護する場所に重なる・重なるかを決められない allowRead・allowWrite、network の緩める項目と原本にない宛先、enableWeaker*、disableAllHooks）がなく、読めない・JSON でないファイルもない（ファイルがなければ合格）',
+    !!layers && layers.every((l) => l.fail.length === 0), `あるファイル=${layers ? layers.filter((l) => l.present).map((l) => l.kind).join(',') || 'なし' : '-'} ${ld((l) => l.fail)}`);
+  record('ST', 'ST16c', '上の層の設定に、弱めるかを決められない項目（hooks の節・フックのプロセスに効きうる env・保護の外への allowWrite・知らない項目）がない（あれば注意として不合格に数える）',
+    !!layers && layers.every((l) => l.warn.length === 0), ld((l) => l.warn));
+  groupST16Rules(v2);
+}
+
+// ST16d・ST16e（p0.4.16）：照合の規則（settings-check.mjs）そのものを、手で書いた設定にかけて確かめる（部品の誤りが、そのまま ST16〜ST16c の合格にならないように）
+function groupST16Rules(v2) {
+  const clone = (x) => JSON.parse(JSON.stringify(x));
+  if (!SC) {
+    for (const id of ['ST16d', 'ST16e']) record('ST', id, `照合の規則の判例（${id}）`, false, `検査の部品（settings-check.mjs）を読めない（${SC_ERR}）`);
+    return;
+  }
+  // ST16d：プロジェクトの設定。原本に、緩める項目を1つずつ足すと不合格。陽性の対照：拒否の規則・禁止の一覧を足し、宛先を減らし、autoAllowBashIfSandboxed を false にしたもの
+  const mut = (f) => { const s = clone(v2); f(s); return s; };
+  const neg = [
+    ['excludedCommands', (s) => { s.sandbox.excludedCommands = ['node *']; }],
+    ['filesystem.allowRead', (s) => { s.sandbox.filesystem.allowRead = ['~/x']; }],
+    ['filesystem.allowWrite', (s) => { s.sandbox.filesystem.allowWrite = ['~/x']; }],
+    ['filesystem.disabled', (s) => { s.sandbox.filesystem.disabled = true; }],
+    ['network.allowUnixSockets', (s) => { s.sandbox.network.allowUnixSockets = ['/var/run/docker.sock']; }],
+    ['network.allowedDomains に宛先を足す', (s) => { s.sandbox.network.allowedDomains.push('exfil.example'); }],
+    ['enableWeakerNestedSandbox', (s) => { s.sandbox.enableWeakerNestedSandbox = true; }],
+    ['enableWeakerNetworkIsolation', (s) => { s.sandbox.enableWeakerNetworkIsolation = true; }],
+    ['allowUnsandboxedCommands', (s) => { s.sandbox.allowUnsandboxedCommands = true; }],
+    ['disableAllHooks', (s) => { s.disableAllHooks = true; }],
+    ['allowManagedHooksOnly', (s) => { s.allowManagedHooksOnly = true; }],
+    ['知らない sandbox の項目', (s) => { s.sandbox.someNewKey = 1; }],
+    ['sandbox の形', (s) => { s.sandbox = 'off'; }],
+    ['sandbox がない', (s) => { delete s.sandbox; }],
+    ['denyRead が配列でない', (s) => { s.sandbox.filesystem.denyRead = '~/x'; }],
+  ];
+  const missed = neg.filter(([, f]) => SC.projectProblems(v2, mut(f)).fail.length === 0).map(([n]) => n);
+  const envWarn = SC.projectProblems(v2, mut((s) => { s.env = { NODE_OPTIONS: '--require /tmp/x.js' }; })).warn.length > 0;
+  const pos = mut((s) => { s.permissions.deny.push('Bash(curl *)'); s.sandbox.filesystem.denyWrite.push('~/Library/LaunchAgents'); s.sandbox.filesystem.denyRead.push('~/.ssh'); s.sandbox.network.allowedDomains = s.sandbox.network.allowedDomains.slice(1); s.sandbox.autoAllowBashIfSandboxed = false; s.disableAllHooks = false; });
+  const pr = SC.projectProblems(v2, pos); const pv = SC.projectProblems(v2, clone(v2));
+  record('ST', 'ST16d', `照合の規則（プロジェクトの設定）：原本に緩める項目を1つずつ足した ${neg.length} 通り（excludedCommands・allowRead・allowWrite・disabled・allowUnixSockets・宛先の追加・enableWeaker*・disableAllHooks・知らない項目・形の違い）はすべて不合格、env の NODE_OPTIONS は注意。陽性の対照：原本そのもの、拒否の規則・禁止の一覧を足し宛先を減らしたものは合格`,
+    missed.length === 0 && envWarn && pr.fail.length === 0 && pr.warn.length === 0 && pv.fail.length === 0 && pv.warn.length === 0,
+    `見逃し=${missed.join(',') || 'なし'} env=${envWarn} 陽性=${[...pr.fail, ...pr.warn, ...pv.fail, ...pv.warn].join(',') || '合格'}`);
+  // ST16e：上の層のファイル（一時のリポジトリとホーム）。ファイルの見つけ方（upperLayerFiles）も含めて確かめる
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'vgdd-conf-st16e-')));
+  const home = path.join(base, 'home'); const repo = path.join(home, 'tsubuyaki-worklog', 'app');
+  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true }); fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+  const FILE = { local: path.join(repo, '.claude/settings.local.json'), user: path.join(home, '.claude/settings.json'), 'user-local': path.join(home, '.claude/settings.local.json') };
+  const want = (() => { const prev = process.env.HOME; process.env.HOME = home; try { return renderForPlace(v2, repo, path.join(home, 'tsubuyaki-z3')).settings; } finally { process.env.HOME = prev; } })();
+  const at = (where, content) => {
+    for (const f of Object.values(FILE)) fs.rmSync(f, { recursive: true, force: true });
+    if (content === 'DIR') fs.mkdirSync(FILE[where]); else if (content !== null) fs.writeFileSync(FILE[where], typeof content === 'string' ? content : JSON.stringify(content));
+    const r = SC.checkUpperLayers({ repo, home, want });
+    return { fail: r.reduce((n, l) => n + l.fail.length, 0), warn: r.reduce((n, l) => n + l.warn.length, 0), present: r.filter((l) => l.present).length };
+  };
+  const failCases = [
+    ['local', { sandbox: { enabled: false } }], ['local', { sandbox: { allowUnsandboxedCommands: true } }], ['local', { sandbox: { failIfUnavailable: false } }],
+    ['user', { sandbox: { excludedCommands: ['git *'] } }], ['user', { sandbox: { filesystem: { disabled: true } } }], ['user', { sandbox: { filesystem: { allowRead: ['~/tsubuyaki-z3/evidence'] } } }],
+    ['local', { sandbox: { filesystem: { allowRead: ['.env.local'] } } }], ['user', { sandbox: { filesystem: { allowRead: ['~/tsub*'] } } }], ['user', { sandbox: { filesystem: { allowWrite: ['~/tsubuyaki-z3'] } } }],
+    ['user', { sandbox: { filesystem: { allowWrite: ['~/tsubuyaki-worklog/app/vgdd'] } } }], ['user-local', { sandbox: { network: { allowAllUnixSockets: true } } }], ['user', { sandbox: { network: { allowedDomains: ['exfil.example'] } } }],
+    ['user', { sandbox: { enableWeakerNetworkIsolation: true } }], ['local', { disableAllHooks: true }], ['user', { disableAllHooks: true }], ['user-local', '{ 壊れた JSON'], ['user', '[1,2]'], ['user', 'DIR'], ['local', { sandbox: 'off' }],
+  ];
+  const warnCases = [['user', { hooks: { PreToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: 'true' }] }] } }], ['user', { sandbox: { filesystem: { allowWrite: ['~/scratch'] } } }], ['user', { env: { NODE_OPTIONS: '--require x' } }], ['local', { sandbox: { someNewKey: 1 } }]];
+  const okCases = [[null, null], ['user', { model: 'opus', permissions: { allow: ['Bash(ls)'], deny: ['Bash(rm *)'] }, sandbox: { enabled: true, filesystem: { denyRead: ['~/secret'], allowRead: ['~/Documents/public'] }, network: { deniedDomains: ['x.example'] } } }],
+    ['local', { sandbox: { allowUnsandboxedCommands: false, failIfUnavailable: true, excludedCommands: [] }, disableAllHooks: false, hooks: {} }], ['user-local', { sandbox: { network: { allowedDomains: ['github.com'] } } }]];
+  const bad = [
+    ...failCases.map(([w, c], i) => [`陰性${i + 1}`, at(w, c)]).filter(([, r]) => r.fail === 0).map(([n]) => n),
+    ...warnCases.map(([w, c], i) => [`注意${i + 1}`, at(w, c)]).filter(([, r]) => !(r.fail === 0 && r.warn > 0)).map(([n]) => n),
+    ...okCases.map(([w, c], i) => [`陽性${i + 1}`, w ? at(w, c) : at('user', null)]).filter(([, r]) => r.fail !== 0 || r.warn !== 0).map(([n]) => n),
+  ];
+  for (const f of Object.values(FILE)) fs.rmSync(f, { recursive: true, force: true });
+  record('ST', 'ST16e', `照合の規則（上の層）：一時のリポジトリとホームの3つのファイルに、弱める値 ${failCases.length} 通り（enabled:false・allowUnsandboxedCommands:true・failIfUnavailable:false・excludedCommands・filesystem.disabled・Z3 や .env.local や保護の場所に重なる allowRead・allowWrite・グロブ・allowAllUnixSockets・原本にない宛先・enableWeaker*・disableAllHooks・壊れた JSON・配列・フォルダ）を置くと不合格、hooks・保護の外への allowWrite・env・知らない項目は注意。陽性の対照：ファイルなし、締める・同じ値の設定は合格`,
+    bad.length === 0, bad.join(',') || '');
 }
 
 // ---- K 停止と再開 -------------------------------------------------------------------------------
@@ -1815,6 +1909,41 @@ console.log(JSON.stringify({ out, cut }));`);
   } finally { try { process.kill(-bg.pid); } catch { /* 終わっている */ } }
 }
 
+// ---- LN 入れ子の起動（p0.4.16。SPEC §5 の起動の窓口・§12）：AI の役割による claude・codex の CLI の起動を、どの役割からも拒む ------------------
+// 入れ子の claude（--bare・--settings・-p）・codex は、外側の sandbox の中で動くが、フック（判定と証拠の記録・役割の閉じ込め）と予算の台帳を通らない。
+//   LN1：起動の変種（パス・大文字・引用符・包むコマンド・置き換え・シェルへの文字列・パイプ・ヒアドキュメント・npx のパッケージ名・codex）を3つの役割から拒む
+//   LN2：名前を起動せずに扱う操作（読む・探す・場所を調べる・文書に書く・コミットの本文）は3つの役割から通す（陽性の対照）
+const LN_DENY = [
+  'claude -p "x"', 'claude --bare -p x', `claude --settings '{"disableAllHooks":true}' -p x`, 'claude --setting-sources user -p x', '/opt/homebrew/bin/claude -p x', '~/.local/bin/claude -p x',
+  'npx @anthropic-ai/claude-code -p x', 'npx -y @anthropic-ai/claude-code@latest -p x', 'npm exec @anthropic-ai/claude-code -- -p x', 'env FOO=1 claude -p x', 'command claude -p x', 'exec claude',
+  'nohup claude -p x &', 'timeout 10 claude -p x', 'claude --version', 'claude --help', 'claude doctor', 'CLAUDE -p y', 'echo x && claude -p y', 'ls & claude -p y', 'ls\nclaude -p y',
+  'bash -c "claude -p x"', "sh -c 'claude -p x'", 'eval "claude -p x"', 'x=$(claude -p hi)', 'echo `claude -p hi`', 'echo "$(claude -p hi)"', "printf 'claude -p x' | sh",
+  'echo claude -p x | bash', 'cat <<EOF | bash\nclaude -p x\nEOF', 'bash <<< "claude -p x"', 'node -e "require(\'child_process\').execSync(\'claude -p x\')"', 'c\\laude -p x', "cla''ude -p x",
+  '"claude" -p x', '/opt/homebrew/bin/cla*e -p x', 'C=claude; $C -p x', '$(which claude) -p x', 'codex exec -s danger-full-access x', '/usr/local/bin/codex exec x', 'npx @openai/codex exec x',
+  'find . -name x -exec claude -p {} \\;', 'xargs claude < list', 'watch "claude -p x"', '(claude -p x)', 'if claude -p x; then echo; fi', 'cd x && claude -p y',
+  'node ~/.npm/_npx/x/node_modules/@anthropic-ai/claude-code/cli.js -p x', '~/.local/share/claude/versions/2.1.325 -p x', 'git commit -m x && claude -p y',
+];
+const LN_ALLOW = [
+  'grep -rn claude docs', 'grep -rn "claude -p" docs', 'cat docs/claude-notes.md', 'which claude', 'type claude', 'command -v claude', 'command -V codex', 'git log --grep=claude',
+  'echo "Claude Code の設定"', 'echo claude', 'ls -la /opt/homebrew/bin/claude', 'test -x /opt/homebrew/bin/claude', 'grep -c codex README.md', 'find . -name claude', 'rg -n claude src',
+  "cat > docs/notes.md <<'EOF'\nClaude を使う\nclaude -p は使わない\nEOF", 'echo "use claude" > docs/x.md', 'git commit -m "claude の記述を直す"', 'npm test', 'cat CLAUDE.md', 'echo $(date) claude',
+];
+function groupLN() {
+  const fx = fixture('ln');
+  const roles = [['executive_head', null, fx.main], ['worker', 'worker', fx.wt], ['tester', 'tester', fx.wt]];
+  const run = (cmds, want) => {
+    const bad = [];
+    for (const [role, at, cwd] of roles) for (const c of cmds) { const g = hook(fx, { tool: 'Bash', input: { command: c }, agent_type: at, cwd }); if (g.decision !== want) bad.push(`${role}: ${c.replace(/\n/g, '⏎').slice(0, 50)} → ${g.decision}`); }
+    return bad;
+  };
+  const d = run(LN_DENY, 'deny');
+  record('LN', 'LN1', `claude・codex の CLI の起動の変種 ${LN_DENY.length} 通り（--bare・--settings・パス・大文字・引用符で分けた名前・env・command・exec・nohup・置き換え・sh -c・eval・パイプ・ヒアドキュメント・npx のパッケージ名・--version）を、行政の長・作業員・テスト担当のどれからも拒む`,
+    d.length === 0, d.slice(0, 4).join(' / '));
+  const a = run(LN_ALLOW, 'allow');
+  record('LN', 'LN2', `名前を起動せずに扱う操作 ${LN_ALLOW.length} 通り（grep・cat・which・command -v・git log・echo・find -name・文書へのヒアドキュメント・コミットの本文）は、3つの役割から通る（陽性の対照）`,
+    a.length === 0, a.slice(0, 4).join(' / '));
+}
+
 // ---- P 移植（p0.4.15。SPEC §11-移植）：別の名前の Z3・別の場所のリポジトリでも同じ強制が働くか、導入の道具 ------------------------
 // ホーム（HOME）は一時ディレクトリにする（~/acme-kernel-z3 の形を試す。本物のホーム・Z3・リポジトリに触れない）。CLI は偽物（実行しない）
 const P_Z3 = 'acme-kernel-z3';
@@ -2178,6 +2307,63 @@ function groupP3() {
     record('P', 'PT22', 'ホームの形 ~<名前> は語の始まりのときだけ：git diff HEAD~1/tsubuyaki は通り、ls ~someone/tsub* は拒否する', ok, ''); }
 }
 
+// ---- P（続き。p0.4.16）：導入の道具の doctor が、設定の厳しさと上の層の設定を、適合性テストと同じ部品で確かめる ------------------------
+function groupP4() {
+  // PT23：一時のホームに install した配置で、doctor が、上の層の設定（<repo>/.claude/settings.local.json・~/.claude/settings.json・settings.local.json）の
+  //   弱める値と読めないファイルを不合格（終了 1）、hooks の節を注意（終了 2）にし、配置済みの設定に足した緩める項目（allowRead）を不合格にする。
+  //   その場所での run.mjs --impl z3 --repo --only ST16 も、上の層の弱める値で ST16b を不合格にする。陽性の対照：ファイルなし・害のない設定は合格（終了 0）
+  const has = fs.existsSync(setupBin());
+  const b = bareRepo('p23'); const env = { ...process.env, ...UTF8, HOME: b.base };
+  const fake = path.join(b.base, 'fakebin'); for (const c of ['claude', 'codex']) { write(path.join(fake, c), '#!/bin/bash\nexit 99\n'); fs.chmodSync(path.join(fake, c), 0o755); }
+  const S = (...a) => (has ? sh(process.execPath, [setupBin(), ...a, '--repo', b.repo, '--z3', b.z3, '--law', VG], { env: { ...env, PATH: `${fake}:${process.env.PATH}` }, timeout: 120000 }) : { status: null, stdout: '' });
+  const ins = S('install');
+  const F = { local: path.join(b.repo, '.claude/settings.local.json'), user: path.join(b.base, '.claude/settings.json'), 'user-local': path.join(b.base, '.claude/settings.local.json') };
+  const doc = (where, content) => {
+    for (const f of Object.values(F)) fs.rmSync(f, { force: true });
+    if (where) write(F[where], typeof content === 'string' ? content : JSON.stringify(content));
+    const r = S('doctor', '--json'); let j = null; try { j = JSON.parse(r.stdout); } catch { j = null; }
+    const st = (id) => j?.checks?.find((c) => c.id === id)?.status;
+    return { code: r.status, layers: st('settings-layers'), strict: st('settings-strict') };
+  };
+  const cases = [
+    ['ファイルなし', null, null, 0, 'pass'],
+    ['local の sandbox.enabled:false', 'local', { sandbox: { enabled: false } }, 1, 'fail'],
+    ['user の excludedCommands', 'user', { sandbox: { excludedCommands: ['node *'] } }, 1, 'fail'],
+    ['user-local の disableAllHooks', 'user-local', { disableAllHooks: true }, 1, 'fail'],
+    ['user の壊れた JSON', 'user', '{ 壊れた', 1, 'fail'],
+    ['user の hooks の節', 'user', { hooks: { Notification: [{ matcher: '*', hooks: [{ type: 'command', command: 'true' }] }] } }, 2, 'warn'],
+    ['user の害のない設定', 'user', { model: 'opus', permissions: { allow: ['Bash(ls)'] } }, 0, 'pass'],
+  ];
+  const got = has && ins.status === 0 ? cases.map(([n, w, c, code, lay]) => { const r = doc(w, c); return [n, r.code === code && r.layers === lay && r.strict === 'pass', `${r.code}/${r.layers}`]; }) : [];
+  // 配置済みの設定（.claude/settings.json）に緩める項目を足すと settings-strict が不合格。戻せば合格
+  const sp = path.join(b.repo, '.claude/settings.json'); let strictOk = false; let strictDet = '-';
+  if (has && ins.status === 0) {
+    for (const f of Object.values(F)) fs.rmSync(f, { force: true });
+    const orig = fs.readFileSync(sp, 'utf8'); const j = JSON.parse(orig); j.sandbox.filesystem.allowRead = ['~/x'];
+    fs.writeFileSync(sp, JSON.stringify(j, null, 2) + '\n');
+    const r1 = doc(null, null);
+    fs.writeFileSync(sp, orig);
+    strictOk = r1.code === 1 && r1.strict === 'fail'; strictDet = `${r1.code}/${r1.strict}`;
+  }
+  // 同じ配置での適合性テスト（--only ST16）：上の層の弱める値で ST16b が不合格、なければ ST16・ST16b・ST16c が合格
+  const nest = () => { const out = path.join(b.base, `nested-${++seq}.json`); sh(process.execPath, [path.join(HERE, 'run.mjs'), '--impl', 'z3', '--repo', b.repo, '--only', 'ST16', '--json', out], { env: { ...env, VGDD_Z3_DIR: b.z3 }, timeout: 300000 }); try { return JSON.parse(fs.readFileSync(out, 'utf8')).results; } catch { return []; } };
+  let nestOk = false; let nestDet = '-';
+  if (has && ins.status === 0) {
+    for (const f of Object.values(F)) fs.rmSync(f, { force: true });
+    const clean = nest();
+    write(F.local, JSON.stringify({ sandbox: { allowUnsandboxedCommands: true } }));
+    const dirty = nest();
+    fs.rmSync(F.local, { force: true });
+    const ok = (rs, id) => rs.find((x) => x.id === id)?.ok;
+    nestOk = ['ST16', 'ST16b', 'ST16c'].every((id) => ok(clean, id) === true) && ok(dirty, 'ST16b') === false && ok(dirty, 'ST16') === true;
+    nestDet = `なし=${['ST16', 'ST16b', 'ST16c'].map((id) => ok(clean, id)).join('/')} local=${ok(dirty, 'ST16b')}`;
+  }
+  const bad = got.filter(([, ok]) => !ok);
+  record('P', 'PT23', 'doctor は上の層の設定（<repo>/.claude/settings.local.json・~/.claude/settings.json・settings.local.json）の弱める値（enabled:false・excludedCommands・disableAllHooks）と壊れた JSON を不合格（終了 1）、hooks の節を注意（終了 2）にし、配置済みの設定に足した allowRead を不合格にする。同じ配置の run.mjs --impl z3 --only ST16 も上の層の弱める値で ST16b を不合格にする。陽性の対照：ファイルなし・害のない設定は合格（終了 0）',
+    has && ins.status === 0 && got.length === cases.length && bad.length === 0 && strictOk && nestOk,
+    has ? `install=${ins.status} ${got.map(([n, ok, d]) => `${n}=${ok ? '○' : `×(${d})`}`).join(' ')} 配置の allowRead=${strictDet} 入れ子=${nestDet}` : '導入の道具がない');
+}
+
 // ---- 権限の表の自己検査（どの権限にも確かめ方がある） ------------------------------------------
 function groupMeta() {
   const ids = new Set(results.map((r) => r.id));
@@ -2313,7 +2499,8 @@ try {
   if (runs('B')) groupB();
   if (runs('W')) groupW();
   if (runs('OC')) groupOC();
-  if (runs('P')) { groupP(); groupP2(); groupP3(); }
+  if (runs('P')) { groupP(); groupP2(); groupP3(); groupP4(); }
+  if (runs('LN')) groupLN();
   if (runs('INV')) groupINV();
   if (!ONLY) { groupMeta(); groupInvMeta(); }
   else console.log(`\n（--only ${[...ONLY].join(',')}：一部の群だけを動かした。M・INV の自己検査をしていないので、この結果は適合の主張に使えない）`);
