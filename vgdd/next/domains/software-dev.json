@@ -1,0 +1,47 @@
+{
+  "schema": "vgdd.domain-pack.v1",
+  "id": "software-dev",
+  "title": "システム開発（今の VGDD の実装が前提にしていること）",
+  "work_item": {
+    "id_pattern": "^T-[0-9]{3,4}$",
+    "store": "docs/tasks",
+    "spec_sections": ["受け入れ条件"],
+    "resource_field": "files_allowed"
+  },
+  "artifact": { "kind": "git-tree", "integrate": "git-ff-merge" },
+  "lifecycle": [
+    { "stage": "企画", "produces": "目標（オーナーが決める）", "gate": "none", "status": "not_implemented" },
+    { "stage": "要件定義", "produces": "票の仕様（受け入れ条件）", "gate": "approval", "status": "implemented" },
+    { "stage": "設計", "produces": "設計（票の仕様の一部。独立した関門はない）", "gate": "none", "status": "not_implemented" },
+    { "stage": "実装", "produces": "票ごとの候補のコミット（gate-runner の段階 2〜10）", "gate": "judicial", "status": "implemented" },
+    { "stage": "試験", "produces": "決定論的な監査の結果（gate-runner の段階 5）", "gate": "judicial", "status": "implemented" },
+    { "stage": "セキュリティ検証", "produces": "security_review の票だけの追加の司法（段階 9）", "gate": "judicial", "status": "implemented" },
+    { "stage": "リリース", "produces": "main への統合の確定（夜間の合格は held にして朝のオーナーの承認）", "gate": "approval", "status": "implemented" },
+    { "stage": "運用", "produces": "運用の記録", "gate": "none", "status": "not_implemented" },
+    { "stage": "保守", "produces": "保守の票", "gate": "none", "status": "not_implemented" },
+    { "stage": "廃止", "produces": "廃止の記録", "gate": "none", "status": "not_implemented" }
+  ],
+  "audits": [
+    { "id": "install", "command": ["npm", "ci", "--no-fund", "--no-audit"], "required": true, "sandbox": true },
+    { "id": "test", "command": ["npm", "run", "-s", "test"], "required": true, "sandbox": true },
+    { "id": "typecheck", "command": ["npm", "run", "-s", "typecheck"], "required": true, "sandbox": true },
+    { "id": "lint", "command": ["npm", "run", "-s", "lint"], "required": true, "sandbox": true }
+  ],
+  "judiciary": {
+    "categories": ["requirement", "correctness", "security", "test", "protected_path", "input"],
+    "min_judges": 2,
+    "distinct_lineage": true,
+    "inputs": ["diff", "acceptance", "audit_results"]
+  },
+  "protected": ["vgdd/**", "vgdd/next/domains/**", ".claude/**"],
+  "disclosures": [
+    "開発エージェントは Claude Code で、フックの入力の形に依っている（docs/adoption.md §3）",
+    "sandbox は macOS の Seatbelt で確かめた。ほかの OS は未確認",
+    "統合先は Git の main で、票は docs/tasks/。決定論的な監査は npm ci・test・typecheck・lint が動く Node.js の案件に限る",
+    "仕様の承認・裁定・停止を担う人が 1 人いる前提。複数人の権限分離・企業の認証基盤との接続・クラウドでの監査はない",
+    "同じ機械の管理者を信頼する。記録の外部への固定はしていない",
+    "昼の司法の費用の上限は未実装",
+    "企画・設計・運用・保守・廃止の段は Kernel に関門がない（not_implemented）。関門の数に数えない",
+    "この宣言は現在の実装の書き写しで、宣言から Kernel が動く仕組みはまだない"
+  ]
+}

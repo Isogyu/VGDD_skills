@@ -1,0 +1,36 @@
+{
+  "schema": "vgdd.domain-pack.v1",
+  "id": "research-report",
+  "title": "調査報告書（非開発の例。このパックで実際に仕事を回したことはない）",
+  "work_item": {
+    "id_pattern": "^R-[0-9]{3,4}$",
+    "store": "reports/items",
+    "spec_sections": ["問い", "受け入れ条件"],
+    "resource_field": "sections_allowed"
+  },
+  "artifact": { "kind": "document-set", "integrate": "publish-copy" },
+  "lifecycle": [
+    { "stage": "問いの設定", "produces": "調査の問いと範囲（オーナーが承認）", "gate": "approval", "status": "implemented" },
+    { "stage": "資料の収集", "produces": "出典の一覧", "gate": "none", "status": "not_implemented" },
+    { "stage": "起草", "produces": "報告書の草稿", "gate": "none", "status": "not_implemented" },
+    { "stage": "審査", "produces": "出典と主張の対応の審査", "gate": "judicial", "status": "implemented" },
+    { "stage": "公開", "produces": "報告書の公開（オーナーの承認）", "gate": "approval", "status": "implemented" }
+  ],
+  "audits": [
+    { "id": "source-url-format", "command": ["node", "tools/check-source-urls.mjs", "--strict"], "required": true, "sandbox": true },
+    { "id": "length", "command": ["node", "tools/check-length.mjs", "--max-chars", "20000"], "required": false, "sandbox": true }
+  ],
+  "judiciary": {
+    "categories": ["requirement", "correctness", "citation", "overclaim"],
+    "min_judges": 1,
+    "distinct_lineage": true,
+    "inputs": ["document_diff", "acceptance", "audit_results", "source_excerpts"]
+  },
+  "protected": ["vgdd/**", "vgdd/next/domains/**", "tools/**"],
+  "disclosures": [
+    "このパックで実際に仕事を回したことはない。非開発領域への汎用化の形を示す例である",
+    "audits の command（tools/check-source-urls.mjs・tools/check-length.mjs）は実在しない例である",
+    "出典の URL の形式を検査しても、出典が主張を支えていることは保証しない。その確認は司法（LLM）に頼り、決定論的ではない",
+    "資料の収集・起草の段は Kernel に関門がない（not_implemented）。関門の数に数えない"
+  ]
+}
