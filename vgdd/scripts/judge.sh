@@ -17,7 +17,7 @@
 #                `requirements_source` がなければ従来どおり（--req が必要）
 #     --base     差分の基点（既定: origin/main と HEAD の merge-base。なければ HEAD~1）
 #     --task     タスク ID（記録用。既定: 日時）
-#     --out      判定 JSON の保存先（既定: ~/tsubuyaki-z3/evidence/verdicts/。z3 に書けるのはオーナー側だけ）
+#     --out      判定 JSON の保存先（既定: ${VGDD_Z3_DIR:-~/tsubuyaki-z3}/evidence/verdicts/。z3 に書けるのはオーナー側だけ）
 #     --dry-run  judge を呼ばず、組み立てた入力を表示して終わる
 #
 # 前提: .claude/agents/judge.md が配置済み（原本は vgdd/agents/judge.md）。claude CLI が使える。
@@ -26,7 +26,7 @@
 
 set -euo pipefail
 
-REQ=""; BASE=""; TASK=""; OUT_DIR="${HOME}/tsubuyaki-z3/evidence/verdicts"; DRY=0; EMIT=0; STATE_FILE=""; TICKET=""
+REQ=""; BASE=""; TASK=""; OUT_DIR="${VGDD_Z3_DIR:-${HOME}/tsubuyaki-z3}/evidence/verdicts"; DRY=0; EMIT=0; STATE_FILE=""; TICKET=""   # p0.4.15：既定の出力先も VGDD_Z3_DIR を見る
 while [ $# -gt 0 ]; do
   case "$1" in
     --req) REQ="$2"; shift 2;;

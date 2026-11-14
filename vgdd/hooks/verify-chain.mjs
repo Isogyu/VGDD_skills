@@ -17,7 +17,7 @@ import crypto from 'node:crypto';
 
 const args = process.argv.slice(2);
 const summaryJson = args.includes('--summary-json');
-const file = args.find((a) => !a.startsWith('--')) || path.join(os.homedir(), 'tsubuyaki-z3', 'evidence', 'tool_calls.jsonl');
+const file = args.find((a) => !a.startsWith('--')) || path.join(process.env.VGDD_Z3_DIR || path.join(os.homedir(), 'tsubuyaki-z3'), 'evidence', 'tool_calls.jsonl');   // p0.4.15：既定も VGDD_Z3_DIR を見る
 const sha256 = (s) => 'sha256:' + crypto.createHash('sha256').update(s, 'utf8').digest('hex');
 
 if (!fs.existsSync(file)) {

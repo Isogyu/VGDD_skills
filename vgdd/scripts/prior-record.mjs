@@ -20,18 +20,58 @@ const MAX_REPORT = 800;
 const MAX_FINDINGS = 10;
 const MAX_FILE = 4 * 1024 * 1024;
 
+// p0.4.15（独立した審査の指摘）：①長い入力で極端に遅かった（メールアドレスの照合が O(n²)。10 万字の a で約 9.5 秒）。
+//   先に長さで切ってから伏せる（切る位置は上限＋伏せ字で縮む分の余裕。切った位置の語は秘密の途中かもしれないので落とす）。
+//   正規表現は、語の始まりでだけ照合を始める形（後ろ読み）にして、線形の時間で終わるようにする。
+//   ②伏せられない形があった（github_pat_・ghp_ の短いもの・AIza・xox?-・ASIA・JWT・Bearer の後ろの長い文字列・全角の ＠ のメールアドレス）。
+//   過剰に伏せない：「Bearer の説明」「約 ~5/10」のような普通の文は伏せない。URL はスキームとホスト（とポート）だけを残し、
+//   パス・クエリ・フラグメントと認証情報（user:pass@）は伏せる（審査 M1：URL を丸ごと残すと、クエリの鍵・署名・URL の中のホームのパスが出た）
+//   伏せ字は既知の形の照合で、すべての秘密を伏せる保証はない（SPEC §12）
+const SCRUB_MARGIN = 1024;   // 切る位置の余裕（伏せ字で縮む分）
+const SECRET_PATTERNS = [
+  /-----BEGIN [A-Z ]{1,40}-----[\s\S]*?(?:-----END [A-Z ]{1,40}-----|$)/g,
+  /sk-ant-[A-Za-z0-9_-]{8,}/g, /sk-[A-Za-z0-9_-]{16,}/g,
+  /github_pat_[A-Za-z0-9_]{10,}/g, /gh[pousr]_[A-Za-z0-9_]{10,}/g,
+  /AIza[0-9A-Za-z_-]{20,}/g, /xox[abprs]-[A-Za-z0-9-]{8,}/g,
+  /AKIA[0-9A-Z]{16}/g, /ASIA[0-9A-Z]{16}/g,
+  /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*/g,   // JWT の形
+  /Bearer\s+[A-Za-z0-9._~+/=-]{20,}/gi,                                          // 直後が鍵らしい長い文字列のときだけ
+  /(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+[@＠][A-Za-z0-9.-]+\.[A-Za-z]{2,}/g,    // メールアドレス（全角の ＠ も）。語の始まりでだけ照合を始める
+];
+const URL_RE = /(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]{0,30}:\/\/[^\s'"`）)」』、。]+/g;
+/** URL のスキームとホスト（とポート）だけを残す。認証情報は［伏せた］@、ホストの後ろに何かあれば /［伏せた］ */
+function urlHead(u) {
+  const m = /^([A-Za-z][A-Za-z0-9+.-]*:\/\/)([^/?#]*)([\s\S]*)$/.exec(u);
+  if (!m) return '［伏せた］';
+  let auth = m[2]; let user = '';
+  const at = auth.lastIndexOf('@');
+  if (at !== -1) { user = '［伏せた］@'; auth = auth.slice(at + 1); }
+  if (!/^[A-Za-z0-9.-]*(?::[0-9]{1,5})?$/.test(auth) && !/^\[[0-9A-Fa-f:.]+\](?::[0-9]{1,5})?$/.test(auth)) auth = '［伏せた］';
+  const rest = m[3] && m[3] !== '/' ? '/［伏せた］' : m[3];
+  return `${m[1]}${user}${auth}${rest}`;
+}
 /** 秘密らしい文字列・絶対パス・制御文字を伏せる。長さも切る */
 export function scrub(s, max) {
   let t = String(s ?? '');
-  t = t.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, ' ');
-  t = t.replace(/sk-ant-[A-Za-z0-9_-]{8,}/g, '［伏せた］').replace(/AKIA[0-9A-Z]{16}/g, '［伏せた］').replace(/-----BEGIN [A-Z ]+-----[\s\S]*?(-----END [A-Z ]+-----|$)/g, '［伏せた］');
-  t = t.replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '［伏せた］');
-  t = t.replace(/sk-[A-Za-z0-9_-]{16,}/g, '［伏せた］').replace(/gh[pousr]_[A-Za-z0-9]{20,}/g, '［伏せた］');
+  const limit = max + SCRUB_MARGIN;
+  const cut = t.length > limit;
+  if (cut) {
+    // 切った位置の、鍵に使われる文字の連なりを落とす（秘密の途中で切れて、伏せる形に合わない前半が残らないように。日本語の文は落とさない）
+    let e = limit;
+    while (e > 0 && /[A-Za-z0-9._~+/=:%@＠-]/.test(t[e - 1])) e--;
+    t = t.slice(0, e);
+  }
+  t = t.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, ' ');
+  for (const re of SECRET_PATTERNS) t = t.replace(re, '［伏せた］');
+  t = t.replace(/file:\/\/\S+/gi, '［パス］');
+  const urls = [];   // URL は退避する。残すのはスキームとホスト（とポート）だけ。認証情報・パス・クエリ・フラグメントは伏せる
+  t = t.replace(URL_RE, (u) => { urls.push(urlHead(u)); return `${urls.length - 1}`; });
   t = t.replace(/\/(?:Users|home|private|var|tmp|opt|etc|usr|Library|Volumes|System|Applications|root|srv|mnt)\/[^\s'"`）)」』、。]*/g, '［パス］');   // よく使う根のパスは、前の文字によらず伏せる
   t = t.replace(/(^|[\s(（「『"'`=:、。])(?:\/[^\s'"`）)」』、。]+|[A-Za-z]:\\[^\s'"`）)」』、。]*)/g, '$1［パス］');   // ほかの絶対パスも伏せる
+  t = t.replace(/(\d+)/g, (_, i) => urls[Number(i)] ?? '');
   t = t.replace(/```/g, "'''");   // 引用の囲みを壊させない
   t = t.replace(/\s+/g, ' ').trim();
-  return t.length > max ? `${t.slice(0, max)}…` : t;
+  return t.length > max ? `${t.slice(0, max)}…` : cut ? `${t}…` : t;
 }
 
 /** 相対パスとして安全なときだけ返す（絶対パス・..・制御文字は null） */

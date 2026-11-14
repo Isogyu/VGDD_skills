@@ -1,6 +1,6 @@
 {
   "schema": "vgdd.capabilities.v1",
-  "kernel_version": "p0.4.14",
+  "kernel_version": "p0.4.15",
   "note": "Governance Kernel の権限の表（ADR-001・ADR-003）。役割ごとに、何ができ、何ができず、それを どの層が強制しているかを書く。expect はフック（Policy Decision Point）の判定。enforced_by はその操作を実際に止める層（複数あれば全部）。'promise' は強制がなく約束だけのもの（弱点として公開する）。probes は適合性テスト（vgdd/conformance/run.mjs）がフックに実際に入力する操作で、{self} はその役割の作業場所のルート、{main} は main の checkout、{wt} は作業員の worktree、{z3} は Z3。 個々の probe に expect があれば、その役割についてはそちらを優先する。",
   "layers": {
     "hook": "PreToolUse フック policy.mjs（Policy Decision Point。拒否と記録）",
@@ -120,7 +120,15 @@
         "executive_head": "deny",
         "worker": "deny",
         "tester": "deny"
-      }
+      },
+      "scenario_tests": [
+        "PT7",
+        "PT8",
+        "PT9",
+        "PT10",
+        "PT14",
+        "PT16"
+      ]
     },
     {
       "id": "CAP-EVIDENCE-READ",
@@ -154,7 +162,18 @@
         "executive_head": "deny",
         "worker": "deny",
         "tester": "deny"
-      }
+      },
+      "scenario_tests": [
+        "PT1",
+        "PT2",
+        "PT2b",
+        "PT3",
+        "PT12",
+        "PT13"
+      ],
+      "known_gaps": [
+        "p0.4.15：フックの Bash の照合は、Z3 の名前とその先頭4字（ホームの形・Z3 の親の絶対パスの直後。2 段目の Z3 では途中の段のグロブも）による文字列の照合。ホームの形を経ない相対パス（../）、中括弧の展開、変数で組み立てたパス、[t]… の文字クラス、バックスラッシュ・空の引用符での分割、3 字のグロブ（~/tsu*）、大文字と小文字だけを変えた名前は見分けきれない。最後に止めるのは sandbox の denyRead（実際のセッションで確かめる）"
+      ]
     },
     {
       "id": "CAP-EVIDENCE-WRITE",
@@ -191,7 +210,11 @@
         "executive_head": "deny",
         "worker": "deny",
         "tester": "deny"
-      }
+      },
+      "scenario_tests": [
+        "PT1",
+        "PT4"
+      ]
     },
     {
       "id": "CAP-BOARD-WRITE",
@@ -300,6 +323,9 @@
       },
       "known_gaps": [
         "行政の長の git push origin HEAD:main はフックでは止めない（権限ルールの ask。人が許可すれば通る）"
+      ],
+      "scenario_tests": [
+        "PT5"
       ]
     },
     {
@@ -449,6 +475,41 @@
       }
     },
     {
+      "id": "CAP-READONLY-OUTSIDE-WRITE",
+      "title": "リポジトリの外の読み取り専用の領域（準備資料・作業記録。p0.4.15 から Z3 の kernel.config.json で足せる）に書く",
+      "allowed": [
+        "owner"
+      ],
+      "enforced_by": [
+        "permission",
+        "sandbox",
+        "hook"
+      ],
+      "probes": [
+        {
+          "tool": "Write",
+          "file_path": "{main}/../preparation/kernel-probe.md"
+        },
+        {
+          "tool": "Bash",
+          "command": "cp /tmp/x {main}/../event_records/kernel-probe.md"
+        }
+      ],
+      "expect": {
+        "executive_head": "deny",
+        "worker": "deny",
+        "tester": "deny"
+      },
+      "scenario_tests": [
+        "PT6",
+        "PT15"
+      ],
+      "known_gaps": [
+        "kernel.config.json の readonly_dirs（置き換え）は既定の2つを外せる（保護を減らせる）。書けるのはオーナーだけ（Z3 の中）で、doctor が「既定の保護を外している」と注意を出す。extra_readonly_dirs（足す）は保護を減らせない。設定の中身は適合性テストの記録と状態の写しに出さない",
+        "sandbox の denyWrite と権限の規則には、設定で足した領域は自動では入らない（オーナーが .claude/settings.json に足す。doctor が欠けを不合格にする）"
+      ]
+    },
+    {
       "id": "CAP-SPEC-DRAFT",
       "title": "仕様（票の統治の項目・受け入れ条件、docs/requirements.md）を起草する",
       "allowed": [
@@ -566,7 +627,9 @@
         "R8",
         "R9",
         "G5",
-        "N5"
+        "N5",
+        "PT5b",
+        "PT11"
       ],
       "known_gaps": [
         "停止の前に始まって実行中の処理（長い Bash、夜間の作業員、司法の呼び出し）は強制終了しない。次のツール呼び出しはフックが止める"
@@ -582,7 +645,10 @@
         "permission",
         "sandbox"
       ],
-      "verified_by": "docs/vgdd-status.md §2 の 11〜13、§2b の V7-3（実セッションで確認。フックの単体試験の対象外）"
+      "verified_by": "docs/vgdd-status.md §2 の 11〜13、§2b の V7-3（実セッションで確認。フックの単体試験の対象外）",
+      "scenario_tests": [
+        "PT18"
+      ]
     },
     {
       "id": "CAP-KERNEL-STATE-WRITE",
@@ -639,7 +705,8 @@
         "ST14c",
         "ST14d",
         "ST16",
-        "ST17"
+        "ST17",
+        "PT17"
       ],
       "known_gaps": [
         "中身が Z3 と一致することは、Z3 を読めるオーナーの照合に依る（行政は照合できない）",
@@ -785,7 +852,13 @@
         "executive_head": "deny",
         "worker": "deny",
         "tester": "deny"
-      }
+      },
+      "scenario_tests": [
+        "W8",
+        "W9",
+        "W10",
+        "W11"
+      ]
     },
     {
       "id": "CAP-LAUNCH-REQUEST",

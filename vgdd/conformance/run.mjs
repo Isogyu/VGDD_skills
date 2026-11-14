@@ -11,6 +11,9 @@
 //   node vgdd/conformance/run.mjs --impl z3 --record … 結果の1行を Z3 の evidence/conformance.jsonl に残す（p0.4.3。Kernel の状態の写しに出る。オーナーが実行）
 //   node vgdd/conformance/run.mjs --json out.json … 結果を JSON にも書く
 //   node vgdd/conformance/run.mjs --observe <repo> … 加えて、実際のリポジトリの票の status の変更を作者ごとに数える（観測。合否なし）
+//   node vgdd/conformance/run.mjs --z3-name <名前> … 試験用の偽の Z3 のフォルダの名前（既定 tsubuyaki-z3。p0.4.15。別の名前の Z3 でも同じ結果になることを確かめる）
+//   node vgdd/conformance/run.mjs --repo-name <名前> … 試験用のリポジトリのフォルダの名前（既定 app。例 acme-worklog/app。p0.4.15）
+//   node vgdd/conformance/run.mjs --only C1,ST16  … 開発用：指定の群だけを動かす（M・INV の自己検査をしないので、適合の主張と --record には使えない。p0.4.15）
 // 終了コード：0 ＝ すべて合格、1 ＝ 不合格あり、2 ＝ 試験の準備に失敗
 //
 // 試験の群：
@@ -22,18 +25,31 @@
 //   A  証跡（全判定の記録、スキーマ、改ざん・切り詰めの検出）                                               … 成立条件⑤
 //   W  起動の窓口と前の試行の記録（申請の検証・night-runner --launch・指摘と仮説の区別。p0.4.10）            … SPEC §5-4
 //   B  予算の台帳（予約・精算・不明の扱い・同時の予約・重複・停止・期間・破損・超過。p0.4.9）               … SPEC §9
+//   P  移植（別の名前の Z3・別の場所のリポジトリでの強制、導入の道具 vgdd-setup.mjs。p0.4.15）              … SPEC §11-移植
 
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawnSync, spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
 const opt = (k) => { const i = args.indexOf(k); return i === -1 ? null : args[i + 1]; };
 const impl = opt('--impl') || 'repo';
+// p0.4.15：試験用の偽の Z3 のフォルダの名前（既定は本番と同じ）。別の名前でも同じ結果になることを確かめる
+const DEFAULT_Z3_NAME = 'tsubuyaki-z3';
+const Z3_NAME = opt('--z3-name') || DEFAULT_Z3_NAME;
+if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(Z3_NAME)) { console.error('--z3-name は英数字と . _ - だけ'); process.exit(2); }
+// p0.4.15（審査 m10）：試験用のリポジトリのフォルダの名前（既定 app。base からの相対。例 acme-worklog/app）
+const REPO_NAME = opt('--repo-name') || 'app';
+if (!REPO_NAME.split('/').every((x) => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(x))) { console.error('--repo-name は英数字と . _ - の段を / でつないだもの'); process.exit(2); }
+const ONLY = opt('--only') ? new Set(opt('--only').split(',').map((x) => x.trim()).filter(Boolean)) : null;
+const KNOWN_GROUPS = ['C1', 'A', 'C2', 'C3', 'G', 'ST', 'ST16', 'K', 'H', 'N', 'L', 'B', 'W', 'OC', 'P', 'INV'];
+if (ONLY && (ONLY.size === 0 || [...ONLY].some((g) => !KNOWN_GROUPS.includes(g)))) { console.error(`--only に知らない群がある（使える群：${KNOWN_GROUPS.join(',')}）`); process.exit(2); }
+const runs = (g) => !ONLY || ONLY.has(g);
+if (ONLY && args.includes('--record')) { console.error('--only と --record は一緒に使えない（一部の群だけの結果を記録しない）'); process.exit(2); }
 const VG = path.resolve(HERE, '..');
 // p0.4.8：--impl z3 で試す写しの場所も、--record の書き先と同じく VGDD_Z3_DIR を優先する（既定と違う場所の導入で、別の写しを試さない）
 const Z3REAL = process.env.VGDD_Z3_DIR || path.join(os.homedir(), 'tsubuyaki-z3');
@@ -47,6 +63,7 @@ const IMPL = impl === 'z3'
 if (args.includes('--print-impl')) { console.log(JSON.stringify({ impl, ...IMPL })); process.exit(0); }
 const CAPS = JSON.parse(fs.readFileSync(path.join(VG, 'kernel/capabilities.json'), 'utf8'));
 const DECISION_SCHEMA = JSON.parse(fs.readFileSync(path.join(VG, 'schemas/kernel-decision.schema.json'), 'utf8'));
+const Z3_RE_SRC = Z3_NAME.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');   // 試験用の Z3 の名前（正規表現として安全に）
 const UTF8 = { LC_ALL: 'ja_JP.UTF-8', LANG: 'ja_JP.UTF-8' }; // OBS-043：本番と同じロケールで動かす
 
 const results = [];
@@ -99,14 +116,14 @@ ${log}
 `;
 
 /** 写しのリポジトリ（main の checkout と作業員の worktree）と偽の Z3 を作る */
-function fixture(name) {
+function fixture(name, { z3Name = Z3_NAME, repoRel = REPO_NAME } = {}) {
   const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), `vgdd-conf-${name}-`)));
-  const main = path.join(base, 'app');
-  const z3 = path.join(base, 'tsubuyaki-z3'); // 名前も本番と同じにする（フックの Bash の照合は名前で Z3 を見る）
+  const main = path.join(base, repoRel);
+  const z3 = path.join(base, z3Name); // 名前は既定で本番と同じ（p0.4.15 から --z3-name で変えられる。フックの Bash の照合は Z3 の場所から名前を作る）
   fs.mkdirSync(path.join(z3, 'evidence/verdicts'), { recursive: true });
   fs.mkdirSync(path.join(z3, 'bin'), { recursive: true });
   fs.mkdirSync(path.join(z3, 'hooks'), { recursive: true });
-  fs.mkdirSync(path.join(base, 'preparation'), { recursive: true });
+  fs.mkdirSync(path.resolve(main, '..', 'preparation'), { recursive: true });
   fs.mkdirSync(main, { recursive: true });
   git(main, 'init', '-q', '-b', 'main');
   git(main, 'config', 'user.name', 'owner'); git(main, 'config', 'user.email', 'owner@example.invalid');
@@ -132,9 +149,10 @@ const LIMITS_WIDE = { schema: 'vgdd.budget-limits.v1', period_id: 'conformance',
 
 let seq = 0;
 /** フックに1回入力する。返り値 { decision, reason, code } */
-function hook(fx, { tool, input, agent_type = null, cwd }) {
+function hook(fx, { tool, input, agent_type = null, cwd, env = {} }) {
   const payload = { hook_event_name: 'PreToolUse', session_id: 'conformance', tool_use_id: `toolu_conf_${++seq}`, tool_name: tool, tool_input: input, cwd, agent_type };
-  const r = sh('node', [IMPL.policy], { input: JSON.stringify(payload), env: { ...process.env, VGDD_Z3_DIR: fx.z3, VGDD_EVIDENCE_PATH: fx.evidence, CLAUDE_PROJECT_DIR: fx.main } });
+  // p0.4.15（審査 m3）：フックはホームの外の Z3 を拒むので、ホームを試験の場所（Z3 の親）にする。本物のホームに触れない
+  const r = sh('node', [IMPL.policy], { input: JSON.stringify(payload), env: { ...process.env, HOME: fx.base, VGDD_Z3_DIR: fx.z3, VGDD_EVIDENCE_PATH: fx.evidence, CLAUDE_PROJECT_DIR: fx.main, ...env } });
   const decision = r.status === 0 ? 'allow' : r.status === 2 ? 'deny' : `error(${r.status})`;
   return { decision, reason: (r.stderr || '').trim().slice(0, 160), code: r.status };
 }
@@ -736,7 +754,7 @@ function groupST() {
   record('ST', 'ST1', '裁判所が周回の終わりに状態の写しを書き、中身は公開してよい集計だけ（パス・ハッシュ・理由の本文・セッション ID を含まない）',
     !!st && st.schema === 'vgdd.kernel-state.v1' && st.kernel_version === CAPS.kernel_version && st.stopped?.active === false
       && st.approvals?.some((a) => a.task === 'T-930' && a.current === true) && st.rulings?.count === 1 && st.annulments?.count === 1 && st.verdicts?.by_task?.['T-930']?.judge === 'APPROVED'
-      && !/\/Users\/|tsubuyaki-z3|vgdd-conf|[0-9a-f]{8,}|session|tool_use|reason|findings|理由の本文/.test(g.kstate) && !('tickets' in st),
+      && !new RegExp(String.raw`\/Users\/|${Z3_RE_SRC}|vgdd-conf|[0-9a-f]{8,}|session|tool_use|reason|findings|理由の本文`).test(g.kstate) && !('tickets' in st),
     st ? '' : `書き出しがない ${g.out}`);
   record('ST', 'ST2', '状態の写しは git で追跡されない（裁判所の記録のコミットに入らず、作業ツリーを汚さない）',
     !!st && sh('git', ['-C', fx.main, 'status', '--porcelain', '--', 'docs/governance']).stdout.trim() === ''
@@ -796,7 +814,7 @@ function groupST() {
       && Object.values(byId).every((i) => i.verified === null) && iv.verified_by === null   // 原本（impl: repo）の記録は、稼働中の検証済みとして出さない
       && byId['INV-09']?.status === 'not_applicable' && iv.invariants.every((i) => !('title' in i))
       && iv.pending_approvals?.some((p) => p.task === 'T-932') && !iv.pending_approvals?.some((p) => p.task === 'T-930') && iv.pending_approvals.every((p) => !('title' in p))
-      && !/\/Users\/|tsubuyaki-z3|vgdd-conf|[0-9a-f]{8,}|秘密の本文|適合性テストの票/.test(ivs) && sh('git', ['-C', f10.main, 'status', '--porcelain', '--', 'docs/governance']).stdout.trim() === '',
+      && !new RegExp(String.raw`\/Users\/|${Z3_RE_SRC}|vgdd-conf|[0-9a-f]{8,}|秘密の本文|適合性テストの票`).test(ivs) && sh('git', ['-C', f10.main, 'status', '--porcelain', '--', 'docs/governance']).stdout.trim() === '',
     iv ? JSON.stringify(iv.pending_approvals).slice(0, 120) : 'ない');
   void ivRepo;
   // 稼働中の実装（z3）で今の版を試した記録なら、不変条件ごとの結果と対象（版・実装・日時）が出る
@@ -830,7 +848,7 @@ function groupST() {
   // 相対パスの --repo でも、起動の時点の場所で解決した絶対パスが渡る
   const fr = gateFixture('st14r');
   fs.rmSync(path.join(fr.z3, 'sbx-repo.log'), { force: true });
-  sh('bash', [path.join(IMPL.bin, 'gate-runner.sh'), '--repo', 'app', '--once', '--interval', '1'], { cwd: fr.base, env: { ...process.env, ...UTF8, VGDD_Z3_DIR: fr.z3, STUB_VERDICT: 'APPROVED' }, timeout: 120000 });
+  sh('bash', [path.join(IMPL.bin, 'gate-runner.sh'), '--repo', REPO_NAME, '--once', '--interval', '1'], { cwd: fr.base, env: { ...process.env, ...UTF8, VGDD_Z3_DIR: fr.z3, STUB_VERDICT: 'APPROVED' }, timeout: 120000 });
   const seenR = fs.existsSync(path.join(fr.z3, 'sbx-repo.log')) ? fs.readFileSync(path.join(fr.z3, 'sbx-repo.log'), 'utf8').split('\n').filter(Boolean) : [];
   record('ST', 'ST14b', '--repo を相対パス（app）で渡しても、監査の sandbox には起動の場所で解決した絶対パスが渡る',
     seenR.length > 0 && seenR.every((r) => path.isAbsolute(r) && fs.realpathSync(r) === fs.realpathSync(fr.main)), seenR.slice(0, 1).join(','));
@@ -848,27 +866,15 @@ function groupST() {
   // CDPATH を継承していても、--repo の相対パスは起動の場所で解決する
   const fc = gateFixture('st14d');
   fs.rmSync(path.join(fc.z3, 'sbx-repo.log'), { force: true });
-  fs.mkdirSync(path.join(fc.base, 'decoy', 'app'), { recursive: true });
-  sh('bash', [path.join(IMPL.bin, 'gate-runner.sh'), '--repo', 'app', '--once', '--interval', '1'], { cwd: fc.base, env: { ...process.env, ...UTF8, VGDD_Z3_DIR: fc.z3, STUB_VERDICT: 'APPROVED', CDPATH: path.join(fc.base, 'decoy') }, timeout: 120000 });
+  fs.mkdirSync(path.join(fc.base, 'decoy', REPO_NAME), { recursive: true });
+  sh('bash', [path.join(IMPL.bin, 'gate-runner.sh'), '--repo', REPO_NAME, '--once', '--interval', '1'], { cwd: fc.base, env: { ...process.env, ...UTF8, VGDD_Z3_DIR: fc.z3, STUB_VERDICT: 'APPROVED', CDPATH: path.join(fc.base, 'decoy') }, timeout: 120000 });
   const seenC = fs.existsSync(path.join(fc.z3, 'sbx-repo.log')) ? fs.readFileSync(path.join(fc.z3, 'sbx-repo.log'), 'utf8').split('\n').filter(Boolean) : [];
   record('ST', 'ST14d', 'CDPATH を継承していても、--repo の相対パスは起動の場所で解決する（別の場所の同名のフォルダに移らない）',
     seenC.length > 0 && seenC.every((r) => fs.realpathSync(r) === fs.realpathSync(fc.main)), seenC.slice(0, 1).join(','));
   const v2 = JSON.parse(fs.readFileSync(path.join(VG, 'settings.v2.json'), 'utf8'));
   record('ST', 'ST15', '設定の原本 vgdd/settings.v2.json も docs/governance を保護する（Edit・Write の拒否4つと sandbox の denyWrite）',
     ['Edit(docs/governance/**)', 'Write(docs/governance/**)', 'Edit(**/docs/governance/**)', 'Write(**/docs/governance/**)'].every((x) => (v2.permissions?.deny || []).includes(x)) && (v2.sandbox?.filesystem?.denyWrite || []).includes('docs/governance'));
-  // p0.4.8：配置済みの設定（リポジトリの .claude/settings.json）は、原本の保護をすべて持つ（拒否の規則・sandbox の書き込みと読み取りの禁止・フック）。
-  //   11/7 まで、原本にある docs/governance の Edit・Write の拒否4つが、配置済みに欠けていた（フックと denyWrite では防いでいた）
-  const deployedPath = path.join(DEPLOYED_REPO, '.claude/settings.json');
-  const dep = fs.existsSync(deployedPath) ? JSON.parse(fs.readFileSync(deployedPath, 'utf8')) : null;
-  const lack = (sel) => (sel(v2) || []).filter((x) => !(sel(dep || {}) || []).includes(x));
-  // sandbox の有効化・失敗時の扱い・sandbox の外での実行の許可も、原本と同じ値でなければならない（Codex の監査 p0.4.8 #2）
-  const flags = ['enabled', 'failIfUnavailable', 'allowUnsandboxedCommands'].filter((k) => (v2.sandbox || {})[k] !== (dep?.sandbox || {})[k]).map((k) => `sandbox.${k}`);
-  const lacks = dep ? [...lack((s) => s.permissions?.deny), ...lack((s) => s.sandbox?.filesystem?.denyWrite), ...lack((s) => s.sandbox?.filesystem?.denyRead), ...flags] : ['配置済みの設定がない'];
-  // フックはキーの順によらず構造で比べる（配列の順は保つ。Codex の監査 p0.4.8 #4）
-  const canon = (x) => Array.isArray(x) ? x.map(canon) : (x && typeof x === 'object') ? Object.fromEntries(Object.keys(x).sort().map((k) => [k, canon(x[k])])) : x;
-  const hooksSame = !!dep && JSON.stringify(canon(dep.hooks)) === JSON.stringify(canon(v2.hooks));
-  record('ST', 'ST16', '配置済みの設定（.claude/settings.json）は、原本 vgdd/settings.v2.json の拒否の規則・sandbox の書き込みと読み取りの禁止の一覧をすべて含み、sandbox の enabled・failIfUnavailable・allowUnsandboxedCommands は同じ値、フックは同じ構造',
-    lacks.length === 0 && hooksSame, `対象=${opt('--repo') ? '--repo' : impl === 'z3' ? '既定の本番のリポジトリ' : '原本のリポジトリ'} 欠け=${lacks.slice(0, 4).join(',') || 'なし'} hooks=${hooksSame ? '同じ' : '違う'}`);
+  groupST16(v2);
   // p0.4.8：--impl z3 は VGDD_Z3_DIR の場所の写しを試す（--record の書き先と同じ場所）
   const pz = path.join(os.tmpdir(), 'vgdd-st17-z3');
   const pr = sh('node', [path.join(HERE, 'run.mjs'), '--impl', 'z3', '--print-impl'], { env: { ...process.env, VGDD_Z3_DIR: pz } });
@@ -926,6 +932,55 @@ function groupST() {
   record('ST', 'ST21', '期間を変えた後、前の期間で動いている作業員は今の期間の作業員の数・試行・実行の件数に入らない',
     k21.r.status === 0 && k21.j?.budget?.period_id === 'pNew' && k21.j.budget.workers.active === 0 && k21.j.budget.attempts.used === 0 && k21.j?.runs?.requested === 0 && k21.j.runs.started === 0,
     JSON.stringify({ b: k21.j?.budget, r: k21.j?.runs }).slice(0, 300));
+}
+
+// ---- ST16 配置済みの設定と原本の照合（p0.4.8。p0.4.15 で、試す場所に合わせて原本を書き換えてから比べる） --------------------------
+// 原本 vgdd/settings.v2.json は元の案件の場所（~/tsubuyaki-z3・~/tsubuyaki-worklog/app）で書いてある。--repo か --impl z3 で試すときは、
+//   原本を render-settings（vgdd-setup.mjs）と同じ規則で、試す場所（DEPLOYED_REPO と Z3REAL）に合わせて書き換えたものと比べる。
+//   書き換えはこのファイルの中で別に実装する（導入の道具の誤りが、そのまま合格にならないように。両者の一致は判例 PT7 が確かめる）。
+//   比べる項目と厳しさは p0.4.8 と同じ。既定の場所では書き換えは何も変えない（同じ結果になる）
+const ORIG_PLACE = /^~\/(tsubuyaki-z3|tsubuyaki-worklog\/app|tsubuyaki-worklog)(?=\/|$)/;
+const ORIG_HOOK = 'node ~/tsubuyaki-z3/hooks/policy.mjs';
+function tildeIn(p, homes) {
+  const real = (() => { try { return fs.realpathSync(p); } catch { return path.resolve(p); } })();
+  for (const h of homes) for (const q of [path.resolve(p), real]) { const r = path.relative(h, q); if (r && !r.startsWith('..') && !path.isAbsolute(r)) return `~/${r.split(path.sep).join('/')}`; }
+  return null;
+}
+function renderForPlace(v2, repo, z3) {
+  const h0 = os.homedir(); const homes = [...new Set([path.resolve(h0), (() => { try { return fs.realpathSync(h0); } catch { return path.resolve(h0); } })()])];
+  const to = { 'tsubuyaki-z3': tildeIn(z3, homes), 'tsubuyaki-worklog/app': tildeIn(repo, homes), 'tsubuyaki-worklog': tildeIn(path.dirname(path.resolve(repo)), homes) };
+  if (Object.values(to).some((x) => !x)) return { error: 'Z3 かリポジトリがホームの下にない（設定は ~/ の形で書くので、書き換えられない）' };
+  const swap = (s) => s.replace(ORIG_PLACE, (m, k) => to[k]);
+  const rule = (s) => { const m = /^([A-Za-z]+)\((.*)\)$/s.exec(s); return m ? `${m[1]}(${swap(m[2])})` : s; };
+  const out = JSON.parse(JSON.stringify(v2));
+  if (out.permissions?.deny) out.permissions.deny = out.permissions.deny.map((x) => (typeof x === 'string' ? rule(x) : x));
+  for (const k of ['denyWrite', 'denyRead']) if (out.sandbox?.filesystem?.[k]) out.sandbox.filesystem[k] = out.sandbox.filesystem[k].map((x) => (typeof x === 'string' ? swap(x) : x));
+  const zr = to['tsubuyaki-z3'].slice(2);
+  const cmd = to['tsubuyaki-z3'] === '~/tsubuyaki-z3' ? ORIG_HOOK : `VGDD_Z3_DIR="$HOME/${zr}" node "$HOME/${zr}/hooks/policy.mjs"`;
+  for (const ms of Object.values(out.hooks || {})) for (const m of ms || []) for (const hk of m.hooks || []) if (hk.command === ORIG_HOOK) hk.command = cmd;
+  return { settings: out };
+}
+const canonJ = (x) => Array.isArray(x) ? x.map(canonJ) : (x && typeof x === 'object') ? Object.fromEntries(Object.keys(x).sort().map((k) => [k, canonJ(x[k])])) : x;
+/** 配置済みの設定 dep が、期待の設定 want の拒否の規則・禁止の一覧をすべて含み、sandbox の3つの値とフックの構造が同じか */
+function settingsCover(want, dep) {
+  const lack = (sel) => (sel(want) || []).filter((x) => !(sel(dep || {}) || []).includes(x));
+  // sandbox の有効化・失敗時の扱い・sandbox の外での実行の許可も、原本と同じ値でなければならない（Codex の監査 p0.4.8 #2）
+  const flags = ['enabled', 'failIfUnavailable', 'allowUnsandboxedCommands'].filter((k) => (want.sandbox || {})[k] !== (dep?.sandbox || {})[k]).map((k) => `sandbox.${k}`);
+  const lacks = dep ? [...lack((s) => s.permissions?.deny), ...lack((s) => s.sandbox?.filesystem?.denyWrite), ...lack((s) => s.sandbox?.filesystem?.denyRead), ...flags] : ['配置済みの設定がない'];
+  // フックはキーの順によらず構造で比べる（配列の順は保つ。Codex の監査 p0.4.8 #4）
+  const hooksSame = !!dep && JSON.stringify(canonJ(dep.hooks)) === JSON.stringify(canonJ(want.hooks));
+  return { lacks, hooksSame };
+}
+function groupST16(v2) {
+  // p0.4.8：配置済みの設定（リポジトリの .claude/settings.json）は、原本の保護をすべて持つ（拒否の規則・sandbox の書き込みと読み取りの禁止・フック）。
+  //   11/7 まで、原本にある docs/governance の Edit・Write の拒否4つが、配置済みに欠けていた（フックと denyWrite では防いでいた）
+  const deployedPath = path.join(DEPLOYED_REPO, '.claude/settings.json');
+  const dep = fs.existsSync(deployedPath) ? JSON.parse(fs.readFileSync(deployedPath, 'utf8')) : null;
+  const placed = !!opt('--repo') || impl === 'z3';
+  const rr = placed ? renderForPlace(v2, DEPLOYED_REPO, Z3REAL) : { settings: v2 };
+  const { lacks, hooksSame } = rr.settings ? settingsCover(rr.settings, dep) : { lacks: [rr.error], hooksSame: false };
+  record('ST', 'ST16', '配置済みの設定（.claude/settings.json）は、原本 vgdd/settings.v2.json（--repo・--impl z3 では試す場所に合わせて書き換えたもの）の拒否の規則・sandbox の書き込みと読み取りの禁止の一覧をすべて含み、sandbox の enabled・failIfUnavailable・allowUnsandboxedCommands は同じ値、フックは同じ構造',
+    lacks.length === 0 && hooksSame, `対象=${opt('--repo') ? '--repo' : impl === 'z3' ? '既定の本番のリポジトリ' : '原本のリポジトリ'} 欠け=${lacks.slice(0, 4).join(',') || 'なし'} hooks=${hooksSame ? '同じ' : '違う'}`);
 }
 
 // ---- K 停止と再開 -------------------------------------------------------------------------------
@@ -1613,6 +1668,19 @@ p.kill(); console.log(JSON.stringify(out));
     k.status === 0 && ks?.acceptance?.accepted_count === 1 && ks.acceptance.accepted[0] === 'T-991' && ks.acceptance.pending_count === 0 && !JSON.stringify(ks.acceptance).includes(mergeSha.slice(0, 8)), JSON.stringify(ks?.acceptance ?? null));
 }
 
+// p0.4.14 の prior-record.mjs の scrub（判例 W11 の差分の試験の基準。変えない。p0.4.15 の審査 M1）
+function scrubP0414(s, max) {
+  let t = String(s ?? '');
+  t = t.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, ' ');
+  t = t.replace(/sk-ant-[A-Za-z0-9_-]{8,}/g, '［伏せた］').replace(/AKIA[0-9A-Z]{16}/g, '［伏せた］').replace(/-----BEGIN [A-Z ]+-----[\s\S]*?(-----END [A-Z ]+-----|$)/g, '［伏せた］');
+  t = t.replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '［伏せた］');
+  t = t.replace(/sk-[A-Za-z0-9_-]{16,}/g, '［伏せた］').replace(/gh[pousr]_[A-Za-z0-9]{20,}/g, '［伏せた］');
+  t = t.replace(/\/(?:Users|home|private|var|tmp|opt|etc|usr|Library|Volumes|System|Applications|root|srv|mnt)\/[^\s'"`）)」』、。]*/g, '［パス］');
+  t = t.replace(/(^|[\s(（「『"'`=:、。])(?:\/[^\s'"`）)」』、。]+|[A-Za-z]:\\[^\s'"`）)」』、。]*)/g, '$1［パス］');
+  t = t.replace(/```/g, "'''");
+  t = t.replace(/\s+/g, ' ').trim();
+  return t.length > max ? `${t.slice(0, max)}…` : t;
+}
 function groupW() {
   const pr = path.join(IMPL.bin, 'prior-record.mjs');
   const la = path.join(IMPL.bin, 'launcher.sh');
@@ -1642,6 +1710,44 @@ function groupW() {
   const again = P(['--prev-signature', 'A1|requirement|src/a.ts']);
   const diff = P(['--prev-signature', 'A7|requirement|src/z.ts']);
   record('W', 'W3', '前の重い指摘が1つでも残っていれば（ほかの指摘が増えても）続けて差し戻されたと見分ける。共通がなければ false', again?.repeated === true && diff?.repeated === false, `same=${again?.repeated} diff=${diff?.repeated}`);
+  // W8〜W10（p0.4.15、独立した審査の指摘）：伏せ字（scrub）は長い入力でも線形の時間で終わり、知られた形の秘密を伏せ、普通の文を壊さない
+  const scrubRun = (code) => { const r = sh(process.execPath, ['--input-type=module', '-e', `const { scrub } = await import(${JSON.stringify(pathToFileURL(pr).href)});\n${code}`]); try { return JSON.parse(r.stdout); } catch { return null; } };
+  const w8 = scrubRun(`const cases = { a: 'a'.repeat(1e5), at: 'a@'.repeat(5e4), dom: 'a@' + 'a.'.repeat(5e4), sk: 'sk-'.repeat(33334), url: 'http://'.repeat(14286), words: ('x'.repeat(50) + ' ').repeat(2000) };
+const out = {}; for (const [k, v] of Object.entries(cases)) { const t0 = performance.now(); const r = scrub(v, 800); out[k] = { ms: Math.round(performance.now() - t0), len: r.length }; }
+console.log(JSON.stringify(out));`);
+  record('W', 'W8', '伏せ字は 10 万字の入力（a の連続・a@ の連続・長いドメイン・sk- の連続・http:// の連続・普通の語の連続）でも、それぞれ 1 秒以内に終わり、上限（800 字）＋省略の印より長くしない',
+    !!w8 && Object.values(w8).every((x) => x.ms < 1000 && x.len <= 801), JSON.stringify(w8 || null).slice(0, 200));
+  const secrets = ['github_pat_11ABCDEFG0123456789_abcdefghijklmnop', 'ghp_ABCDEFGHIJ1234', 'gho_abcdefghij0123456789', 'AIzaSyA1234567890abcdefghijklmnopqrstu', 'xoxb-1234-5678-abcdefghij', 'xoxp-9876543210-abcdefgh',
+    'ASIAABCDEFGHIJKLMNOP', 'AKIAABCDEFGHIJKLMNOP', 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTYifQ.abcdEFGH_ijkLMN', 'Bearer abcdefghijklmnopqrstuvwxyz0123', 'taro＠example.co.jp', 'hanako@example.com', 'sk-ant-api03-ABCDEFGHIJKLMNOP', 'sk-proj-ABCDEFGHIJKLMNOPQRST'];
+  const w9 = scrubRun(`const s = ${JSON.stringify(secrets)}; const out = s.map((x) => scrub('前 ' + x + ' 後', 300));
+const cut = scrub('あ'.repeat(800 + 1024 - 6) + 'sk-ant-api03-SECRETSECRETSECRET', 800);
+console.log(JSON.stringify({ out, cut }));`);
+  const keep9 = (o, x) => !o.includes(x.replace(/^Bearer /, '').slice(0, 12)) && !o.includes(x.slice(-8)) && o.startsWith('前') && o.endsWith('後');
+  const bad9 = w9 ? secrets.filter((x, i) => !keep9(w9.out[i], x)) : secrets;
+  record('W', 'W9', '伏せ字は github_pat_・gh?_ の短いもの・AIza・xox?-・ASIA・AKIA・JWT の形・Bearer の後ろの長い文字列・全角の ＠ のメールアドレスを伏せ、前後の文は残す。切る位置にかかった秘密の前半も残さない',
+    bad9.length === 0 && !!w9 && !/sk-a|SECRET/.test(w9.cut), bad9.length ? `伏せていない：${bad9.map((x) => x.slice(0, 6)).join(',')}` : w9 && /sk-a|SECRET/.test(w9.cut) ? '切る位置の秘密が残った' : '');
+  // p0.4.15（審査 M1）：URL はスキームとホスト（とポート）だけを残す。パス・クエリ・フラグメント・認証情報は伏せる
+  const plain = ['約 ~5/10 が通った', 'Bearer の説明を読む', 'src/lib/a.ts:3 の値を 2 にする', '要件 A1 と T-930 の差し戻し', '50% と 3/4 の割合', '詳しくは https://example.org を見る', 'https://example.org/ が入口'];
+  const urlCases = [['詳しくは https://example.org/docs/a?b=1#x を見る', '詳しくは https://example.org/［伏せた］ を見る'], ['http://localhost:3000/Users/someone/tsubuyaki-z3/evidence/held.jsonl', 'http://localhost:3000/［伏せた］'],
+    ['https://x.example/?api_key=abcd1234abcd1234', 'https://x.example/［伏せた］'], ['https://hooks.slack.com/services/T000/B000/XXXXXXXXXXXXXXXXXXXXXXXX', 'https://hooks.slack.com/［伏せた］'],
+    ['https://bucket.s3.amazonaws.com/k?X-Amz-Signature=0123456789abcdef&X-Amz-Credential=AKIAABCDEFGHIJKLMNOP', 'https://bucket.s3.amazonaws.com/［伏せた］'], ['ssh://git@10.0.0.5/~/repo', 'ssh://［伏せた］@10.0.0.5/［伏せた］']];
+  const w10 = scrubRun(`console.log(JSON.stringify(${JSON.stringify([...plain, ...urlCases.map((x) => x[0])])}.map((x) => scrub(x, 300))));`);
+  const want10 = [...plain, ...urlCases.map((x) => x[1])];
+  const bad10 = w10 ? want10.map((w, i) => [w, w10[i]]).filter(([w, g]) => w !== g) : want10.map((w) => [w, '-']);
+  record('W', 'W10', '伏せ字は普通の文（「約 ~5/10」・「Bearer の説明」・相対パス・要件と票の ID・割合・ホストだけの URL）を変えず、URL はスキームとホスト（とポート）だけを残す（クエリの鍵・Slack の webhook・S3 の署名・URL の中のホームのパス・認証情報を伏せる）',
+    bad10.length === 0, bad10.length ? `違う：${bad10.map(([w, g]) => `${w}←${g}`).join(' / ').slice(0, 240)}` : '');
+  // W11（審査 M1）：前の版（p0.4.14）の scrub が伏せていた秘密を、今の版が伏せずに出す形が1つもない（秘密 × 文脈の差分の試験。前の版の関数はこのファイルに写して固定）
+  const w11Secrets = ['sk-ant-api03-QWERTYUIOPASDFGH', 'sk-proj-ZXCVBNMLKJHGFDSAQWER', 'AKIAQWERTYUIOPASDFGH', '-----BEGIN RSA PRIVATE KEY-----MIIEpQIBAAKCAQEA-----END RSA PRIVATE KEY-----', 'ghp_QWERTYUIOPASDFGHJKLZXCVBNM1234', 'hanako@example.com',
+    '/Users/someone/tsubuyaki-z3/evidence/held.jsonl', '/home/someone/.ssh/id_rsa', '/private/var/secret', '/opt/app/key.pem', 'C:\\Users\\x\\secret.txt', '/srv/data/x', '/etc/passwd', 'github_pat_11ABCDEFG0123456789_qwertyuiop', 'AIzaSyQWERTYUIOPASDFGHJKLZXCVBNM12345', 'xoxb-1111-2222-qwertyuiop', 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTYifQ.qwertyQWERTY', 'Bearer qwertyuiopasdfghjklzxcvbnm12'];
+  const w11Core = (x) => x.startsWith('-----') ? 'MIIEpQIBAAKCAQEA' : x.startsWith('/') || x.startsWith('C:') ? x.split(/[\\/]/).filter(Boolean).slice(1).join('/').slice(0, 10) || x : x.replace(/^Bearer /, '').slice(-10);
+  const w11Ctx = [(x) => x, (x) => `前 ${x} 後`, (x) => `値=${x}`, (x) => `"${x}"`, (x) => `https://h.example/p?k=${x}`, (x) => `https://h.example/${x}`, (x) => `http://localhost:3000${x.startsWith('/') ? x : '/' + x}`, (x) => `(${x})`, (x) => `「${x}」`,
+    (x) => `file://${x}`, (x) => `x:${x}`, (x) => `${x}。`, (x) => `ssh://git@h/${x}`, (x) => 'あ'.repeat(1810) + x, (x) => `\`${x}\``, (x) => `${x}\n次の行`, (x) => `url=https://u:${x}@h.example/`];
+  const w11In = w11Secrets.flatMap((x) => w11Ctx.map((c) => [c(x), w11Core(x)]));
+  const w11 = scrubRun(`console.log(JSON.stringify(${JSON.stringify(w11In.map((x) => x[0]))}.map((x) => scrub(x, 800))));`);
+  const reg11 = w11 ? w11In.filter(([inp, k], i) => !scrubP0414(inp, 800).includes(k) && w11[i].includes(k)) : w11In;
+  const leak11 = w11 ? w11In.filter(([, k], i) => w11[i].includes(k)).length : -1;
+  record('W', 'W11', `伏せ字の差分の試験：秘密 ${w11Secrets.length} 種 × 文脈 ${w11Ctx.length} 種（URL のクエリ・パス・認証情報、引用、長い前置きなど）で、前の版（p0.4.14）が伏せていたのに今の版が伏せずに出すものが 0 件`,
+    !!w11 && reg11.length === 0, `入力 ${w11In.length} 件 後退 ${reg11.length} 件 今の版で残る ${leak11} 件${reg11.length ? `：${reg11.slice(0, 2).map(([x]) => x.slice(0, 60)).join(' / ')}` : ''}`);
 
   // W4〜W6 起動の窓口（launcher.sh → night-runner.sh --launch。dry-run）
   const fx = fixture('w');
@@ -1692,6 +1798,316 @@ function groupW() {
     const r7 = sh('node', [path.join(IMPL.bin, 'launch-intake.mjs'), '--repo', fx2.main, '--z3', fx2.z3], { env });
     record('W', 'W7', '申請のフォルダ（merge-requests/launch）が記号リンクなら、何も読まず・受け取らずに止める', r7.status === 70 && r7.stdout.trim() === '' && fs.existsSync(path.join(real, 'T-990.json')), `rc=${r7.status}`);
   } finally { try { process.kill(-bg.pid); } catch { /* 終わっている */ } }
+}
+
+// ---- P 移植（p0.4.15。SPEC §11-移植）：別の名前の Z3・別の場所のリポジトリでも同じ強制が働くか、導入の道具 ------------------------
+// ホーム（HOME）は一時ディレクトリにする（~/acme-kernel-z3 の形を試す。本物のホーム・Z3・リポジトリに触れない）。CLI は偽物（実行しない）
+const P_Z3 = 'acme-kernel-z3';
+const P_REPO = 'acme-worklog/app';   // 元の案件の ~/tsubuyaki-worklog/app に当たる。兄弟 acme-worklog は Z3 の名前の先頭（acme）で始まる
+const setupBin = () => path.join(IMPL.bin, 'vgdd-setup.mjs');
+/** 一時のホームの下に、まだ何も置いていないリポジトリだけを作る（導入の道具を試す） */
+function bareRepo(name) {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), `vgdd-conf-${name}-`)));
+  const repo = path.join(base, P_REPO); fs.mkdirSync(repo, { recursive: true });
+  git(repo, 'init', '-q', '-b', 'main'); git(repo, 'config', 'user.name', 'owner'); git(repo, 'config', 'user.email', 'owner@example.invalid');
+  write(path.join(repo, 'src/lib/a.ts'), 'export const v = 1;\n'); git(repo, 'add', '-A'); git(repo, 'commit', '-q', '-m', 'init');
+  return { base, repo, z3: path.join(base, P_Z3) };
+}
+function groupP() {
+  const fx = fixture('p', { z3Name: P_Z3, repoRel: P_REPO });
+  const H = { HOME: fx.base };
+  const roles = [['executive_head', null, fx.main], ['worker', 'worker', fx.wt], ['tester', 'tester', fx.wt]];
+  const fill = (c, f = fx) => c.replaceAll('{z3}', f.z3).replaceAll('{base}', f.base).replaceAll('{main}', f.main);
+  const bashAll = (cmds, want, f = fx, env = H, rs = roles) => {
+    const bad = [];
+    for (const [role, at, cwd] of rs) for (const c of cmds) {
+      const g = hook(f, { tool: 'Bash', input: { command: fill(c, f) }, agent_type: at, cwd, env });
+      if (g.decision !== want) bad.push(`${role}: ${fill(c, f).replaceAll(f.base, '…')} → ${g.decision}`);
+    }
+    return bad;
+  };
+  // PT1：別の名前の Z3 で、Bash による Z3 の読み取り・書き込み・STOP の作成と移動（C1 の CAP-EVIDENCE-READ・WRITE の Bash の probe に当たる操作）
+  const b1 = bashAll(['cat {z3}/evidence/held.jsonl', 'cat ~/acme-kernel-z3/evidence/held.jsonl', 'cat $HOME/acme-kernel-z3/evidence/tool_calls.jsonl', 'cat "${HOME}/acme-kernel-z3/evidence/spec_approvals.jsonl"',
+    "echo '{}' >> {z3}/evidence/rulings.jsonl", "echo '{}' >> ~/acme-kernel-z3/evidence/rulings.jsonl", 'touch {z3}/STOP', 'touch ~/acme-kernel-z3/STOP', 'mv {z3}/STOP /tmp/x', 'mv ~/acme-kernel-z3/STOP /tmp/x'], 'deny');
+  record('P', 'PT1', '別の名前の Z3（acme-kernel-z3）で、行政の長・作業員・テスト担当の Bash による Z3 の読み取り・書き込み・STOP の作成と移動（絶対パス・~・$HOME・${HOME}）がすべて拒否される', b1.length === 0, b1.slice(0, 3).join(' / '));
+  // PT2：グロブの疑い（Z3 の名前の先頭4字 acme で始まる語。ホームの形と、Z3 の親の絶対パスの直後）
+  const b2 = bashAll(['cat ~/acme*/evidence/held.jsonl', 'ls $HOME/acme-k*', 'cat ${HOME}/acme?kernel-z3/STOP', 'cat {base}/acme*/evidence/held.jsonl', 'cp /tmp/x ~/acme*/STOP', 'cat /Users/someone/acme*/x'], 'deny');
+  record('P', 'PT2', '別の名前の Z3 で、グロブの疑いの形（~/acme*・$HOME/acme-k*・${HOME}/acme?…・Z3 の親の絶対パス/acme*）が拒否される', b2.length === 0, b2.slice(0, 3).join(' / '));
+  const b2b = bashAll(['cat ~/acme-worklog/app/src/lib/a.ts', 'ls ~/acme-worklog/app/docs', 'cat {main}/src/lib/a.ts', 'ls ~/acme-worklog/preparation'], 'allow');
+  record('P', 'PT2b', '別の名前の Z3 で、リポジトリの場所（acme-worklog。Z3 の名前と同じ先頭）のような正当な兄弟のパスの読み取りは通る（陽性の対照）', b2b.length === 0, b2b.slice(0, 3).join(' / '));
+  // PT3：短すぎる・ありふれた名前の Z3、リポジトリの中の Z3、相対パスの VGDD_Z3_DIR は、フックがすべての操作を拒否し、導入の道具も拒む
+  const readA = (z) => hook(fx, { tool: 'Read', input: { file_path: path.join(fx.main, 'src/lib/a.ts') }, cwd: fx.main, env: { ...H, VGDD_Z3_DIR: z } });   // 記録は fx の証拠ストア（拒否の理由が配置の検査によることを見る）
+  const badZ = [...['z3', 'tmp', 'abc', 'data', 'Desktop', 'evidence'].map((n) => path.join(fx.base, n)), path.join(fx.main, 'kernel-z3-inside')];
+  for (const z of badZ) fs.mkdirSync(path.join(z, 'evidence'), { recursive: true });
+  const h3 = [...badZ.map((z) => [z, readA(z)]), ['相対パス', readA(P_Z3)]].filter(([, g]) => !(g.decision === 'deny' && /配置か設定/.test(g.reason))).map(([z]) => path.basename(z));
+  const ok3 = readA(fx.z3).decision === 'allow';
+  const s3 = fs.existsSync(setupBin()) ? badZ.filter((z) => sh('node', [setupBin(), 'install', '--dry-run', '--repo', fx.main, '--z3', z, '--law', VG], { env: { ...process.env, ...H } }).status !== 65).map((z) => path.basename(z)) : ['導入の道具がない'];
+  record('P', 'PT3', '短すぎる・ありふれた名前（z3・tmp・abc・data・Desktop・evidence）、リポジトリの中、相対パスの Z3 では、フックが普通の Read も含めてすべて拒否し、導入の道具（install）も拒む。正しい名前では同じ Read が通る（陽性の対照）',
+    h3.length === 0 && ok3 && s3.length === 0, `フックが通した：${h3.join(',') || 'なし'} 正しい名前=${ok3} 道具が通した：${s3.join(',') || 'なし'}`);
+
+  // PT4：judge.sh・judge-codex.sh・review-constitution.sh の既定の出力先は VGDD_Z3_DIR の下（既定の場所 ~/tsubuyaki-z3 に書かない）
+  { const f4 = fixture('p4', { z3Name: P_Z3, repoRel: P_REPO });
+    const home4 = path.join(f4.base, 'home'); fs.mkdirSync(home4, { recursive: true });
+    commitTicket(f4, 'T-921', {});
+    const w4 = path.join(f4.base, 'wt-921'); git(f4.main, 'worktree', 'add', '-q', '-b', 'task/T-921', w4, 'main');
+    write(path.join(w4, 'src/lib/a.ts'), 'export const v = 2;\n'); git(w4, 'add', '-A'); git(w4, 'commit', '-q', '-m', '実装');
+    const fake = path.join(f4.base, 'fakebin');
+    write(path.join(fake, 'claude'), '#!/bin/bash\nprintf "%s" "$FAKE_OUT"\n');
+    write(path.join(fake, 'codex'), '#!/bin/bash\nwhile [ $# -gt 0 ]; do [ "$1" = "-o" ] && { printf "%s" "$FAKE_OUT" > "$2"; shift; }; shift; done\n');
+    fs.chmodSync(path.join(fake, 'claude'), 0o755); fs.chmodSync(path.join(fake, 'codex'), 0o755);
+    const okV = JSON.stringify({ schema: 'vgdd.verdict.v1', verdict: 'APPROVED', deterministic_audits_passed: true, requirements: [], findings: [], summary: 'x' });
+    const env4 = (out) => ({ ...process.env, ...UTF8, HOME: home4, PATH: `${fake}:${process.env.PATH}`, FAKE_OUT: out, VGDD_AUDIT_WRAP: '', VGDD_Z3_DIR: f4.z3 });
+    const tk = ['--ticket', 'docs/tasks/T-921-probe.md', '--base', 'main', '--task', 'T-921'];
+    const rj = sh('bash', [path.join(IMPL.bin, 'judge.sh'), ...tk], { cwd: w4, env: env4(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: okV })), timeout: 120000 });
+    const rc = sh('bash', [path.join(IMPL.bin, 'judge-codex.sh'), ...tk], { cwd: w4, env: env4(okV), timeout: 120000 });
+    const rr = sh('bash', [path.join(IMPL.bin, 'review-constitution.sh'), '--reason', '移植の試験'], { cwd: f4.main, env: env4('{}'), timeout: 120000 });
+    const vd = path.join(f4.z3, 'evidence/verdicts'); const names = fs.existsSync(vd) ? fs.readdirSync(vd) : [];
+    const has = (re) => names.some((n) => re.test(n));
+    const leaked = fs.existsSync(path.join(home4, 'tsubuyaki-z3'));
+    record('P', 'PT4', 'judge.sh・judge-codex.sh・review-constitution.sh は、--out がなければ VGDD_Z3_DIR の evidence/verdicts に書き、既定の場所（ホームの tsubuyaki-z3）に何も作らない（偽の CLI、ホームは一時ディレクトリ）',
+      has(/^T-921-[0-9a-f]{12}\.json$/) && has(/^T-921-[0-9a-f]{12}-codex-judge\.json$/) && has(/^constitution-.*\.json$/) && !leaked, `exit ${rj.status}/${rc.status}/${rr.status} 書いた=${names.length} 既定の場所=${leaked ? 'できた' : 'ない'}`); }
+
+  // PT5：裁判所・夜間の代行・起動の窓口は VGDD_REPO を見る（引数 --repo が優先）。ホームは一時ディレクトリ（既定の場所は存在しない）
+  { const g5 = gateFixture('p5'); const home5 = path.join(g5.base, 'home'); fs.mkdirSync(home5, { recursive: true });
+    const gEnv = (repoEnv) => ({ ...process.env, ...UTF8, HOME: home5, VGDD_Z3_DIR: g5.z3, VGDD_REPO: repoEnv, STUB_VERDICT: 'APPROVED' });
+    const r5 = sh('bash', [path.join(IMPL.bin, 'gate-runner.sh'), '--once', '--interval', '1'], { cwd: g5.base, env: gEnv(g5.main), timeout: 120000 });
+    const in5 = sh('git', ['-C', g5.main, 'merge-base', '--is-ancestor', g5.head, 'main']).status === 0;
+    const g5b = gateFixture('p5b'); const home5b = path.join(g5b.base, 'home'); fs.mkdirSync(home5b, { recursive: true });
+    const r5b = sh('bash', [path.join(IMPL.bin, 'gate-runner.sh'), '--repo', g5b.main, '--once', '--interval', '1'], { cwd: g5b.base, env: { ...process.env, ...UTF8, HOME: home5b, VGDD_Z3_DIR: g5b.z3, VGDD_REPO: path.join(g5b.base, 'decoy'), STUB_VERDICT: 'APPROVED' }, timeout: 120000 });
+    const in5b = sh('git', ['-C', g5b.main, 'merge-base', '--is-ancestor', g5b.head, 'main']).status === 0;
+    // 夜間の代行（dry-run）と起動の窓口（dry-run）
+    const fn = fixture('p5n'); const homeN = path.join(fn.base, 'home'); fs.mkdirSync(homeN, { recursive: true });
+    commitTicket(fn, 'T-940', { status: 'ready' });
+    if (fs.existsSync(path.join(IMPL.bin, 'spec-digest.mjs'))) fs.copyFileSync(path.join(IMPL.bin, 'spec-digest.mjs'), path.join(fn.z3, 'bin/spec-digest.mjs'));
+    const dn = digest(fn, 'main', 'docs/tasks/T-940-probe.md').out || 'sha256:unavailable';
+    write(path.join(fn.z3, 'evidence/spec_approvals.jsonl'), JSON.stringify({ schema: 'vgdd.spec-approval.v1', task: 'T-940', digest: dn, approved_by: 'owner', policy_line: POLICY_LINE }) + '\n');
+    write(path.join(fn.z3, 'night/queue.json'), JSON.stringify({ tickets: ['T-940'], limits: { until: '23:59', max_tickets: 1 } }));
+    touch(path.join(fn.z3, 'evidence/gate_events.jsonl'));
+    const fakeG = path.join(fn.base, 'gate-runner.sh'); write(fakeG, '#!/bin/bash\nsleep 120\n'); fs.chmodSync(fakeG, 0o755);
+    const bg = spawn('bash', [fakeG], { detached: true, stdio: 'ignore' });
+    let nOut = ''; let nOutB = ''; let lOk = false;
+    try {
+      const nEnv = (repoEnv) => ({ ...process.env, ...UTF8, HOME: homeN, VGDD_Z3_DIR: fn.z3, VGDD_REPO: repoEnv });
+      const n1 = sh('bash', [path.join(IMPL.bin, 'night-runner.sh'), '--dry-run'], { cwd: fn.base, env: nEnv(fn.main), timeout: 120000 }); nOut = n1.stdout + n1.stderr;
+      const n2 = sh('bash', [path.join(IMPL.bin, 'night-runner.sh'), '--repo', fn.main, '--dry-run'], { cwd: fn.base, env: nEnv(path.join(fn.base, 'decoy')), timeout: 120000 }); nOutB = n2.stdout + n2.stderr;
+      write(path.join(fn.main, 'merge-requests/launch/T-940.json'), JSON.stringify({ task: 'T-940' }));
+      sh('bash', [path.join(IMPL.bin, 'launcher.sh'), '--once', '--dry-run'], { cwd: fn.base, env: nEnv(fn.main), timeout: 120000 });
+      const rcpt = fs.existsSync(path.join(fn.z3, 'launch/receipts')) ? fs.readdirSync(path.join(fn.z3, 'launch/receipts')) : [];
+      lOk = rcpt.some((n) => n.startsWith('T-940') && /\.accepted\./.test(n)) && !fs.existsSync(path.join(fn.main, 'merge-requests/launch/T-940.json'));
+    } finally { try { process.kill(-bg.pid); } catch { /* 終わっている */ } }
+    const nA = /（dry-run）T-940 をレーンに割り当てる/.test(nOut); const nB = /（dry-run）T-940 をレーンに割り当てる/.test(nOutB);
+    record('P', 'PT5', '裁判所（gate-runner）・夜間の代行（night-runner）・起動の窓口（launcher）は、--repo がなければ VGDD_REPO のリポジトリを扱い、--repo があれば VGDD_REPO より優先する',
+      in5 && in5b && nA && nB && lOk && !fs.existsSync(path.join(home5, 'tsubuyaki-worklog')), `gate(env)=${in5}/exit ${r5.status} gate(--repo 優先)=${in5b}/exit ${r5b.status} night(env)=${nA} night(--repo 優先)=${nB} launcher(env)=${lOk}`); }
+
+  // PT5b：環境変数 VGDD_REPO だけだったスクリプト（git-baseline・kernel-stop・kernel-resume・approve-spec・sandboxed-run）も --repo を受け、VGDD_REPO より優先する
+  { const f5 = fixture('p5s', { z3Name: P_Z3 }); const home = path.join(f5.base, 'home'); fs.mkdirSync(home, { recursive: true });
+    const decoy = path.join(f5.base, 'decoy');
+    const env = { ...process.env, ...UTF8, HOME: home, VGDD_Z3_DIR: f5.z3, VGDD_REPO: decoy };
+    const bl = path.join(f5.z3, 'evidence/git-config.baseline'); fs.rmSync(bl, { force: true });
+    const rb = sh('bash', [path.join(IMPL.bin, 'git-baseline.sh'), '--repo', f5.main], { env });
+    const blOk = rb.status === 0 && (() => { try { return fs.readFileSync(bl, 'utf8').trim() === sha256hex(fs.readFileSync(path.join(f5.main, '.git/config'))); } catch { return false; } })();
+    commitTicket(f5, 'T-911', {});
+    if (fs.existsSync(path.join(IMPL.bin, 'spec-digest.mjs'))) fs.copyFileSync(path.join(IMPL.bin, 'spec-digest.mjs'), path.join(f5.z3, 'bin/spec-digest.mjs'));
+    const ra = sh('bash', [path.join(IMPL.bin, 'approve-spec.sh'), 'T-911', '--yes', '--repo', f5.main], { env });
+    const apOk = ra.status === 0 && digest(f5, 'main', 'docs/tasks/T-911-probe.md', ['--check', path.join(f5.z3, 'evidence/spec_approvals.jsonl')]).code === 0;
+    fs.copyFileSync(IMPL.verify, path.join(f5.z3, 'hooks/verify-chain.mjs'));
+    hook(f5, { tool: 'Read', input: { file_path: path.join(f5.main, 'CLAUDE.md') }, cwd: f5.main });
+    const rs = sh('bash', [path.join(IMPL.bin, 'kernel-stop.sh'), '移植の試験', '--repo', f5.main], { env });
+    const stopMain = (() => { try { return (fs.readFileSync(path.join(f5.z3, 'STOP'), 'utf8').match(/^main=(.*)$/m) || [])[1]; } catch { return null; } })();
+    const stOk = rs.status === 0 && stopMain === git(f5.main, 'rev-parse', 'main');
+    const rr = sh('bash', [path.join(IMPL.bin, 'kernel-resume.sh'), '移植の試験', '--repo', f5.main], { env });
+    const reOk = rr.status === 0 && !fs.existsSync(path.join(f5.z3, 'STOP'));
+    let sbOk = null;
+    if (sh('bash', ['-c', 'command -v sandbox-exec']).status === 0) {
+      const sb = path.join(f5.base, 'sbx'); write(path.join(sb, '.env.local'), 'SECRET=x\n'); write(path.join(sb, 'plain.txt'), 'ok\n');
+      const wtd = fs.mkdtempSync(path.join(os.tmpdir(), 'vgdd-sbx-wt-'));
+      const run = (f) => sh('bash', [path.join(IMPL.bin, 'sandboxed-run.sh'), '--dir', wtd, '--repo', sb, '--', 'cat', path.join(sb, f)], { env });
+      sbOk = run('.env.local').status !== 0 && run('plain.txt').status === 0;
+    }
+    record('P', 'PT5b', 'git-baseline・approve-spec・kernel-stop・kernel-resume・sandboxed-run は --repo を受け、VGDD_REPO（別の場所）より優先する（sandbox-exec がなければ sandboxed-run は不合格として数える）',
+      blOk && apOk && stOk && reOk && sbOk === true, `baseline=${blOk}/${rb.status} approve=${apOk}/${ra.status} stop=${stOk}/${rs.status} resume=${reOk}/${rr.status} sandbox=${sbOk === null ? '未実行' : sbOk}`); }
+
+  // PT6：Kernel の設定（Z3 の kernel.config.json）。なければ準備資料・作業記録を保護、指定すればそれを保護、壊れていればすべての操作を拒否
+  { const f6 = fixture('p6', { z3Name: P_Z3 }); const kc = path.join(f6.z3, 'kernel.config.json');
+    const head = [['executive_head', null, f6.main]];
+    const writeTool = (p) => hook(f6, { tool: 'Write', input: { file_path: p, content: 'x' }, cwd: f6.main }).decision;
+    const a1 = bashAll(['echo x > ../preparation/y.md', 'cp /tmp/x ../event_records/z.md'], 'deny', f6, {}, head);
+    const a2 = writeTool(path.join(f6.main, '..', 'preparation/y.md')) === 'deny' && writeTool(path.join(f6.main, '..', 'event_records/y.md')) === 'deny';
+    const a3 = bashAll(['echo x > ../other/y.md'], 'allow', f6, {}, head);
+    write(kc, JSON.stringify({ schema: 'vgdd.kernel-config.v1', extra_readonly_dirs: ['../secretdocs'] }) + '\n');
+    const b1 = bashAll(['echo x > ../secretdocs/y.md', 'cp /tmp/x ../secretdocs/'], 'deny', f6, {}, head);
+    const b2 = writeTool(path.join(f6.main, '..', 'secretdocs/y.md')) === 'deny';
+    const b3 = bashAll(['echo x > ../preparation/y.md'], 'deny', f6, {}, head);   // p0.4.15（審査 m5）：extra_readonly_dirs は既定に足す（既定の保護は外れない）
+    const broken = ['{ 壊れた JSON', JSON.stringify({ schema: 'x', extra_readonly_dirs: [] }), JSON.stringify({ schema: 'vgdd.kernel-config.v1', extra_readonly_dirs: '../a' }),
+      JSON.stringify({ schema: 'vgdd.kernel-config.v1', extra_readonly_dirs: [], more: 1 }), JSON.stringify({ schema: 'vgdd.kernel-config.v1', extra_readonly_dirs: ['../a/*'] }), JSON.stringify({ schema: 'vgdd.kernel-config.v1' })];
+    const c1 = broken.filter((t) => { write(kc, t); return hook(f6, { tool: 'Read', input: { file_path: path.join(f6.main, 'src/lib/a.ts') }, cwd: f6.main }).decision !== 'deny'; }).length;
+    fs.rmSync(kc, { force: true }); fs.mkdirSync(kc);
+    const c2 = hook(f6, { tool: 'Read', input: { file_path: path.join(f6.main, 'src/lib/a.ts') }, cwd: f6.main }).decision === 'deny';
+    fs.rmSync(kc, { recursive: true, force: true });
+    const c3 = hook(f6, { tool: 'Read', input: { file_path: path.join(f6.main, 'src/lib/a.ts') }, cwd: f6.main }).decision === 'allow';
+    record('P', 'PT6', 'Kernel の設定がなければ準備資料・作業記録への書き込みを拒否し、extra_readonly_dirs で別の対象を足せばそれも拒否する（既定の2つも保護したまま）。壊れた・形の違う設定（6通りとフォルダ）では普通の Read も拒否し、設定を消せば戻る',
+      !a1.length && a2 && !a3.length && !b1.length && b2 && !b3.length && c1 === 0 && c2 && c3, `既定=${!a1.length && a2} 対照=${!a3.length} 指定=${!b1.length && b2} 既定も保護=${!b3.length} 壊れた設定で通した=${c1} フォルダ=${c2} 戻る=${c3}`); }
+
+  // PT7：render-settings の出力に元の案件の名前が残らず、拒否の規則と禁止の一覧の数が保たれ、適合性テストの書き換え（ST16）と一致する
+  { const b7 = bareRepo('p7'); const env7 = { ...process.env, HOME: b7.base };
+    const v2 = JSON.parse(fs.readFileSync(path.join(VG, 'settings.v2.json'), 'utf8'));
+    const has = fs.existsSync(setupBin());
+    const r = has ? sh('node', [setupBin(), 'render-settings', '--repo', b7.repo, '--z3', b7.z3, '--law', VG], { env: env7 }) : { status: null, stdout: '' };
+    let out = null; try { out = JSON.parse(r.stdout); } catch { out = null; }
+    const cnt = (s) => [s?.permissions?.deny?.length, s?.sandbox?.filesystem?.denyWrite?.length, s?.sandbox?.filesystem?.denyRead?.length, Object.keys(s?.hooks || {}).length].join('/');
+    const mine = (() => { const prev = process.env.HOME; process.env.HOME = b7.base; try { return renderForPlace(v2, b7.repo, b7.z3); } finally { process.env.HOME = prev; } })();
+    const cov = out && mine.settings ? [settingsCover(mine.settings, out), settingsCover(out, mine.settings)] : null;
+    const same = !!cov && cov.every((c) => c.lacks.length === 0 && c.hooksSame);
+    // 既定の場所では原本と一字一句同じ。置き換えられない名前（知らない項目・形の違うパス）が残れば失敗する（陰性の対照）
+    const d = has ? sh('node', [setupBin(), 'render-settings', '--repo', path.join(b7.base, 'tsubuyaki-worklog/app'), '--z3', path.join(b7.base, 'tsubuyaki-z3'), '--law', VG], { env: env7 }) : { stdout: '' };
+    const ident = d.stdout.trim() === JSON.stringify(v2, null, 2);
+    const negs = [{ ...v2, env: { X: '~/tsubuyaki-z3/x' } }, { ...v2, permissions: { ...v2.permissions, ask: [...v2.permissions.ask, 'Bash(cat ~/tsubuyaki-worklog2/x)'] } }].map((s, i) => {
+      const law = path.join(b7.base, `law-neg${i}`); write(path.join(law, 'settings.v2.json'), JSON.stringify(s));
+      return has ? sh('node', [setupBin(), 'render-settings', '--repo', b7.repo, '--z3', b7.z3, '--law', law], { env: env7 }).status : null;
+    });
+    record('P', 'PT7', 'render-settings：別の場所の出力に元の案件の名前（tsubuyaki）が残らず、拒否の規則・denyWrite・denyRead・フックの数が原本と同じで、ST16 の書き換えと一致する。既定の場所では原本と同じ。置き換えられない名前が残れば失敗（終了 65）',
+      r.status === 0 && !!out && !/tsubuyaki/.test(r.stdout) && cnt(out) === cnt(v2) && same && ident && negs.every((x) => x === 65),
+      has ? `exit ${r.status} 数=${cnt(out)}/${cnt(v2)} ST16 と一致=${same} 既定=${ident} 陰性=${negs.join(',')}` : '導入の道具がない'); }
+
+  // PT8・PT9：一時のホームの別の名前のリポジトリと Z3 に install し、doctor が合格し、その場所で run.mjs --impl z3 の C1 と ST16 が合格する。install は上書きしない
+  { const b8 = bareRepo('p8'); const env8 = { ...process.env, ...UTF8, HOME: b8.base };
+    const fake = path.join(b8.base, 'fakebin');   // doctor は PATH を探すだけで実行しない。偽の CLI を置く（本物の claude・codex は呼ばない）
+    for (const c of ['claude', 'codex']) { write(path.join(fake, c), '#!/bin/bash\nexit 99\n'); fs.chmodSync(path.join(fake, c), 0o755); }
+    const has = fs.existsSync(setupBin());
+    const S = (...a) => (has ? sh(process.execPath, [setupBin(), ...a, '--repo', b8.repo, '--z3', b8.z3, '--law', VG], { env: { ...env8, PATH: `${fake}:${process.env.PATH}` }, timeout: 120000 }) : { status: null, stdout: '', stderr: '道具がない' });
+    const dry = S('install', '--dry-run'); const dryClean = !fs.existsSync(b8.z3) && !fs.existsSync(path.join(b8.repo, '.claude'));
+    const ins = S('install');
+    const mode = (() => { try { return fs.statSync(b8.z3).mode & 0o777; } catch { return null; } })();
+    const doc = S('doctor', '--json'); let dj = null; try { dj = JSON.parse(doc.stdout); } catch { dj = null; }
+    let nested = null; let nj = null;
+    if (has && ins.status === 0) {
+      const out = path.join(b8.base, 'nested.json');
+      nested = sh(process.execPath, [path.join(HERE, 'run.mjs'), '--impl', 'z3', '--repo', b8.repo, '--z3-name', P_Z3, '--only', 'C1,ST16', '--json', out], { env: { ...env8, VGDD_Z3_DIR: b8.z3 }, timeout: 600000 });
+      try { nj = JSON.parse(fs.readFileSync(out, 'utf8')); } catch { nj = null; }
+    }
+    const nr = nj?.results || [];
+    const c1ids = CAPS.capabilities.filter((c) => c.probes && Object.keys(c.expect || {}).some((r) => CAPS.roles[r]?.hook_input)).map((c) => c.id);
+    const c1ok = nr.length > 0 && c1ids.every((id) => c1Complete(id, nr.filter((x) => x.group === 'C1' && x.id === id))) && nr.filter((x) => x.group === 'C1').every((x) => x.ok);
+    const st16 = nr.find((x) => x.id === 'ST16')?.ok === true;
+    record('P', 'PT8', 'install（--dry-run は何も書かない）で一時のホームの別の名前のリポジトリ（acme-worklog/app）と Z3（acme-kernel-z3。権限 0700）に置き、doctor が全項目合格（終了 0）し、その場所での run.mjs --impl z3 --repo（VGDD_Z3_DIR=その Z3）の C1 と ST16 が合格する',
+      dry.status === 0 && dryClean && ins.status === 0 && mode === 0o700 && doc.status === 0 && dj?.fail === 0 && dj?.unverifiable === 0 && nested?.status === 0 && c1ok && st16,
+      `dry=${dry.status}/${dryClean} install=${ins.status} mode=${mode === null ? '-' : mode.toString(8)} doctor=${doc.status}${dj ? `（不合格 ${dj.fail}・不明 ${dj.unverifiable}：${dj.checks.filter((c) => c.status !== 'pass').map((c) => c.id).join(',')}）` : ''} nested=${nested?.status ?? '-'} C1=${c1ok}（${nr.filter((x) => x.group === 'C1').length} 件） ST16=${st16}`);
+    // PT9：もう一度の install は何も変えずに終わる。違うファイルがあれば、一覧を出して何も書かずに止まる（上書きしない。--force はない）
+    const again = S('install');
+    const rule = path.join(b8.z3, 'bin/rule.sh'); const agent = path.join(b8.repo, '.claude/agents/judge.md'); const gone = path.join(b8.z3, 'bin/spec-digest.mjs');
+    let p9 = false; let det9 = '導入の道具がない';
+    if (has && ins.status === 0) {
+      fs.appendFileSync(rule, '# オーナーの手直し\n'); fs.appendFileSync(agent, '\n手直し\n'); fs.rmSync(gone);
+      const before = [fs.readFileSync(rule, 'utf8'), fs.readFileSync(agent, 'utf8')];
+      const conflict = S('install'); const force = S('install', '--force');
+      p9 = again.status === 0 && /作る 0 件/.test(again.stdout) && conflict.status === 1 && /rule\.sh/.test(conflict.stderr) && /judge\.md/.test(conflict.stderr)
+        && fs.readFileSync(rule, 'utf8') === before[0] && fs.readFileSync(agent, 'utf8') === before[1] && !fs.existsSync(gone) && force.status === 64;
+      det9 = `again=${again.status} conflict=${conflict.status} 消したファイルを作らない=${!fs.existsSync(gone)} --force=${force.status}`;
+    }
+    record('P', 'PT9', 'install は既にあるファイルを上書きしない：同じなら何も作らずに終わり、違うファイル（Z3 のスクリプト・エージェントの定義）があれば一覧を出して何も書かずに止まる（終了 1。消えていたファイルも作らない）。--force はない', p9, det9); }
+}
+
+// ---- P（続き。p0.4.15 の独立した審査の指摘 M2・m1〜m8 の判例） ------------------------------------------------------------
+function groupP2() {
+  const has = fs.existsSync(setupBin());
+  const fakeCli = (base) => { const d = path.join(base, 'fakebin'); for (const c of ['claude', 'codex']) { write(path.join(d, c), '#!/bin/bash\nexit 99\n'); fs.chmodSync(path.join(d, c), 0o755); } return d; };
+  const setup = (base, args, extraEnv = {}) => (has ? sh(process.execPath, [setupBin(), ...args, '--law', VG], { env: { ...process.env, ...UTF8, HOME: base, PATH: `${fakeCli(base)}:${process.env.PATH}`, ...extraEnv }, timeout: 120000 }) : { status: null, stdout: '', stderr: '導入の道具がない' });
+  const denyAll = (g) => g.decision === 'deny' && /配置か設定/.test(g.reason);
+  // PT10（審査 M2）：Z3・リポジトリの場所の段に使えない文字（引用符・$()・バッククォート・空白・'・$HOME・括弧）があれば、render-settings・install・doctor が拒み、フックもすべて拒否する
+  { const b = bareRepo('p10'); const pw = path.join(b.base, 'PWNED');
+    const badZ = [`${b.base}/x"$(touch ${pw})"/kern-z3`, `${b.base}/x\`touch ${pw}\`/kern-z3`, `${b.base}/a b/kern-z3`, `${b.base}/x'y/kern-z3`, `${b.base}/$HOME/kern-z3`];
+    const badR = [`${b.base}/proj)x/app`, `${b.base}/proj(x/app`, `${b.base}/a b/app`];
+    const got = [...badZ.map((z) => [b.repo, z]), ...badR.map((r) => [r, b.z3])].map(([r, z]) => [setup(b.base, ['render-settings', '--repo', r, '--z3', z]).status, setup(b.base, ['install', '--dry-run', '--repo', r, '--z3', z]).status, setup(b.base, ['doctor', '--repo', r, '--z3', z]).status]);
+    const toolOk = got.every(([a, i, d]) => a === 65 && i === 65 && d === 1);
+    const fx = fixture('p10h', { z3Name: P_Z3, repoRel: P_REPO });
+    const zsp = path.join(fx.base, 'a b', P_Z3); fs.mkdirSync(path.join(zsp, 'evidence'), { recursive: true });
+    const hookOk = denyAll(hook(fx, { tool: 'Read', input: { file_path: path.join(fx.main, 'src/lib/a.ts') }, cwd: fx.main, env: { VGDD_Z3_DIR: zsp } }));
+    record('P', 'PT10', 'Z3・リポジトリの場所の段に使えない文字（"$(…)"・バッククォート・空白・\'・$HOME・括弧）があれば、render-settings・install（--dry-run）は終了 65、doctor は不合格で、注入は実行されない。フックもそのような Z3 ではすべて拒否する',
+      has && toolOk && !fs.existsSync(pw) && hookOk, `道具=${JSON.stringify(got)} 注入=${fs.existsSync(pw) ? '実行された' : 'なし'} フック=${hookOk}`); }
+  // PT11（審査 m1）：kernel-stop.sh・kernel-resume.sh は、理由がなく --repo で始まれば使い方の誤り（終了 64）で、停止も再開もしない
+  { const f = fixture('p11', { z3Name: P_Z3 }); const env = { ...process.env, ...UTF8, HOME: f.base, VGDD_Z3_DIR: f.z3, VGDD_REPO: f.main };
+    const s1 = sh('bash', [path.join(IMPL.bin, 'kernel-stop.sh'), '--repo', f.main], { env }); const noStop = !fs.existsSync(path.join(f.z3, 'STOP'));
+    write(path.join(f.z3, 'STOP'), '試験\nstop_id=x\nmain=unknown\n');
+    const s2 = sh('bash', [path.join(IMPL.bin, 'kernel-resume.sh'), '--repo', f.main], { env }); const kept = fs.existsSync(path.join(f.z3, 'STOP'));
+    record('P', 'PT11', 'kernel-stop.sh・kernel-resume.sh は、最初の引数が -- で始まる（理由を書かずに --repo を書いた）とき、終了 64 で、STOP を作らず・消さない', s1.status === 64 && noStop && s2.status === 64 && kept, `stop=${s1.status}/${noStop} resume=${s2.status}/${kept}`); }
+  // PT12（審査 m2 と §12 の例）：既定の名前の Z3 で、プロジェクトが既定と違う場所（~/tsubuyaki-other/app）にあっても、兄弟から .. で戻る形・~// ・~/./・"$HOME"/・~名前/ のグロブを疑う
+  { const f = fixture('p12', { z3Name: DEFAULT_Z3_NAME, repoRel: 'tsubuyaki-other/app' }); const at = [['executive_head', null, f.main], ['worker', 'worker', f.wt]];
+    const run = (cmds, want) => { const bad = []; for (const [role, a, cwd] of at) for (const c of cmds) { const cmd = c.replaceAll('{main}', f.main); const g = hook(f, { tool: 'Bash', input: { command: cmd }, agent_type: a, cwd }); if (g.decision !== want) bad.push(`${role}: ${cmd.replaceAll(f.base, '…')} → ${g.decision}`); } return bad; };
+    const d = run(['ls ~/tsubuyaki-other/../tsub*/STOP', 'ls ~/tsubuyaki-worklog/../tsub*', 'ls {main}/../tsub*', 'ls ~//tsub*', 'ls ~/./tsub*', 'ls "$HOME"/tsub*', 'ls ~someone/tsub*', 'ls ~/tsubuyaki-worklog*', 'cat ~/tsubuyaki-other/app/../../tsub*/STOP', 'ls ../../tsub*/STOP', 'cat src/../../../tsub*/STOP'], 'deny');
+    const a = run(['cat ~/tsubuyaki-other/app/src/lib/a.ts', 'ls ~/tsubuyaki-other/preparation', 'cat ~/tsubuyaki-worklog/app/README.md'], 'allow');
+    record('P', 'PT12', '既定の名前の Z3 で、正当な兄弟（プロジェクトと既定のリポジトリの場所）から .. で戻る語、.. の段の後の先頭4字のグロブ（../../tsub*）、~//・~/./・"$HOME"/・~名前/ の後のグロブ、兄弟の名前の後ろのグロブを疑って拒否し、兄弟の配下の読み取りは通す',
+      d.length === 0 && a.length === 0, [...d, ...a].slice(0, 3).join(' / ')); }
+  // PT13（審査 m3）：Z3 はホームの下の 2 段まで。深い・ホームの外の Z3 ではすべて拒否する。2 段目の Z3 では途中の段のグロブも疑う
+  { const f = fixture('p13', { z3Name: P_Z3, repoRel: P_REPO });
+    const mk = (z) => { fs.mkdirSync(path.join(z, 'evidence'), { recursive: true }); return z; };
+    const deep = mk(path.join(f.base, 'a', 'b', P_Z3)); const two = mk(path.join(f.base, 'kz', P_Z3));
+    const outHome = path.join(f.base, 'home'); fs.mkdirSync(outHome, { recursive: true });
+    const read = (env) => hook(f, { tool: 'Read', input: { file_path: path.join(f.main, 'src/lib/a.ts') }, cwd: f.main, env });
+    const bash = (c, z) => hook(f, { tool: 'Bash', input: { command: c }, cwd: f.main, env: { VGDD_Z3_DIR: z } }).decision;
+    const deepAll = denyAll(read({ VGDD_Z3_DIR: deep })); const outAll = denyAll(read({ HOME: outHome }));
+    const twoOk = read({ VGDD_Z3_DIR: two }).decision === 'allow' && read({}).decision === 'allow';
+    const twoGlob = ['ls ~/*/acme*', 'ls ~/kz/acme*', 'cat $HOME/k?/acme-k*/STOP', `ls ${f.base}/kz/acme*`].filter((c) => bash(c, two) !== 'deny');
+    record('P', 'PT13', 'Z3 がホームから 3 段（~/a/b/<名前>）やホームの外なら、フックは普通の Read も拒否する。2 段目（~/kz/<名前>）は通り、途中の段のグロブ（~/*/acme*・$HOME/k?/acme-k*）も拒否する',
+      deepAll && outAll && twoOk && twoGlob.length === 0, `深い=${deepAll} 外=${outAll} 2段=${twoOk} 通ったグロブ：${twoGlob.join(',') || 'なし'}`); }
+  // PT14（審査 m4）：Z3 の名前とリポジトリの名前が互いに前置の配置は install が拒み、先頭4字がありふれた名前は注意（doctor は合格に数えず終了 2）
+  let b14 = null;
+  { const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'vgdd-conf-p14-')));
+    const repoA = path.join(base, 'acme-z3-app'); fs.mkdirSync(repoA); git(repoA, 'init', '-q', '-b', 'main');
+    const r1 = setup(base, ['install', '--dry-run', '--repo', repoA, '--z3', path.join(base, 'acme-z3')]);
+    const r2 = setup(base, ['install', '--dry-run', '--repo', path.join(base, 'acme-z3'), '--z3', path.join(base, 'acme-z3-app')]);
+    b14 = bareRepo('p14b'); const zn = path.join(b14.base, 'node-vault');
+    const ins = setup(b14.base, ['install', '--repo', b14.repo, '--z3', zn]);
+    const doc = setup(b14.base, ['doctor', '--json', '--repo', b14.repo, '--z3', zn]); let dj = null; try { dj = JSON.parse(doc.stdout); } catch { dj = null; }
+    b14.zn = zn;
+    record('P', 'PT14', 'Z3 の名前とリポジトリの段の名前が互いに前置（~/acme-z3 と ~/acme-z3-app）なら install は終了 65。先頭4字がありふれた名前（node-vault）は install が注意を出し、doctor は注意として合格に数えない（不合格 0・終了 2）',
+      has && r1.status === 65 && r2.status === 65 && ins.status === 0 && /注意/.test(ins.stdout) && doc.status === 2 && dj?.fail === 0 && dj?.checks?.some((c) => c.id === 'name-prefix' && c.status === 'warn'),
+      `前置=${r1.status}/${r2.status} install=${ins.status} doctor=${doc.status} 不合格=${dj?.fail ?? '-'}：${(dj?.checks || []).filter((c) => c.status === 'fail').map((c) => c.id).join(',')}`); }
+  // PT15（審査 m5）：extra_readonly_dirs は足す（既定の保護は外れない）。readonly_dirs は置き換え（doctor が注意）。両方・~ で始まる値・重複したキー・記号リンクの設定はすべて拒否
+  { const f = fixture('p15', { z3Name: P_Z3 }); const kc = path.join(f.z3, 'kernel.config.json'); const S = '"schema":"vgdd.kernel-config.v1"';
+    const head = (c) => hook(f, { tool: 'Bash', input: { command: c }, cwd: f.main }).decision;
+    const read = () => hook(f, { tool: 'Read', input: { file_path: path.join(f.main, 'src/lib/a.ts') }, cwd: f.main });
+    write(kc, `{${S},"extra_readonly_dirs":["../secretdocs"]}`);
+    const add = head('echo x > ../preparation/y') === 'deny' && head('echo x > ../event_records/y') === 'deny' && head('echo x > ../secretdocs/y') === 'deny';
+    write(kc, `{${S},"readonly_dirs":["../secretdocs"]}`);
+    const repl = head('echo x > ../preparation/y') === 'allow' && head('echo x > ../secretdocs/y') === 'deny';
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'vgdd-conf-p15o-')); write(path.join(out, 'k.json'), `{${S},"extra_readonly_dirs":[]}`);
+    const broken = [`{${S},"extra_readonly_dirs":[],"readonly_dirs":[]}`, `{${S},"extra_readonly_dirs":["~/secret"]}`, `{${S},"extra_readonly_dirs":["../a"],"extra_readonly_dirs":[]}`, `{${S},"readonly_dirs":[],"schema":"vgdd.kernel-config.v1"}`, 'LINK'];
+    const passed = broken.filter((t) => { fs.rmSync(kc, { force: true }); if (t === 'LINK') fs.symlinkSync(path.join(out, 'k.json'), kc); else write(kc, t); return !denyAll(read()); }).length;
+    fs.rmSync(kc, { force: true });
+    let warn = null;
+    if (has && b14) { write(path.join(b14.zn, 'kernel.config.json'), `{${S},"readonly_dirs":["../preparation"]}`); const d = setup(b14.base, ['doctor', '--json', '--repo', b14.repo, '--z3', b14.zn]); try { warn = JSON.parse(d.stdout).checks.some((c) => c.id === 'kernel-config-replace' && c.status === 'warn'); } catch { warn = false; } }
+    record('P', 'PT15', 'Kernel の設定：extra_readonly_dirs は既定の2つに足し、readonly_dirs は置き換える（doctor が「既定の保護を外している」と注意）。両方を書く・~ で始まる値・同じキーが二度・記号リンクの設定では、普通の Read も拒否する',
+      add && repl && passed === 0 && warn === true, `足す=${add} 置き換え=${repl} 壊れた設定で通した=${passed} doctor の注意=${warn}`); }
+  // PT16（審査 m6）：install は、実体がホームの外になる場所（記号リンク）には書かない。途中で失敗したら、作ったものの一覧を出して止まり（終了 70）、Z3 は 0700
+  { const b = bareRepo('p16'); const outside = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'vgdd-conf-p16o-')));
+    fs.symlinkSync(outside, path.join(b.base, 'lnk'));
+    const r1 = setup(b.base, ['install', '--repo', b.repo, '--z3', path.join(b.base, 'lnk', P_Z3)]);
+    const outsideEmpty = fs.readdirSync(outside).length === 0;
+    const ag = path.join(b.repo, '.claude', 'agents'); fs.mkdirSync(ag, { recursive: true }); fs.chmodSync(ag, 0o500);   // Z3 に書いた後、エージェントの定義を書くところで失敗させる
+    const r2 = setup(b.base, ['install', '--repo', b.repo, '--z3', b.z3]);
+    fs.chmodSync(ag, 0o755);
+    const mode = (() => { try { return fs.statSync(b.z3).mode & 0o777; } catch { return null; } })();
+    record('P', 'PT16', 'install は、記号リンクの先がホームの外になる Z3 を拒み（何も書かない）、書いている途中で失敗したら、作ったものの一覧を出して止まる（終了 70。消さない）。Z3 は作った直後から 0700',
+      has && r1.status === 65 && outsideEmpty && r2.status === 70 && /作った \d+ 件/.test(r2.stderr) && fs.existsSync(path.join(b.z3, 'hooks/policy.mjs')) && mode === 0o700,
+      `リンク=${r1.status}/外は空=${outsideEmpty} 途中の失敗=${r2.status} mode=${mode === null ? '-' : mode.toString(8)}`); }
+  // PT17（審査 m7）：--only は報告に一部だけの印を入れ、知らない群・0 件では終了 2
+  { const out = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'vgdd-conf-p17-')), 'o.json');
+    const x = sh(process.execPath, [path.join(HERE, 'run.mjs'), '--only', 'XYZ'], { env: { ...process.env } });
+    const y = sh(process.execPath, [path.join(HERE, 'run.mjs'), '--only', 'ST16', '--json', out], { env: { ...process.env } });
+    let j = null; try { j = JSON.parse(fs.readFileSync(out, 'utf8')); } catch { j = null; }
+    record('P', 'PT17', 'run.mjs --only：知らない群は終了 2。動かした群は報告（partial: true・only）と標準出力に一部だけの印として出し、適合の主張に使えないと書く',
+      x.status === 2 && j?.partial === true && JSON.stringify(j?.only) === '["ST16"]' && /一部だけ/.test(y.stdout) && /適合の主張に使えない/.test(y.stdout), `XYZ=${x.status} partial=${j?.partial} only=${JSON.stringify(j?.only)}`); }
+  // PT18（審査 m8）：release.sh・night-runner.sh は監査の sandbox に --repo を渡す（VGDD_REPO がなくても、本当のリポジトリの .env.local を隠す）
+  { const rf = releaseFixture('p18'); const log = path.join(rf.fx.base, 'sbx-args.log');
+    write(path.join(rf.fx.z3, 'bin/sandboxed-run.sh'), `#!/bin/bash\nprintf '%s\\n' "$*" >> ${JSON.stringify(log)}\nexit 0\n`); fs.chmodSync(path.join(rf.fx.z3, 'bin/sandboxed-run.sh'), 0o755);
+    const env = { ...process.env, ...UTF8, HOME: rf.fx.base, VGDD_Z3_DIR: rf.fx.z3 }; delete env.VGDD_REPO;
+    const r = sh('bash', [path.join(IMPL.bin, 'release.sh'), '--repo', rf.fx.main, rf.id], { env, cwd: rf.fx.main, timeout: 120000 });
+    const lines = fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\n').filter(Boolean) : [];
+    const relOk = lines.length > 0 && lines.every((l) => l.includes(`--repo ${rf.fx.main}`));
+    const nr = fs.readFileSync(path.join(IMPL.bin, 'night-runner.sh'), 'utf8').split('\n').filter((l) => /sandboxed-run\.sh"? --dir/.test(l) && !/^\s*#/.test(l));
+    const nrOk = nr.length > 0 && nr.every((l) => /--repo "\$REPO"/.test(l));
+    record('P', 'PT18', 'release.sh は監査の sandbox（sandboxed-run.sh）のすべての呼び出しに --repo を渡し（VGDD_REPO なしで確かめる）、night-runner.sh の呼び出しにも --repo "$REPO" がある（ソースの検査）',
+      relOk && nrOk, `release=${r.status} 呼び出し ${lines.length} 件 --repo=${relOk} night-runner=${nrOk}（${nr.length} 行）`); }
 }
 
 // ---- 権限の表の自己検査（どの権限にも確かめ方がある） ------------------------------------------
@@ -1813,24 +2229,26 @@ function observe(repo) {
 console.log(`VGDD Governance Kernel 適合性テスト（実装：${impl}、Kernel ${CAPS.kernel_version}）`);
 let observed = null;
 try {
-  const fx = fixture('c1');
-  const probes = groupC1(fx);
-  groupA(fx, probes);
-  groupC2();
-  groupC3();
-  groupG();
-  groupST();
-  groupK();
-  groupK2();
-  groupH();
-  groupN();
-  groupL();
-  groupB();
-  groupW();
-  groupOC();
-  groupINV();
-  groupMeta();
-  groupInvMeta();
+  if (runs('C1') || runs('A')) {
+    const fx = fixture('c1');
+    const probes = groupC1(fx);
+    if (runs('A')) groupA(fx, probes);
+  }
+  if (runs('C2')) groupC2();
+  if (runs('C3')) groupC3();
+  if (runs('G')) groupG();
+  if (runs('ST')) groupST(); else if (runs('ST16')) groupST16(JSON.parse(fs.readFileSync(path.join(VG, 'settings.v2.json'), 'utf8')));
+  if (runs('K')) { groupK(); groupK2(); }
+  if (runs('H')) groupH();
+  if (runs('N')) groupN();
+  if (runs('L')) groupL();
+  if (runs('B')) groupB();
+  if (runs('W')) groupW();
+  if (runs('OC')) groupOC();
+  if (runs('P')) { groupP(); groupP2(); }
+  if (runs('INV')) groupINV();
+  if (!ONLY) { groupMeta(); groupInvMeta(); }
+  else console.log(`\n（--only ${[...ONLY].join(',')}：一部の群だけを動かした。M・INV の自己検査をしていないので、この結果は適合の主張に使えない）`);
   if (opt('--observe')) observed = observe(opt('--observe'));
 } catch (e) {
   console.error(`試験の準備に失敗：${e.stack || e}`);
@@ -1839,7 +2257,7 @@ try {
 const failed = results.filter((r) => !r.ok);
 const byGroup = {};
 for (const r of results) { byGroup[r.group] ??= { pass: 0, fail: 0 }; byGroup[r.group][r.ok ? 'pass' : 'fail']++; }
-console.log(`\n合計 ${results.length} 件：合格 ${results.length - failed.length}、不合格 ${failed.length}　${Object.entries(byGroup).map(([g, c]) => `${g} ${c.pass}/${c.pass + c.fail}`).join('　')}`);
+console.log(`\n${ONLY ? `【一部だけ：--only ${[...ONLY].join(',')}。適合の主張に使えない】` : ''}合計 ${results.length} 件：合格 ${results.length - failed.length}、不合格 ${failed.length}　${Object.entries(byGroup).map(([g, c]) => `${g} ${c.pass}/${c.pass + c.fail}`).join('　')}`);
 // p0.4.3：--record で結果の1行を Z3 の conformance.jsonl に残す（Kernel の状態の写しが「最後の適合性テスト」として出す）。
 //   Z3 に書けるのはオーナーだけなので、実行するのもオーナー（sandbox の外）。件数と合否と実装と日時だけ
 if (args.includes('--record')) {
@@ -1850,5 +2268,7 @@ if (args.includes('--record')) {
     impl_sha256: implSha,
     invariants: Object.fromEntries((CAPS.invariants || []).map((i) => [i.id, i.status === 'not_applicable' ? 'n/a' : (results.find((x) => x.id === `${i.id}:meta`)?.ok ? 'pass' : 'fail')])) }) + '\n');
 }
-if (opt('--json')) fs.writeFileSync(opt('--json'), JSON.stringify({ schema: 'vgdd.conformance-report.v1', impl, kernel_version: CAPS.kernel_version, at: new Date().toISOString(), totals: byGroup, results, observed }, null, 2) + '\n');
+if (opt('--json')) fs.writeFileSync(opt('--json'), JSON.stringify({ schema: 'vgdd.conformance-report.v1', impl, kernel_version: CAPS.kernel_version, at: new Date().toISOString(), z3_name: Z3_NAME, repo_name: REPO_NAME, only: ONLY ? [...ONLY] : null, partial: !!ONLY, totals: byGroup, results, observed }, null, 2) + '\n');
+// p0.4.15（審査 m7）：--only で1件も動かなければ「準備の失敗」（終了 2）。合格と見誤らない
+if (ONLY && results.length === 0) { console.error('--only の群で動いた試験が 0 件（終了 2）'); process.exit(2); }
 process.exit(failed.length ? 1 : 0);

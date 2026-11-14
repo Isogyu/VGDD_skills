@@ -11,13 +11,16 @@
 # 再開の記録（確かめた結果と stop_id）を先に書き、そのあとで STOP を evidence/stops/ に移す（消さない）。
 # 記録に失敗すれば再開しない。移すのに失敗すれば停止のまま（安全側）。
 #
-# 使い方: vgdd/scripts/kernel-resume.sh "再開の理由" [--accept-main]
+# 使い方: vgdd/scripts/kernel-resume.sh "再開の理由" [--accept-main] [--repo <repo>]
 set -euo pipefail
-REPO="${VGDD_REPO:-$HOME/tsubuyaki-worklog/app}"; Z3="${VGDD_Z3_DIR:-$HOME/tsubuyaki-z3}"
+REPO="${VGDD_REPO:-$HOME/tsubuyaki-worklog/app}"; Z3="${VGDD_Z3_DIR:-$HOME/tsubuyaki-z3}"   # p0.4.15：リポジトリは 引数 --repo ＞ 環境変数 VGDD_REPO ＞ 既定
 GIT_BIN="$(type -P git)"
 git() { "$GIT_BIN" -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.sshCommand=ssh "$@"; }
-reason="${1:-}"; [ -n "$reason" ] || { echo "使い方: kernel-resume.sh \"理由\" [--accept-main]" >&2; exit 64; }
+reason="${1:-}"; [ -n "$reason" ] && [ "${reason#--}" = "$reason" ] || { echo "使い方: kernel-resume.sh \"理由\" [--accept-main] [--repo <repo>]（理由は最初に書く。-- で始まる理由は使えない）" >&2; exit 64; }
 ACCEPT_MAIN=0; [ "${2:-}" = "--accept-main" ] && ACCEPT_MAIN=1
+# p0.4.15：--repo <repo> は理由の後（--accept-main の後でもよい）
+if [ "${2:-}" = "--repo" ]; then [ -n "${3:-}" ] || { echo "--repo にリポジトリの場所を指定する" >&2; exit 64; }; REPO="$3"; if [ "${4:-}" = "--accept-main" ]; then ACCEPT_MAIN=1; fi
+elif [ "${3:-}" = "--repo" ] && [ "$ACCEPT_MAIN" -eq 1 ]; then [ -n "${4:-}" ] || { echo "--repo にリポジトリの場所を指定する" >&2; exit 64; }; REPO="$4"; fi
 LOCK="$Z3/.kernel.lock"
 mkdir "$LOCK" 2>/dev/null || { echo "別の停止・再開が動いている（${LOCK}）。終わってからやり直す" >&2; exit 75; }
 trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT

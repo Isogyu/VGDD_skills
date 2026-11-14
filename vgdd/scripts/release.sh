@@ -10,9 +10,10 @@
 #   ・申請の SHA がすでに main の祖先なら「統合済み」として何もしない（空の統合を「判定と違う」と誤って扱わない）
 #   ・取り消し（reset）は、HEAD がこの実行の作った統合のコミットのときだけ行う
 #   ・統合したら、票の status を merged にして §6 に1行を足し、その票だけを gate-runner の名でコミットする（_board.json は次の gate-runner の統合で作り直す）
-# 使い方: vgdd/scripts/release.sh T-009 [T-010 ...]
+# 使い方: vgdd/scripts/release.sh [--repo <repo>] T-009 [T-010 ...]
 set -euo pipefail
-REPO="${VGDD_REPO:-$HOME/tsubuyaki-worklog/app}"; Z3="${VGDD_Z3_DIR:-$HOME/tsubuyaki-z3}"
+REPO="${VGDD_REPO:-$HOME/tsubuyaki-worklog/app}"; Z3="${VGDD_Z3_DIR:-$HOME/tsubuyaki-z3}"   # p0.4.15：リポジトリは 引数 --repo ＞ 環境変数 VGDD_REPO ＞ 既定
+if [ "${1:-}" = "--repo" ]; then [ -n "${2:-}" ] || { echo "--repo にリポジトリの場所を指定する" >&2; exit 64; }; REPO="$2"; shift 2; fi
 GIT_BIN="$(type -P git)"
 git() { "$GIT_BIN" -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.sshCommand=ssh "$@"; }
 LOCK="$Z3/.release.lock"
@@ -101,8 +102,8 @@ for task in "$@"; do
   # 組み合わせた木で決定論的な監査を sandbox の中でもう一度（夜は別々に判定したため、組み合わせの不具合をここで止める）
   wt="$(mktemp -d "${TMPDIR:-/tmp}/release-$task-XXXX")"; git -C "$REPO" worktree add --detach -q "$wt" HEAD
   SBX="$Z3/bin/sandboxed-run.sh"
-  if ! ( cd "$wt" && "$SBX" --dir "$wt" --net -- npm ci --no-fund --no-audit >/dev/null 2>&1 && "$SBX" --dir "$wt" -- npm run -s test >/dev/null 2>&1 \
-        && "$SBX" --dir "$wt" -- npm run -s typecheck >/dev/null 2>&1 && "$SBX" --dir "$wt" -- npm run -s lint >/dev/null 2>&1 ); then
+  if ! ( cd "$wt" && "$SBX" --dir "$wt" --repo "$REPO" --net -- npm ci --no-fund --no-audit >/dev/null 2>&1 && "$SBX" --dir "$wt" --repo "$REPO" -- npm run -s test >/dev/null 2>&1 \
+        && "$SBX" --dir "$wt" --repo "$REPO" -- npm run -s typecheck >/dev/null 2>&1 && "$SBX" --dir "$wt" --repo "$REPO" -- npm run -s lint >/dev/null 2>&1 ); then
     git -C "$REPO" worktree remove --force "$wt" || true; undo "$before" "$merged"
     echo "✗ ${task}：組み合わせた木で監査が不合格。統合を取り消した" >&2; exit 1
   fi

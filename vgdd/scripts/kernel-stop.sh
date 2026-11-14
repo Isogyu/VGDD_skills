@@ -12,11 +12,12 @@
 # STOP の中身：1行目＝理由（フックが拒否の理由に使う）、2行目＝stop_id、3行目＝停止の時点の main の完全な SHA。
 #   再開は STOP そのものに書いた SHA から後のコミットを数える（出来事の記録の追記に失敗しても、停止の情報は失われない）。
 #
-# 使い方: vgdd/scripts/kernel-stop.sh "理由（例：作業員の不審な操作を調べる）"
+# 使い方: vgdd/scripts/kernel-stop.sh "理由（例：作業員の不審な操作を調べる）" [--repo <repo>]
 set -euo pipefail
-REPO="${VGDD_REPO:-$HOME/tsubuyaki-worklog/app}"; Z3="${VGDD_Z3_DIR:-$HOME/tsubuyaki-z3}"
+REPO="${VGDD_REPO:-$HOME/tsubuyaki-worklog/app}"; Z3="${VGDD_Z3_DIR:-$HOME/tsubuyaki-z3}"   # p0.4.15：リポジトリは 引数 --repo ＞ 環境変数 VGDD_REPO ＞ 既定
+if [ "${2:-}" = "--repo" ]; then [ -n "${3:-}" ] || { echo "--repo にリポジトリの場所を指定する" >&2; exit 64; }; REPO="$3"; fi
 GIT_BIN="$(type -P git)"
-reason="${1:-}"; [ -n "$reason" ] || { echo "使い方: kernel-stop.sh \"理由\"" >&2; exit 64; }
+reason="${1:-}"; [ -n "$reason" ] && [ "${reason#--}" = "$reason" ] || { echo "使い方: kernel-stop.sh \"理由\" [--repo <repo>]（理由は最初に書く。-- で始まる理由は使えない）" >&2; exit 64; }
 # 停止と再開を直列化する錠（mkdir は原子的）
 LOCK="$Z3/.kernel.lock"
 mkdir "$LOCK" 2>/dev/null || { echo "別の停止・再開が動いている（${LOCK}）。終わってからやり直す" >&2; exit 75; }

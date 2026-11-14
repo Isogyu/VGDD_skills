@@ -28,7 +28,7 @@
 set -euo pipefail
 
 export VGDD_AUDIT_WRAP="${VGDD_Z3_DIR:-${HOME}/tsubuyaki-z3}/bin/sandboxed-run.sh"  # p0.3.0：judge.sh の監査も sandbox の中
-REPO="${HOME}/tsubuyaki-worklog/app"; INTERVAL=30; ONCE=0; NO_CODEX=0; RUN_MERGED=""; HOLD=0
+REPO="${VGDD_REPO:-${HOME}/tsubuyaki-worklog/app}"; INTERVAL=30; ONCE=0; NO_CODEX=0; RUN_MERGED=""; HOLD=0   # p0.4.15：リポジトリは 引数 --repo ＞ 環境変数 VGDD_REPO ＞ 既定
 Z3="${VGDD_Z3_DIR:-${HOME}/tsubuyaki-z3}"
 
 # p0.3.1：この裁判所（sandbox の外・オーナーの権限）が実行する git は、リポジトリのフックと fsmonitor を読まない（OBS-033）。

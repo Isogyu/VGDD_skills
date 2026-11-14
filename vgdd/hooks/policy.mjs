@@ -47,6 +47,12 @@
 //   - Z3 に STOP があれば（オーナーが kernel-stop.sh で置く）、読み取りのツール（Read・Glob・Grep）以外のすべての操作を拒否する（Bash はすべて拒否）。
 //     読み取りも通常の判定（Z3 の読み取り禁止など）を通す。再開は kernel-resume.sh（チェーン・git の設定・main を確かめてから）
 //
+// p0.4.15 の変更点（移植。別の名前の Z3・別の場所のリポジトリでも同じ強制を働かせる）：
+//   - Bash の照合の Z3 の名前とグロブの疑いを、実際の Z3 の場所（VGDD_Z3_DIR）から作る（z3Tokens）。既定の配置では今までと同じ照合
+//   - Z3 の名前が短すぎる・ありふれている、Z3 とリポジトリが入れ子、VGDD_Z3_DIR が相対パスなら、すべての操作を拒否する（fail-closed）
+//   - リポジトリの外の読み取り専用（準備資料・作業記録）を Z3 の kernel.config.json から読む。なければ今までの2つ。読めない・形が違えば、すべて拒否
+//   - 既定と違う場所の Z3 では、フックの登録で VGDD_Z3_DIR を渡す（vgdd-setup.mjs render-settings が書く）
+//
 // 保証できないこと（README に明記する）：
 //   - Bash の判定は文字列照合。パスの分割・変数展開・別名による回避は完全には防げない。書き込みは sandbox の denyWrite で補う
 //   - 人が承認画面で「許可」を押した操作は止められない（記録は残る）
@@ -59,11 +65,119 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 
-const POLICY_VERSION = 'p0.4.5'; // OBS-013（リンクの実体で判定、作業員の閉じ込め）、OBS-014（誤検知4件の修正）、Kernel の停止（ADR-027）を含む
+const POLICY_VERSION = 'p0.4.15'; // OBS-013（リンクの実体で判定、作業員の閉じ込め）、OBS-014（誤検知4件の修正）、Kernel の停止（ADR-027）、移植（p0.4.15）を含む
 const HOME = os.homedir();
-const Z3 = process.env.VGDD_Z3_DIR || path.join(HOME, 'tsubuyaki-z3');
+const DEFAULT_Z3_NAME = 'tsubuyaki-z3';
+const Z3 = process.env.VGDD_Z3_DIR || path.join(HOME, DEFAULT_Z3_NAME);
 const EVIDENCE = process.env.VGDD_EVIDENCE_PATH || path.join(Z3, 'evidence', 'tool_calls.jsonl');
 const GENESIS = 'sha256:genesis';
+// p0.4.15：既定のリポジトリの場所（スクリプトの既定と同じ）。グロブの疑いの照合で、正当な兄弟のパスとして除く
+const DEFAULT_REPO = path.join(HOME, 'tsubuyaki-worklog', 'app');
+
+// ---- 移植（p0.4.15）：Z3 の名前と配置の検査、Kernel の設定（Z3 の kernel.config.json） ------------------------
+// Z3 の名前は Bash の照合（名前と、先頭の4字によるグロブの疑い）に使う。短すぎる・ありふれた名前では照合が広すぎるか狭すぎるので、
+//   フックは起動の時点ですべての操作を拒否する（fail-closed）。導入の道具（vgdd-setup.mjs の install・doctor）も同じ規則で拒む（同じ規則を写して持つ）
+const Z3_NAME_MIN = 4;   // グロブの疑いに使う先頭の字数と同じ
+const Z3_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const Z3_COMMON_NAMES = new Set(['z3', 'tmp', 'temp', 'home', 'data', 'var', 'etc', 'opt', 'usr', 'bin', 'lib', 'src', 'app', 'apps', 'test', 'tests', 'doc', 'docs',
+  'work', 'root', 'users', 'library', 'desktop', 'documents', 'downloads', 'applications', 'private', 'volumes', 'system', 'public', 'evidence', 'hooks', 'kernel',
+  'vgdd', 'backup', 'config', 'node_modules']);
+function z3NameProblem(name) {
+  if (typeof name !== 'string' || !Z3_NAME_RE.test(name)) return 'Z3 の名前に使えない文字がある（英数字と . _ - だけ。先頭は英数字）';
+  if (name.length < Z3_NAME_MIN) return `Z3 の名前が短すぎる（${Z3_NAME_MIN} 文字以上）`;
+  if (Z3_COMMON_NAMES.has(name.toLowerCase())) return 'Z3 の名前がありふれている（照合が広すぎるか狭すぎる）';
+  return null;
+}
+// Z3 の場所（p0.4.15、審査 M2・m3）：ホームの下で、深さ 2 段まで（~/<名前> か ~/<段>/<名前>）。ホームからの相対の各段は
+//   英数字と . _ - だけ（先頭は英数字。. と .. は不可）。深い場所では途中の段のグロブ（~/a/*/kern*）を照合しきれず、
+//   使えない文字はシェルの注入やパスの解釈の違いの元になるため。設定の場所（VGDD_Z3_DIR のとおり）で見る（実体がリンクの先でも、その名前は別に確かめる）
+const Z3_MAX_DEPTH = 2;
+const PATH_SEG_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+/** ホームからの Z3 の相対パスの段の配列。ホームの外なら null */
+function z3HomeSegs() {
+  const z = path.resolve(Z3);
+  for (const h of [...new Set([path.resolve(HOME), realish(HOME)])]) {
+    const rel = path.relative(h, z);
+    if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) return rel.split(path.sep);
+  }
+  return null;
+}
+/** Z3 の名前（設定の名前と実体の名前）・場所と、リポジトリとの入れ子を確かめる。問題があれば理由を返す */
+function placementProblem(projectDir) {
+  const env = process.env.VGDD_Z3_DIR;
+  if (env && !path.isAbsolute(env)) return 'VGDD_Z3_DIR が絶対パスでない';
+  for (const n of new Set([path.basename(path.resolve(Z3)), path.basename(realish(Z3))])) {
+    const p = z3NameProblem(n);
+    if (p) return p;
+  }
+  const segs = z3HomeSegs();
+  if (!segs) return 'Z3 がホームの下にない';
+  if (segs.length > Z3_MAX_DEPTH) return `Z3 がホームから ${Z3_MAX_DEPTH} 段より深い`;
+  if (!segs.every((x) => PATH_SEG_RE.test(x))) return 'Z3 の場所の途中の段に使えない文字がある（英数字と . _ - だけ。先頭は英数字）';
+  const z = realish(Z3); const r = realish(projectDir);
+  if (isInside(z, r)) return 'Z3 がリポジトリ（プロジェクトの場所）の中にある';
+  if (isInside(r, z)) return 'リポジトリ（プロジェクトの場所）が Z3 の中にある';
+  return null;
+}
+
+// Kernel の設定（p0.4.15）。Z3 の中（オーナーだけが書ける場所）に置く。Z3 の外からは読まない（記号リンクはたどらない）。
+//   ファイルがなければ、元の案件の既定（準備資料・作業記録）。読めない・形が違うときは、すべての操作を拒否する（fail-closed）。
+//   extra_readonly_dirs は既定に**足す**（保護を減らせない）。readonly_dirs は既定を**置き換える**（保護を減らせる。別の案件で既定の2つを外すときだけ）。
+//   どちらか一方だけを書ける（審査 m5）
+const KERNEL_CONFIG = path.join(Z3, 'kernel.config.json');
+const DEFAULT_READONLY_DIRS = ['../preparation', '../event_records'];
+const READONLY_LABELS = { '../preparation': ['準備資料（リポジトリの外・読み取り専用）', '準備資料'], '../event_records': ['作業記録（リポジトリの外・読み取り専用）', '作業記録'] };
+/** JSON の最上位のキーを、書いてある順にすべて返す（重複を見つけるため。JSON.parse は後勝ちで重複を消す）。走査できなければ null */
+function topLevelKeys(text) {
+  const keys = []; let depth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '"') {
+      let j = i + 1;
+      while (j < text.length && text[j] !== '"') j += text[j] === '\\' ? 2 : 1;
+      if (j >= text.length) return null;
+      if (depth === 1) {
+        let k = j + 1; while (k < text.length && /\s/.test(text[k])) k++;
+        if (text[k] === ':') { try { keys.push(JSON.parse(text.slice(i, j + 1))); } catch { return null; } }
+      }
+      i = j; continue;
+    }
+    if (c === '{' || c === '[') depth++; else if (c === '}' || c === ']') depth--;
+  }
+  return keys;
+}
+function loadKernelConfig() {
+  let text;
+  let fd = null;
+  try {
+    fd = fs.openSync(KERNEL_CONFIG, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.size > 64 * 1024) return { error: 'kernel.config.json がファイルでないか大きすぎる' };
+    text = fs.readFileSync(fd, 'utf8');
+  } catch (e) {
+    if (e && e.code === 'ENOENT') return { readonlyDirs: DEFAULT_READONLY_DIRS, source: 'default', replaced: false };
+    if (e && e.code === 'ELOOP') return { error: 'kernel.config.json が記号リンク（たどらない）' };
+    return { error: 'kernel.config.json を読めない' };
+  } finally { if (fd !== null) try { fs.closeSync(fd); } catch { /* 閉じられなくても判定は上で決まっている */ } }
+  let j;
+  try { j = JSON.parse(text); } catch { return { error: 'kernel.config.json が JSON でない' }; }
+  if (!j || typeof j !== 'object' || Array.isArray(j) || j.schema !== 'vgdd.kernel-config.v1') return { error: 'kernel.config.json の schema が vgdd.kernel-config.v1 でない' };
+  const keys = topLevelKeys(text);
+  if (!keys || new Set(keys).size !== keys.length) return { error: 'kernel.config.json に同じ項目が二度ある（または走査できない）' };
+  if (Object.keys(j).some((k) => !['schema', 'extra_readonly_dirs', 'readonly_dirs'].includes(k))) return { error: 'kernel.config.json に知らない項目がある' };
+  const hasExtra = Object.prototype.hasOwnProperty.call(j, 'extra_readonly_dirs'); const hasRepl = Object.prototype.hasOwnProperty.call(j, 'readonly_dirs');
+  if (hasExtra === hasRepl) return { error: 'kernel.config.json には extra_readonly_dirs（足す）と readonly_dirs（置き換える）のどちらか一方だけを書く' };
+  const d = hasExtra ? j.extra_readonly_dirs : j.readonly_dirs;
+  if (!Array.isArray(d) || d.length > 32) return { error: 'kernel.config.json の読み取り専用の一覧が配列でない（または 32 を超える）' };
+  for (const x of d) {
+    if (typeof x !== 'string' || x.length === 0 || x.length > 200 || /[\u0000-\u001f\u007f*?[\]{}]/.test(x) || x.startsWith('~')) return { error: 'kernel.config.json の読み取り専用の一覧に形の違う項目がある（~ で始まる値も不可）' };
+    const b = path.basename(x);
+    if (!b || b === '.' || b === '..') return { error: 'kernel.config.json の読み取り専用の一覧に名前のない項目がある' };
+  }
+  return { readonlyDirs: hasExtra ? [...new Set([...DEFAULT_READONLY_DIRS, ...d])] : d, source: 'file', replaced: hasRepl };
+}
+let KCONF = { readonlyDirs: DEFAULT_READONLY_DIRS };
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
 
 // ---- 入力 -----------------------------------------------------------------
 
@@ -197,13 +311,10 @@ function isNoReadAbs(absPath) {
   return isInside(p, z3);
 }
 
-/** 絶対パスが「リポジトリの外の読み取り専用」（準備資料・作業記録）か */
+/** 絶対パスが「リポジトリの外の読み取り専用」（準備資料・作業記録。p0.4.15 から Z3 の kernel.config.json で指定。なければこの2つ）か */
 function isReadOnlyOutside(absPath, projectDir) {
   const p = path.resolve(absPath);
-  for (const [dir, label] of [
-    [path.resolve(projectDir, '..', 'preparation'), '準備資料（リポジトリの外・読み取り専用）'],
-    [path.resolve(projectDir, '..', 'event_records'), '作業記録（リポジトリの外・読み取り専用）'],
-  ]) {
+  for (const [dir, label] of KCONF.readonlyDirs.map((d) => [path.resolve(projectDir, d), (READONLY_LABELS[d] || [])[0] || '読み取り専用の領域（Kernel の設定 kernel.config.json の指定）'])) {
     const rel = path.relative(dir, p);
     if (rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))) return label;
   }
@@ -298,9 +409,60 @@ const END_OF_WORD = String.raw`(?=\/|[\s"'\x60;|&)]|$)`; // \x60 はバックク
 // 語の直前の区切り。p0.2.1⑤：> < | & ; ( を加える（`echo x>.claude/s` の > の直後も語の始まり）
 const START_OF_WORD = String.raw`(^|[\s"'\x60=/><|&;(])`;
 const tok = (body) => new RegExp(START_OF_WORD + body + END_OF_WORD);
+// p0.4.15：Z3 の名前の照合を、実際の Z3 の場所から作る（p0.4.14 までは tsubuyaki-z3 の直書きで、別の名前の Z3 では Bash の拒否が効かなかった）。
+//   ①名前（設定の名前と実体の名前）がどこかに現れれば拒否（読み取りも）
+//   ②グロブの疑い：Z3 の親の場所（~・$HOME・${HOME}・/Users/<名前>、絶対パス。ホームの形は Z3 の場所によらずいつも見る）の直後に、
+//     Z3 の名前の先頭4字で始まる語があれば拒否。ただし正当な兄弟（今のプロジェクトと既定のリポジトリの場所の、親の直下の名前）は除く。
+//     兄弟の名前が Z3 の名前の先頭と同じ（Z3 の名前が兄弟の名前で始まる）ときは、その兄弟を除かない（`~/<兄弟>*` が Z3 に展開されうるため）。
+//   既定の配置（~/tsubuyaki-z3 と ~/tsubuyaki-worklog/app）では p0.4.14 までと同じ照合になる
+//   p0.4.15 の審査（m2・m3・§12 の例）で強めた点：兄弟を除くのは、語（区切りまで）が兄弟そのものか兄弟の配下を指し、`..` の段を含まないときだけ
+//   （`~/tsubuyaki-worklog/../tsub*`・`~/tsubuyaki-worklog*` は疑う）。ホームの形に `~<名前>`・引用符つきの `"$HOME"` を含め、
+//   ホームの形と名前の間の `//`・`/./` も同じに見る。Z3 が 2 段目（~/<段>/<名前>）なら、途中の段のグロブ（~/*/<先頭4字>…）も疑う
+function z3Tokens(projectDir) {
+  const zAbs = path.resolve(Z3); const zReal = realish(Z3);
+  const names = [...new Set([path.basename(zAbs), path.basename(zReal)])];
+  const toks = names.map((n) => ({ re: new RegExp(escapeRe(n)), noRead: true, label: 'Z3 保護領域' }));
+  const HOME_FORMS = ['~[A-Za-z0-9._-]*', String.raw`"?\$HOME"?`, String.raw`"?\$\{HOME\}"?`, String.raw`\/Users\/[^/\s]+`];
+  const homes = [...new Set([HOME, realish(HOME)])];
+  const parents = [...new Set([path.dirname(zAbs), path.dirname(zReal)])];
+  const anchors = new Set(HOME_FORMS);
+  const segs = z3HomeSegs();
+  if (segs && segs.length >= 2) for (const f of HOME_FORMS) anchors.add(`${f}(?:\\/[^/\\s]+){1,${segs.length - 1}}`);
+  for (const parent of parents) {
+    anchors.add(escapeRe(parent));
+    for (const h of homes) {
+      if (!isInside(parent, h) || parent === h) continue;
+      const rel = escapeRe(path.relative(h, parent).split(path.sep).join('/'));
+      for (const f of HOME_FORMS) anchors.add(`${f}\\/${rel}`);
+    }
+  }
+  const siblings = new Set();
+  for (const base of [...new Set([...homes, ...parents])]) {
+    for (const r of [path.resolve(projectDir), realish(projectDir), DEFAULT_REPO]) {
+      if (isInside(r, base) && r !== base) siblings.add(path.relative(base, r).split(path.sep)[0]);
+    }
+  }
+  for (const n of names) {
+    const prefix = n.slice(0, Z3_NAME_MIN);
+    const sibs = [...siblings].filter((s) => s.length > prefix.length && s.startsWith(prefix) && !names.some((m) => m.startsWith(s)));
+    const re = new RegExp(`(?:${[...anchors].join('|')})(?:\\/\\.?(?=\\/))*\\/${escapeRe(prefix)}`, 'g');
+    const excused = (str, at) => {
+      const word = (/^[^\s"'`;|&()<>]*/.exec(str.slice(at)) || [''])[0];
+      if (word.split('/').includes('..')) return false;
+      return sibs.some((x) => word === x || word.startsWith(x + '/'));
+    };
+    toks.push({ re: { test: (str) => { re.lastIndex = 0; let m; while ((m = re.exec(str))) { if (!excused(str, m.index + m[0].length - prefix.length)) return true; } return false; } }, noRead: true, label: 'Z3 保護領域（グロブの疑い）' });
+    // `..` の段の後ろに Z3 の名前の先頭4字で始まる段がある語も疑う（`../../tsub*`・`<リポジトリ>/../<先頭4字>*`。ホームの形を経なくても、親へ戻って Z3 に届きうる）
+    toks.push({ re: new RegExp(`(?:^|[\\s"'\x60=/><|&;(])\\.\\.\\/(?:[^\\s"'\x60;|&()<>/]*\\/)*${escapeRe(prefix)}`), noRead: true, label: 'Z3 保護領域（.. の後のグロブの疑い）' });
+  }
+  return toks;
+}
+/** フックの Bash の照合に使う保護語の一覧（Z3 の場所と Kernel の設定から作る） */
+function bashProtectedTokens(projectDir) {
+  const ro = KCONF.readonlyDirs.map((d) => ({ re: tok(String.raw`(\.\.\/)?` + escapeRe(path.basename(d))), noRead: false, label: (READONLY_LABELS[d] || [])[1] || '読み取り専用の領域（Kernel の設定の指定）' }));
+  return [...z3Tokens(projectDir), ...BASH_PROTECTED_TOKENS, ...ro];
+}
 const BASH_PROTECTED_TOKENS = [
-  { re: /tsubuyaki-z3/, noRead: true, label: 'Z3 保護領域' },
-  { re: /(~|\$HOME|\$\{HOME\}|\/Users\/[^/\s]+)\/tsub(?!uyaki-worklog\b)/, noRead: true, label: 'Z3 保護領域（グロブの疑い）' },
   { re: new RegExp(START_OF_WORD + String.raw`\.claude(\/|\b)`), noRead: false, label: '.claude' },
   { re: /(~|\$HOME|\$\{HOME\}|\/Users\/[^/\s]+)\/\.claude(\/|\b)/, noRead: false, label: 'ユーザー設定 ~/.claude' },
   { re: /(~|\$HOME|\$\{HOME\}|\/Users\/[^/\s]+)\/\.claude\.json/, noRead: false, label: 'ユーザー設定 ~/.claude.json' },
@@ -311,8 +473,7 @@ const BASH_PROTECTED_TOKENS = [
   { re: /docs\/governance(?![\w.-])|kernel-(state|invariants)\.json/, noRead: false, label: 'docs/governance（Kernel の状態の写し）' },   // p0.4.3。p0.4.5：docs/governance.md（文書）を取り違えない
   { re: new RegExp(String.raw`merge-requests\/done` + END_OF_WORD), noRead: false, label: 'merge-requests/done' },
   { re: new RegExp(String.raw`merge-requests\/launch` + END_OF_WORD), noRead: false, label: 'merge-requests/launch（起動の申請は Write ツールで行政の長だけが置く。Bash では書かない）' },   // p0.4.10
-  { re: tok(String.raw`(\.\.\/)?preparation`), noRead: false, label: '準備資料' },
-  { re: tok(String.raw`(\.\.\/)?event_records`), noRead: false, label: '作業記録' },
+  // 準備資料・作業記録（p0.4.14 までは ../preparation・../event_records の直書き）は、p0.4.15 から Kernel の設定から作る（bashProtectedTokens）
 ];
 
 // 読み取り専用と見なすコマンドの先頭（各セグメントの先頭に一致すること）
@@ -544,7 +705,7 @@ function judgeBash(command, git, agentType, cwd, projectDir, confine) {
     const c = judgeConfinedBash(pre, cwd, confine);
     if (c) return { decision: 'deny', reason: `Bash: ${c}` };
   }
-  const hits = BASH_PROTECTED_TOKENS.filter((t) => t.re.test(pre));
+  const hits = bashProtectedTokens(projectDir).filter((t) => t.re.test(pre));
   if (hits.length === 0) return { decision: 'allow', reason: '保護パスへの言及なし' };
   const labels = hits.map((h) => h.label).join('・');
   if (hits.some((h) => h.noRead)) {
@@ -774,7 +935,13 @@ function main() {
   }
 
   // PreToolUse：判定と記録
-  const verdict = judge(input, projectDir, git);
+  // p0.4.15：Z3 の名前・配置と Kernel の設定を先に確かめる。決められなければ、すべての操作を拒否する（fail-closed。記録は残す）
+  const conf = loadKernelConfig();
+  const setupBad = conf.error || placementProblem(projectDir);
+  if (!conf.error) KCONF = conf;
+  const verdict = setupBad
+    ? { target: null, decision: 'deny', reason: `Kernel の配置か設定を確かめられないため、すべての操作を拒否（fail-closed）：${setupBad}。オーナーが Z3 の名前・場所と kernel.config.json を直す` }
+    : judge(input, projectDir, git);
   const rec = {
     ...baseRecord(input, git),
     type: 'tool_call',
