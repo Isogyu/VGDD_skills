@@ -6,7 +6,7 @@
 
 | 場面 | 誰が | 何をするか | 確かめた範囲 |
 |---|---|---|---|
-| **A. clone で試す** | 誰でも | 適合性テストを動かし、画面と記録を読む。Kernel は実稼働しない | **確かめた**：作者の macOS の一時的な clone（main `f786d2f`、2026-11-07 01:5x、Node 25。[`validation.md` §4](validation.md)）。今の版の clone と、ほかの人の手元は未確認 |
+| **A. clone で試す** | 誰でも | 適合性テストを動かし、画面と記録を読む。Kernel は実稼働しない | **確かめた**：最初の導入先のリポジトリを、作者の macOS の一時的な clone で（Node 25。[`validation.md` §4](validation.md)）。今の版の clone と、ほかの人の手元は未確認 |
 | **B. 作者が別の場所に構築する** | 作者 | 別のフォルダと別の保護領域に、Kernel を実稼働させる | **適合性テストの水準でだけ確かめた**（法律 p0.4.15、判例 群 P）：一時ディレクトリの写しの上で、(1) 別の名前の Z3（`acme-kernel-z3`）でフックが C1 の全部の判定を同じにすること、(2) 裁判所・夜間の代行・起動の窓口が `--repo`・`VGDD_REPO` で指定のリポジトリを扱うこと（PT5）、(2b) 試験用の Z3 とリポジトリのフォルダの名前を変えて（`--z3-name acme-kernel-z3 --repo-name acme-worklog/app`）全部の群（G・N・L を含む。第2版の 583 件で依頼者も確かめた）が既定の名前と1件ずつ同じ結果になること（立法補佐と依頼者がそれぞれ確かめた）、(3) 導入の道具で一時のホームに置いた配置で、診断が合格し、C1 と ST16 が通ること（PT8）。**実際の Claude Code のセッション・実際の sandbox・実際の司法での運用は未確認**。実稼働させた記録はない |
 | **C. ほかの人が既存の案件に入れる** | ほかの人 | 自分の案件に Kernel を入れ、参照実装を必要に応じて直す | **未確認**。試した人はいない（場所と名前の移植は B と同じ範囲で試験済み。案件ごとの前提（§3）は試していない） |
 
@@ -22,12 +22,14 @@
 |---|---|
 | 適合性テスト（`node vgdd/conformance/run.mjs`。`jq`・`shasum`・UTF-8 のロケールが要る） | 使い捨ての試験用リポジトリと偽の Z3 の上で、止めるべき操作が止まり、通すべき操作が通ること。LLM は呼ばないので、判定の中身ではなく判定の扱いを試す |
 | 前の版との比較 | 法律の版の差は [`vgdd/kernel/history.json`](../vgdd/kernel/history.json) と Git の履歴で追える |
-| `/governance` | 統治の数字・票の盤・票1枚の運命・法律の歴史。全体図は一部の数が「—」で、Kernel と不変条件の区画は、状態の表示用ファイルがないので空（一時的な clone で確かめた。[`validation.md` §4](validation.md)） |
-| 記録を読む | 票の §2 と §6（[`tasks/`](tasks/)）、主張と証拠（[`validation.md`](validation.md)） |
+| 統治の画面（最初の導入先のアプリの `/governance`。このリポジトリにはない） | 統治の数字・票の盤・票1枚の運命・法律の歴史。全体図は一部の数が「—」で、Kernel と不変条件の区画は、状態の表示用ファイルがないので空（一時的な clone で確かめた。[`validation.md` §4](validation.md)） |
+| 記録を読む | 票の §2 と §6（導入先の `docs/tasks/`。このリポジトリにはない）、主張と証拠（[`validation.md`](validation.md)） |
 
 適合性テストは、実際の sandbox と起動設定を試しません（[`kernel.md` §6](kernel.md)）。A が通っても、B や C が動くことの証拠にはなりません。
 
 ## 2. B：作者が別の場所に構築する（未検証）
+
+**既定の名前について。** このリポジトリの文書とコードに出てくる既定の名前（保護領域 `~/tsubuyaki-z3`、リポジトリ `~/tsubuyaki-worklog/app`）は、最初の導入先の開発のときの配置の名前です。今の実装の既定の値なので、設定の説明とコマンドの例では、そのまま書いています。配布の前に変える予定です。変えるまでは、環境変数 `VGDD_Z3_DIR`、`VGDD_REPO` と引数 `--repo` で指定してください。
 
 ### 要るもの
 
@@ -39,7 +41,7 @@
 | 裁判所の道具 | `jq`・`node`・`git`・`npm`・`python3`・`sandbox-exec`。Git の設定の基準値（[`git-baseline.sh`](../vgdd/scripts/git-baseline.sh)）。裁判所は起動時に確かめ、欠ければ起動しない | `gate-runner.sh` の `preflight` |
 | 司法の CLI | `claude` と `codex` | [`SPEC.md` §6](../vgdd/kernel/SPEC.md) |
 | エージェントの定義 | 作業員・テスト担当・judge・憲法審査 | [`../vgdd/agents/`](../vgdd/agents/) を `.claude/agents/` へ |
-| 票の運用 | 形式どおりの票、オーナーの `approve-spec.sh` | [`tasks/README.md`](tasks/README.md) |
+| 票の運用 | 形式どおりの票、オーナーの `approve-spec.sh` | 導入先の `docs/tasks/README.md`（票の形式。このリポジトリにはない）。指紋の作り方は [`SPEC.md` §4](../vgdd/kernel/SPEC.md) |
 
 `--no-codex` で起動すれば司法は judge だけになりますが、別系統の確認がなくなります。この開発の記録は、Claude の司法に Codex の第2の司法を加えた構成のものです。1つの Claude アカウントで役割を分けたセッションだけで運用する構成と、そのときの司法の独立性は確かめていません。
 
@@ -103,7 +105,7 @@ B・C で、上から順に人が確かめます。p0.4.15 から、この表の
 | 操作する先 | `git rev-parse --show-toplevel` | `<repo>` を指す。親のフォルダの別のリポジトリではない |
 | 統合先 | `git rev-parse --verify main` | SHA が出る |
 | 監査が動く | `npm ci`、`npm run test`、`npm run typecheck`、`npm run lint` | すべて通る |
-| 票の置き場所 | `ls docs/tasks/README.md` | ある。形式は [`tasks/README.md`](tasks/README.md) |
+| 票の置き場所 | `ls docs/tasks/README.md` | ある（票の形式の説明） |
 | 追跡しないファイル | `git check-ignore .env.local docs/governance/kernel-state.json docs/governance/kernel-invariants.json` | 3つとも出る |
 
 ### フック・sandbox・保護の設定
@@ -116,7 +118,7 @@ B・C で、上から順に人が確かめます。p0.4.15 から、この表の
 | sandbox | `jq -c '[.sandbox.enabled, .sandbox.failIfUnavailable, .sandbox.allowUnsandboxedCommands]' .claude/settings.json` | `[true,true,false]` |
 | 書き込みの保護 | `jq '.sandbox.filesystem.denyWrite' .claude/settings.json` | 自分の Z3、`vgdd`、`CLAUDE.md`、`.claude/settings.json`、`docs/governance`、`docs/tasks/_board.json` が入っている |
 | 読み取りの保護 | `jq '.sandbox.filesystem.denyRead' .claude/settings.json` | 自分の Z3 と `.env.local` が入っている |
-| 開発時のパスの残り | `grep -n 'tsubuyaki' .claude/settings.json` | 自分の配置に直した後は何も出ない |
+| 開発時のパスの残り | `grep -n 'tsubuyaki' .claude/settings.json`（既定の名前は開発のときの配置の名前。配布の前に変える予定） | 自分の配置に直した後は何も出ない |
 
 ### 原本と配置済みの設定の一致
 
