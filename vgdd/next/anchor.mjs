@@ -29,6 +29,12 @@
 //     設定の変更自体も、行に残した設定の写し（cfg）と違えば、オーナーの epoch まで書き込みを止める。
 //   - 読めない（記号リンク・通常のファイルでない・大きさの上限）：snapshot を拒む。それ以外の読み込みの失敗は、state: 'unreadable' を入れて固定する。
 //   - verify は鎖を検証し直さない（先頭の bytes までの指紋が一致すれば、鎖の検証の結果も同じ）。全部の anchor の時点の指紋を 1 回の読みで計算する。
+//   - verify は、行に残した設定の写しと開く側の設定が違えば ok: false（AN-CFG-COPY）。manifest は記録の名前だけを持ち、パスは写しにしかないので、
+//     別のパスを指す設定で開くと、固定した記録でない記録（書き換える前の写しなど）を照合してしまうため（審査 N-1）。
+//     受け入れて照合するには verify({ allowConfigMismatch: true }) と明示し、結果の config_mismatch_accepted: true と notes に残る。
+//   - dir は入れ子のフォルダもたどる（深さ 8 まで。項目の名前は相対パス。数は入れ子を含めて max_dir_files まで。審査 N-2）。
+//   - 前の固定で読めなかった・なかった記録は、最後に読めた固定の項目と比べて食い違いを出す（審査 N-4）。
+//   - anchor の記録自身・<file>. で始まる関連のファイル・それを含むフォルダは、大文字小文字を区別せずに対象から拒む（審査 N-5）。
 //
 // 保証できないこと：
 //   - **anchor の記録（<file> と <file>.head）と、対象の記録を、一緒に作り直す改ざんは、外部の証拠がなければ検出できない。**
@@ -38,7 +44,10 @@
 //     記録されなかった操作は検出しない。固定は「その内容が存在した」ことだけを示す。
 //   - 行為者が本物であること（actor は申告。lib/vocab.mjs と同じ）。この部品が確かめるのは、役割が表にあり、種類が合うことまで。
 //   - tool_calls と checkpoints.jsonl の突き合わせ（verify-chain.mjs の checkpoint 照合）はしない。checkpoints.jsonl は鎖のない記録として指紋だけを固定する。
-//   - ledger の head と本体の読み取りは、追記と競合しうる（head を先に読む）。2 行以上の追記が間に入ると、壊れていると誤って報告しうる（誤検出の側）。
+//   - 鎖のある記録は head を先に読み、その後で本体を開く（chain.mjs の読み手と同じ順）。head と合わず、head が読み始めから変わっていれば 1 回だけ読み直す。
+//     それでも、読み直しの間にも追記が続く（2 回の読みの両方で head と本体の間に追記が入る）と、壊れていると誤って固定しうる（誤検出の側。審査 N-3）。
+//   - dir の入れ子の読み取りは、フォルダの lstat と readdir の後の lstat の i-node を照合するが、その間の差し替えの窓はゼロではない。
+//     入れ子が深すぎる dir（9 段以上）は固定を拒む（厳しい側。攻撃者が深いフォルダを作れれば固定を止められる）。
 //   - 祖先ディレクトリの記号リンクは拒む（realpath が違えば読まない）が、大文字小文字を区別しない FS の綴り違いも拒む（厳しい側）。
 //   - 一時ファイルの作成・ロックは anchor の記録（chain.mjs）の仕組みのまま。取り残しのロックは自動では外さない。
 
@@ -50,7 +59,7 @@ import { parseActor, normActor, isOwner, isDigest, isTs, asDigest, refusal } fro
 
 export const RECORD_TYPE = 'vgdd.anchor.v1';
 /** 規則の版。ガードの規則を変えるたびに上げ、各行に記録する。古い版の行はオーナーの epoch に覆われるまで書き込みを止める */
-export const RULES = 'an.v1';
+export const RULES = 'an.v2'; // an.v2：入れ子の dir を固定する・anchor の記録の関連ファイルを対象にしない・照合の設定の食い違い（審査 B1）
 export const MANIFEST_VERSION = 1;
 export const KINDS = Object.freeze(['chained', 'plain', 'dir']);
 export const SCHEMES = Object.freeze(['tool_calls', 'ledger', 'chain']);
@@ -71,6 +80,9 @@ const HARD_LIMITS = Object.freeze({
 });
 const CAMEL = { maxSources: 'max_sources', maxSourceBytes: 'max_source_bytes', maxTotalBytes: 'max_total_bytes', maxDirFiles: 'max_dir_files', maxDirFileBytes: 'max_dir_file_bytes', maxLineBytes: 'max_line_bytes' };
 const MAX_REGRESSIONS = 200;
+/** dir の入れ子の深さの上限と、項目の名前（相対パス）の長さの上限（審査 N-2） */
+const MAX_DIR_DEPTH = 8;
+const MAX_DIR_ENTRY_NAME = 1024;
 const NOFOLLOW = fs.constants.O_NOFOLLOW ?? 0;
 const EMPTY = `sha256:${sha256('')}`;
 
@@ -102,6 +114,14 @@ export function pathProblem(p) {
   const segs = p.slice(1).split('/');
   if (segs.some((s) => s === '' || s === '.' || s === '..')) return 'パスに ..・.・空の要素（重なった /・末尾の /）がある';
   return null;
+}
+
+/**
+ * 対象のパス（小文字）が anchor の記録（小文字）自身・その関連のファイル（.head・.lock・.recovery.jsonl・.torn-*・.head.tmp など <file>. で始まるもの）・
+ * それを含むフォルダ（祖先）のどれかなら true。大文字小文字を区別しない FS（macOS の既定）で、綴りを変えて同じファイルを指す回り込みを塞ぐ（審査 N-5）
+ */
+function selfProblem(pLower, fLower) {
+  return pLower === fLower || pLower.startsWith(`${fLower}.`) || fLower.startsWith(`${pLower}/`);
 }
 
 /**
@@ -144,7 +164,7 @@ export function normalizeConfig(raw, anchorsFile = null) {
     else {
       const key = s.path.toLowerCase();
       if (paths.has(key)) errors.path.push(`${name || '?'}: 同じパスを 2 つの名前で指定（大文字小文字を区別しない）`); else paths.add(key);
-      if (anchorsFile && (s.path === anchorsFile || s.path === `${anchorsFile}.head` || s.path === `${anchorsFile}.lock`)) errors.path.push(`${name || '?'}: anchor の記録自身は対象にできない`);
+      if (anchorsFile && selfProblem(key, String(anchorsFile).toLowerCase())) errors.path.push(`${name || '?'}: anchor の記録自身・関連のファイル（<file>.*）・それを含むフォルダは対象にできない（大文字小文字を区別しない）`);
     }
     if (name && kind && !pp && (kind !== 'chained' || scheme)) sources.push({ name, kind, scheme, path: s.path });
   }
@@ -328,24 +348,39 @@ function openRegular(p, maxBytes) {
   } catch (e) { try { fs.closeSync(fd); } catch { /* 閉じられなければそのまま */ } return { err: `io_${e.code || 'error'}` }; }
 }
 
+const sameHead = (a, b) => a.state === b.state && a.seq === b.seq && a.hash === b.hash;
+
+/**
+ * 1 つのファイルの記録を読む。head を先に読み、その後で本体を開く（chain.mjs の読み手と同じ順。本体は伸びるだけなので、
+ * この順なら本体は head 以上の行を持つ。chain の方式は head の後ろの書き込み中の 1 行を許すので、間に追記が 1 回入っても壊れと誤報しない）。
+ * head と合わない（head_mismatch）とき、head が読み始めから変わっていれば、1 回だけ読み直す（ledger は head と本体の行数の完全一致を求めるため。審査 N-3）。
+ * 読み直しても合わなければ、その結果を固定する（本当の食い違いは隠さない）
+ */
 function readFileSource(src, limits, offsets, budget) {
-  const o = openRegular(src.path, limits.max_source_bytes);
   const headP = src.kind === 'chained' ? headPathOf(src) : null;
+  const first = readFileOnce(src, limits, offsets, budget, headP);
+  if (!headP || first.res.state !== 'ok' || !first.res.chain || first.res.chain.code !== 'head_mismatch') return first.res;
+  if (sameHead(first.head, readHeadFile(headP, src.scheme))) return first.res;
+  budget.used -= first.res.size;
+  return readFileOnce(src, limits, offsets, budget, headP).res;
+}
+
+function readFileOnce(src, limits, offsets, budget, headP) {
+  const head = headP ? readHeadFile(headP, src.scheme) : { state: 'none' };
+  const o = openRegular(src.path, limits.max_source_bytes);
   if (o.missing) {
     // 記録がないのに head だけがある（ledger・chain）のは壊れ（chain.mjs:80、ledger.mjs:68）
-    const hd = headP ? readHeadFile(headP, src.scheme) : { state: 'none' };
-    return absent(src, { chain: headP && hd.state !== 'none' ? { scheme: src.scheme, ok: false, code: 'file_missing', lines_verified: 0, head_seq: hd.state === 'ok' ? hd.seq : null, head_hash: hd.state === 'ok' ? asDigest(hd.hash) : null, last_hash: null } : null });
+    return { head, res: absent(src, { chain: headP && head.state !== 'none' ? { scheme: src.scheme, ok: false, code: 'file_missing', lines_verified: 0, head_seq: head.state === 'ok' ? head.seq : null, head_hash: head.state === 'ok' ? asDigest(head.hash) : null, last_hash: null } : null }) };
   }
-  if (o.err) return unreadable(src, o.err);
-  if (budget.used + o.size > limits.max_total_bytes) { fs.closeSync(o.fd); return unreadable(src, 'total_too_large'); }
+  if (o.err) return { head, res: unreadable(src, o.err) };
+  if (budget.used + o.size > limits.max_total_bytes) { fs.closeSync(o.fd); return { head, res: unreadable(src, 'total_too_large') }; }
   budget.used += o.size;
   try {
-    const head = headP ? readHeadFile(headP, src.scheme) : { state: 'none' };
     const checker = src.kind === 'chained' ? makeChecker(src.scheme, head) : null;
     const r = scanFd(o.fd, o.size, offsets, checker, limits.max_line_bytes);
     const chain = checker ? checker.done({ complete: r.complete, partial: r.partial }) : null;
-    return { name: src.name, kind: src.kind, scheme: src.scheme ?? null, state: 'ok', reason: null, size: o.size, bytes: r.bytes, lines: r.lines, prefix: r.prefix, tail: r.tail, partial_tail: r.partial, chain, at: r.at };
-  } catch (e) { return unreadable(src, e && e.message === 'short_read' ? 'short_read' : `io_${(e && e.code) || 'error'}`); } finally { fs.closeSync(o.fd); }
+    return { head, res: { name: src.name, kind: src.kind, scheme: src.scheme ?? null, state: 'ok', reason: null, size: o.size, bytes: r.bytes, lines: r.lines, prefix: r.prefix, tail: r.tail, partial_tail: r.partial, chain, at: r.at } };
+  } catch (e) { return { head, res: unreadable(src, e && e.message === 'short_read' ? 'short_read' : `io_${(e && e.code) || 'error'}`) }; } finally { fs.closeSync(o.fd); }
 }
 
 const TYPE_OF = (st) => (st.isFile() ? 'f' : st.isSymbolicLink() ? 'l' : st.isDirectory() ? 'd' : 'o');
@@ -357,27 +392,48 @@ function readDirSource(src, limits, budget) {
   const bad = (r) => unreadable(src, r, { count: 0, entries: [], entries_digest: digest([]) });
   if (st.isSymbolicLink()) return bad('symlink');
   if (!st.isDirectory()) return bad('not_file');
-  let names; try { names = fs.readdirSync(src.path); } catch (e) { return bad(`io_${e.code || 'error'}`); }
-  if (names.length > limits.max_dir_files) return bad('too_many_files');
-  names.sort();
+  // 入れ子のフォルダもたどる（審査 N-2。最初の版は直下のファイルだけを指紋にし、入れ子の中の書き換えを見逃した）。
+  // 項目の名前は src.path からの相対パス（'/' 区切り）。フォルダ自身も種類 d の項目として残す。記号リンクのフォルダはたどらない（種類 l）。
+  // 深さは MAX_DIR_DEPTH まで（超えれば dir_too_deep で固定を拒む）。項目の数（入れ子を含む）は max_dir_files まで。
   const entries = [];
-  for (const nm of names) {
-    const p = path.join(src.path, nm);
-    let es; try { es = fs.lstatSync(p); } catch (e) { return bad(`io_${e.code || 'error'}`); }
-    const type = TYPE_OF(es);
-    if (type !== 'f') { entries.push([nm, type, null, null]); continue; }
-    if (es.size > limits.max_dir_file_bytes) return bad('dir_file_too_large');
-    if (budget.used + es.size > limits.max_total_bytes) return bad('total_too_large');
-    budget.used += es.size;
-    let fd; try { fd = fs.openSync(p, fs.constants.O_RDONLY | NOFOLLOW); } catch (e) { return bad(e.code === 'ELOOP' ? 'symlink' : `io_${e.code || 'error'}`); }
-    try {
-      const f = fs.fstatSync(fd);
-      if (!f.isFile() || f.ino !== es.ino || f.dev !== es.dev) return bad('changed_while_opening');
-      const hh = crypto.createHash('sha256'); const b = Buffer.allocUnsafe(Math.max(1, Math.min(1 << 20, f.size))); let pos = 0;
-      while (pos < f.size) { const m = fs.readSync(fd, b, 0, Math.min(b.length, f.size - pos), pos); if (m <= 0) return bad('short_read'); hh.update(b.subarray(0, m)); pos += m; }
-      entries.push([nm, 'f', f.size, `sha256:${hh.digest('hex')}`]);
-    } catch (e) { return bad(`io_${(e && e.code) || 'error'}`); } finally { fs.closeSync(fd); }
-  }
+  const walk = (abs, rel, depth, stBefore) => {
+    let names; try { names = fs.readdirSync(abs); } catch (e) { return `io_${e.code || 'error'}`; }
+    // 読んでいる間にフォルダが別のもの（記号リンクなど）に差し替えられていないか
+    let stAfter; try { stAfter = fs.lstatSync(abs); } catch (e) { return `io_${e.code || 'error'}`; }
+    if (!stAfter.isDirectory() || stAfter.ino !== stBefore.ino || stAfter.dev !== stBefore.dev) return 'changed_while_opening';
+    if (entries.length + names.length > limits.max_dir_files) return 'too_many_files';
+    names.sort();
+    for (const nm of names) {
+      const p = path.join(abs, nm); const rp = rel ? `${rel}/${nm}` : nm;
+      if (rp.length > MAX_DIR_ENTRY_NAME) return 'dir_name_too_long';
+      let es; try { es = fs.lstatSync(p); } catch (e) { return `io_${e.code || 'error'}`; }
+      const type = TYPE_OF(es);
+      if (type === 'd') {
+        if (depth + 1 > MAX_DIR_DEPTH) return 'dir_too_deep';
+        entries.push([rp, 'd', null, null]);
+        const w = walk(p, rp, depth + 1, es);
+        if (w) return w;
+        continue;
+      }
+      if (type !== 'f') { entries.push([rp, type, null, null]); continue; }
+      if (es.size > limits.max_dir_file_bytes) return 'dir_file_too_large';
+      if (budget.used + es.size > limits.max_total_bytes) return 'total_too_large';
+      budget.used += es.size;
+      let fd; try { fd = fs.openSync(p, fs.constants.O_RDONLY | NOFOLLOW); } catch (e) { return e.code === 'ELOOP' ? 'symlink' : `io_${e.code || 'error'}`; }
+      try {
+        const f = fs.fstatSync(fd);
+        if (!f.isFile() || f.ino !== es.ino || f.dev !== es.dev) return 'changed_while_opening';
+        const hh = crypto.createHash('sha256'); const b = Buffer.allocUnsafe(Math.max(1, Math.min(1 << 20, f.size))); let pos = 0;
+        while (pos < f.size) { const m = fs.readSync(fd, b, 0, Math.min(b.length, f.size - pos), pos); if (m <= 0) return 'short_read'; hh.update(b.subarray(0, m)); pos += m; }
+        entries.push([rp, 'f', f.size, `sha256:${hh.digest('hex')}`]);
+      } catch (e) { return `io_${(e && e.code) || 'error'}`; } finally { fs.closeSync(fd); }
+    }
+    return null;
+  };
+  const err = walk(src.path, '', 0, st);
+  if (err) return bad(err);
+  // 名前順（相対パスの文字列の順。manifest の形の検査と同じ順）に並べる
+  entries.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
   return { name: src.name, kind: 'dir', scheme: null, state: 'ok', reason: null, size: 0, bytes: 0, lines: 0, prefix: null, tail: null, partial_tail: false, chain: null, at: new Map(), count: entries.length, entries, entries_digest: digest(entries) };
 }
 
@@ -418,15 +474,21 @@ const find = (list, name) => (Array.isArray(list) ? list.find((s) => s.name === 
  * コード：source_gone・source_unreadable・kind_changed・truncated・lines_decreased・rewritten・unverifiable・chain_broken・entry_deleted・entry_rewritten・entry_type_changed。
  * 前にあった記録が設定から消えた場合は、ここでは扱わない（AN-SOURCE-SHRINK）。
  */
-export function checkGrowth(prev, reads) {
+export function checkGrowth(prev, reads, lastOk = null) {
   const out = [];
   if (!isObj(prev) || !Array.isArray(prev.sources)) return out;
-  for (const p of prev.sources) {
-    const r = Array.isArray(reads) ? reads.find((x) => x.name === p.name) : undefined;
+  for (const p0 of prev.sources) {
+    const r = Array.isArray(reads) ? reads.find((x) => x.name === p0.name) : undefined;
     if (!r) continue;
-    const add = (code, detail = '') => out.push({ name: p.name, code, detail: cap(detail) });
-    if (r.kind !== p.kind) { add('kind_changed', `${p.kind} → ${r.kind}`); continue; }
-    if (p.state !== 'ok') { if (r.chain && r.chain.ok === false && r.state === 'ok') add('chain_broken', r.chain.code); continue; }
+    const add = (code, detail = '') => out.push({ name: p0.name, code, detail: cap(detail) });
+    if (r.kind !== p0.kind) { add('kind_changed', `${p0.kind} → ${r.kind}`); continue; }
+    // 前の固定で読めなかった・なかった記録は、最後に読めた（ok だった）時点の項目と比べる（審査 N-4。読めない状態を 1 回はさんで書き換えを隠せない）
+    let p = p0;
+    if (p0.state !== 'ok') {
+      const base = lastOk instanceof Map ? lastOk.get(p0.name) : undefined;
+      if (!isObj(base) || base.kind !== p0.kind || base.state !== 'ok') { if (r.chain && r.chain.ok === false && r.state === 'ok') add('chain_broken', r.chain.code); continue; }
+      p = base;
+    }
     if (r.state === 'absent') { add('source_gone', '前はあった記録がない'); continue; }
     if (r.state === 'unreadable') { add('source_unreadable', r.reason); continue; }
     if (p.kind === 'dir') {
@@ -460,12 +522,12 @@ export function anchorOf(manifest) { return digest(manifest); }
 
 /**
  * manifest を作る（純関数）。prev は前の manifest か null（anchor どうしを鎖にする）。nonce は 64 桁の 16 進（推測を防ぐ乱数。固定の値として残る。判定は乱数に依らない）。
- * extra = { takenAt }。regressions は checkGrowth(prev, reads) を入れる
+ * extra = { takenAt, lastOk }。regressions は checkGrowth(prev, reads, lastOk) を入れる（lastOk：記録の名前 → 最後に ok だった manifest の項目）
  */
 export function buildManifest(reads, prev, nonce, rules = RULES, extra = {}) {
   if (!Array.isArray(reads)) throw new Refused('bad_reads', '配列でない');
   const sources = [...reads].sort((a, b) => (a.name < b.name ? -1 : 1)).map(entryOfRead);
-  let reg = checkGrowth(prev, reads);
+  let reg = checkGrowth(prev, reads, extra.lastOk instanceof Map ? extra.lastOk : null);
   if (reg.length > MAX_REGRESSIONS) reg = [...reg.slice(0, MAX_REGRESSIONS - 1), { name: '*', code: 'more', detail: `ほか ${reg.length - MAX_REGRESSIONS + 1} 件` }];
   return {
     v: MANIFEST_VERSION, rules, prev_manifest: prev ? anchorOf(prev) : null, nonce, taken_at: extra.takenAt ?? null,
@@ -526,7 +588,8 @@ function sourceEntryProblem(s) {
     if (s.scheme !== null || !isNonNeg(s.count) || !Array.isArray(s.entries) || s.entries.length !== s.count || !isDigest(s.entries_digest)) return 'dir の欄の形';
     let last = null;
     for (const e of s.entries) {
-      if (!Array.isArray(e) || e.length !== 4 || typeof e[0] !== 'string' || e[0].length === 0 || e[0].length > 255 || !['f', 'l', 'd', 'o'].includes(e[1])) return 'dir の項目の形';
+      if (!Array.isArray(e) || e.length !== 4 || typeof e[0] !== 'string' || e[0].length === 0 || e[0].length > MAX_DIR_ENTRY_NAME || !['f', 'l', 'd', 'o'].includes(e[1])) return 'dir の項目の形';
+      if (e[0].split('/').some((x) => x === '' || x === '.' || x === '..')) return 'dir の項目の名前（相対パス）の形';
       if (e[1] === 'f' ? !(isNonNeg(e[2]) && isDigest(e[3])) : !(e[2] === null && e[3] === null)) return 'dir の項目の値';
       if (last !== null && !(last < e[0])) return 'dir の項目が名前順でない・重複';
       last = e[0];
@@ -631,7 +694,7 @@ export function replay(records, o = {}) {
   const cfgNow = o.cfgCopy ?? null;
   const st = {
     rows: records.length, anchors: [], byAnchor: new Map(), receiptKeys: new Set(), receiptDigests: new Set(), epochs: [], dropAllowed: new Set(),
-    problems: [], accepted_problems: [], rules_uncovered: [], cfg_mismatch: [], lastAnchor: null, lastManifest: null,
+    problems: [], accepted_problems: [], rules_uncovered: [], cfg_mismatch: [], lastAnchor: null, lastManifest: null, lastOk: new Map(),
   };
   const covered = o.pendingEpoch ? records.length : coveredCount(records);
   let lastEpoch = null;
@@ -661,6 +724,7 @@ export function replay(records, o = {}) {
       const entry = { seq, at: r.at, anchor: r.anchor, manifest: r.manifest, receipts: [], flagged: res.violations.length > 0 };
       st.anchors.push(entry); st.byAnchor.set(r.anchor, entry);
       st.lastAnchor = r.anchor; st.lastManifest = r.manifest;
+      if (Array.isArray(r.manifest.sources)) for (const s of r.manifest.sources) if (isObj(s) && typeof s.name === 'string' && s.state === 'ok') st.lastOk.set(s.name, s);
       st.dropAllowed.clear(); // drops の許可は次の 1 回の固定にだけ効く（外した名前を後で足して、また外すには新しい epoch が要る）
     } else if (r.op === 'receipt') {
       if (res.violations.length) return;
@@ -692,7 +756,7 @@ const fromFindings = (ctx, name) => {
   return f.length ? `${f.slice(0, 3).map((x) => x.reason).join(' / ')}${f.length > 3 ? `（ほか ${f.length - 3} 件）` : ''}` : null;
 };
 const V = (name, fn) => (ctx) => (ctx.op === 'verify' ? fromFindings(ctx, name) : fn ? fn(ctx) : null);
-const stateOf = (ctx) => ctx.state || { problems: [], accepted_problems: [], rules_uncovered: [], cfg_mismatch: [], dropAllowed: new Set(), byAnchor: new Map(), receiptKeys: new Set(), receiptDigests: new Set(), lastAnchor: null, lastManifest: null };
+const stateOf = (ctx) => ctx.state || { problems: [], accepted_problems: [], rules_uncovered: [], cfg_mismatch: [], dropAllowed: new Set(), byAnchor: new Map(), receiptKeys: new Set(), receiptDigests: new Set(), lastAnchor: null, lastManifest: null, lastOk: new Map() };
 const normNames = (arr) => (Array.isArray(arr) ? arr.map(normSourceName) : null);
 
 function inputShapeProblem(ctx) {
@@ -754,7 +818,7 @@ export const GUARDS = {
   // 大きさの上限（1 つの記録・合計・dir のファイル数と大きさ）を超えるものは固定を拒む
   'AN-SIZE-LIMIT': W((ctx) => {
     if (ctx.op !== 'snapshot' || !Array.isArray(ctx.reads)) return null;
-    const bad = ctx.reads.filter((r) => r.state === 'unreadable' && ['too_large', 'too_many_files', 'total_too_large', 'dir_file_too_large'].includes(r.reason));
+    const bad = ctx.reads.filter((r) => r.state === 'unreadable' && ['too_large', 'too_many_files', 'total_too_large', 'dir_file_too_large', 'dir_too_deep', 'dir_name_too_long'].includes(r.reason));
     return bad.length ? `大きさの上限を超えた記録がある（${bad.slice(0, 3).map((r) => `${r.name}:${r.reason}`).join('、')}）` : null;
   }),
   // 対象を減らす変更：前の manifest にあった記録が設定から消えるのは、オーナーの epoch が drops に挙げた名前だけ（裁判所のスクリプトは外せない）
@@ -765,13 +829,16 @@ export const GUARDS = {
     return gone.length ? `前の固定にあった記録を対象から外せるのは、オーナーの epoch の drops だけ（${gone.slice(0, 3).join('、')}）` : null;
   }),
   // 行に残した設定の写し（cfg）と開く側の設定が違えば、オーナーの epoch まで書き込みを止める
-  'AN-CFG-COPY': W((ctx) => {
-    if (ctx.op !== 'snapshot' && ctx.op !== 'receipt') return null;
+  // 照合（verify）でも、食い違いは発見にする（審査 N-1。写しと別のパスを指す設定で開くと、書き換える前の写しと照合して ok になった）。
+  // 受け入れるには verify({ allowConfigMismatch: true }) と明示し、結果の config_mismatch_accepted に残す
+  'AN-CFG-COPY': (ctx) => {
+    if (ctx && ctx.op === 'verify') return fromFindings(ctx, 'AN-CFG-COPY');
+    if (!ctx || (ctx.op !== 'snapshot' && ctx.op !== 'receipt')) return null;
     if (ctx.replayRow) return null;
     const st = stateOf(ctx);
     if (ctx.cfgCopy === null || ctx.cfgCopy === undefined) return null; // 設定が読めないときは AN-SOURCES-ALLOWLIST・AN-PATH-SAFE が止める
     return st.cfg_mismatch.length ? `記録の設定の写し（cfg）が開く側の設定と違う（seq ${st.cfg_mismatch.slice(0, 5).join('・')}）。受け入れるにはオーナーの epoch が要る` : null;
-  }),
+  },
   // 古い規則の版の行は、オーナーの移行の記録（epoch）に覆われるまで書き込みを止める
   'AN-RULES-VERSION': W((ctx) => {
     if (ctx.op === 'epoch' || ctx.replayRow) return null;
@@ -905,9 +972,11 @@ export function openAnchors(file, opt = {}) {
     }
   }
 
-  function offsetsOf(prevManifest) {
+  /** 前の manifest の位置と、前の固定で ok でなかった記録の「最後に ok だった時点」の位置（審査 N-4） */
+  function offsetsOf(prevManifest, lastOk) {
     const o = Object.create(null);
-    if (prevManifest) for (const s of prevManifest.sources) if (s.kind !== 'dir' && s.state === 'ok' && s.bytes > 0) o[s.name] = [s.bytes];
+    const add = (s) => { if (isObj(s) && s.kind !== 'dir' && s.state === 'ok' && Number.isSafeInteger(s.bytes) && s.bytes > 0) (o[s.name] ||= []).push(s.bytes); };
+    if (prevManifest) for (const s of prevManifest.sources) { if (isObj(s) && s.state === 'ok') add(s); else if (isObj(s) && lastOk) add(lastOk.get(s.name)); }
     return o;
   }
 
@@ -916,11 +985,11 @@ export function openAnchors(file, opt = {}) {
     const st = replay(records, { cfgCopy, pendingEpoch: pendingEpoch === true, file });
     const ctx = { op, actor: freezeCopy(actor), input: freezeCopy(input), state: st, chain: ch, config, cfgCopy };
     if (op === 'snapshot') {
-      ctx.reads = norm.ok ? readSources(norm.sources, norm.limits, offsetsOf(st.lastManifest)) : [];
+      ctx.reads = norm.ok ? readSources(norm.sources, norm.limits, offsetsOf(st.lastManifest, st.lastOk)) : [];
       ctx.removed = st.lastManifest ? namesOf(st.lastManifest).filter((n) => !norm.sources.some((s) => s.name === n)) : [];
       ctx.candidate = null;
       if (norm.ok) try {
-        const manifest = buildManifest(ctx.reads, st.lastManifest, newNonce(), RULES, { takenAt: now() });
+        const manifest = buildManifest(ctx.reads, st.lastManifest, newNonce(), RULES, { takenAt: now(), lastOk: st.lastOk });
         ctx.candidate = { manifest, anchor: anchorOf(manifest) };
       } catch (e) { if (!(e instanceof Refused)) throw e; ctx.candidate = null; }
     }
@@ -1004,7 +1073,11 @@ export function openAnchors(file, opt = {}) {
       }
     }
     if (unknownUpTo) findings.push({ guard: 'AN-ANCHOR-LINK', reason: 'upTo の anchor が記録にない' });
-    if (st.cfg_mismatch.length) notes.push('開く側の設定が記録の設定の写しと違う（書き込みは止まる。照合は開く側の設定の記録で行った）');
+    const acceptMismatch = o.allowConfigMismatch === true && st.cfg_mismatch.length > 0;
+    if (st.cfg_mismatch.length) {
+      if (acceptMismatch) notes.push(`開く側の設定が記録の設定の写しと違う（seq ${st.cfg_mismatch.slice(0, 5).join('・')}）。呼び出し側が allowConfigMismatch で受け入れたので、開く側の設定の記録で照合した（記録に固定したパスとは違う記録を照合した可能性がある）`);
+      else findings.push({ guard: 'AN-CFG-COPY', reason: `記録の設定の写し（cfg）が開く側の設定と違う（seq ${st.cfg_mismatch.slice(0, 5).join('・')}）。開く側の設定の記録で照合しても、固定した記録を照合したことにならない。受け入れるには verify({ allowConfigMismatch: true }) と明示する（書き込みはオーナーの epoch まで止まる）` });
+    }
     const ctx = { op: 'verify', findings, state: st, chain: ch };
     const violations = check(ctx).violations;
     return {
@@ -1012,6 +1085,7 @@ export function openAnchors(file, opt = {}) {
       result: {
         ok: violations.length === 0 && findings.length === 0,
         anchors_checked: results.length, findings, violations,
+        config_mismatch_accepted: acceptMismatch,
         record: { chain_ok: ch.ok, chain_code: ch.ok ? null : ch.code, problems: st.problems, accepted_problems: st.accepted_problems, rules_uncovered: st.rules_uncovered, config_matches: st.cfg_mismatch.length === 0 && cfgCopy !== null },
         anchors: results,
         with_receipt: results.filter((r) => r.receipts > 0).map((r) => r.anchor),
@@ -1049,7 +1123,11 @@ export function openAnchors(file, opt = {}) {
       const body = guarded('receipt', actor, input, (ctx) => ({ ...normReceipt(ctx.input).value }));
       return deepFreeze({ anchor: body.anchor, method: body.method, ref: body.ref, digest: body.digest, note: body.note, receipt_verified: false, verification: 'not_performed', notice: EXTERNAL_NOTE });
     },
-    /** 手元の対象の記録を、記録にある全部の anchor（upTo まで）と照合する。receipt があるか・本物かは見ない */
+    /**
+     * 手元の対象の記録を、記録にある全部の anchor（upTo まで）と照合する。receipt があるか・本物かは見ない。
+     * o = { upTo?, pinned?, allowConfigMismatch? }。設定の写しとの食い違いは、allowConfigMismatch: true（真偽値の true だけ）のときだけ受け入れ、
+     * 結果の config_mismatch_accepted に残す。それ以外は AN-CFG-COPY の発見で ok: false
+     */
     verify: (o = {}) => analyze(o).result,
     /** 外に出してよいものだけ：anchor の値と記録の時刻。manifest・件数・名前・パスは含めない。記録が壊れているときは出さない */
     externalView(anchor) {

@@ -50,6 +50,7 @@ export const ACTORS = Object.freeze({
   worker1: { role: 'worker', kind: 'ai', id: 'worker-1', lineage: 'claude' },
   worker2: { role: 'worker', kind: 'ai', id: 'worker-2', lineage: 'claude' },
   judgeCodex: { role: 'codex_judge', kind: 'ai', id: 'judge-codex', lineage: 'codex' },
+  judgeClaude: { role: 'judge', kind: 'ai', id: 'judge-claude', lineage: 'claude' },
   constClaude: { role: 'constitutional_review', kind: 'ai', id: 'const-review', lineage: 'claude' }, // 実際の憲法審査は Claude（capabilities.json の identity）
 });
 
@@ -120,7 +121,7 @@ export function runWalkthrough({ dir = null, log = () => {} } = {}) {
       { id: A.head.id, template: 'executive_head', scope: { resources: ticketResources, tools: [...WORK_TOOLS, 'Agent'] } },
       { id: A.worker1.id, template: 'worker', parent: A.head.id, scope: { resources: ['src/a/**', 'src/c/**'], tools: WORK_TOOLS } },
       { id: A.worker2.id, template: 'worker', parent: A.head.id, scope: { resources: ['src/b/**'], tools: WORK_TOOLS } },
-      { id: 'judge-claude', template: 'judge', scope: { resources: [], tools: [] } },
+      { id: A.judgeClaude.id, template: 'judge', scope: { resources: [], tools: [] } },
       { id: A.judgeCodex.id, template: 'codex_judge', scope: { resources: [], tools: [] } },
     ],
   };
@@ -298,11 +299,12 @@ export function runWalkthrough({ dir = null, log = () => {} } = {}) {
   const evalOf = (p, ev = GOOD) => im.evaluate(A.gate, p.id, { digest: im.get(p.id).digest, evidence: { conformance: ev } });
   const reviewOf = (p, who = A.judgeCodex) => im.review(who, p.id, { digest: im.get(p.id).digest, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(p.id).digest });
   const adoptOf = (id) => im.adopt(A.owner, id, { digest: im.get(id).digest, policy_line: policyLine });
-  evalOf(playbook); reviewOf(playbook);
+  // im.v5：採用には、APPROVED を出した司法の系統が 2 つ要る（提案者の系統の申告に依らない。独立した審査 4 回目 I-1）
+  evalOf(playbook); reviewOf(playbook); reviewOf(playbook, A.judgeClaude);
   const adopted = adoptOf(playbook.id);
   if (adopted.status !== 'adopted' || !im.adoptionValid(playbook.id)) throw new Error('手順の改善が採用されない');
   tr.link(A.owner, { rel: 'derives', from: { kind: 'improvement', id: playbook.id }, to: { kind: 'experience', id: induced.id } });
-  log(8, `行政の長が ${playbook.id} を提案 → 裁判所のスクリプトが評価 → codex の judge が審査 → オーナーが採用`);
+  log(8, `行政の長が ${playbook.id} を提案 → 裁判所のスクリプトが評価 → codex と claude の judge が審査 → オーナーが採用`);
 
   const looser = clone(caps); looser.capabilities.find((c) => c.id === 'CAP-MAIN-INTEGRATE').allowed.push('worker');
   const dLoose = authorityDelta(caps, looser);
@@ -320,7 +322,7 @@ export function runWalkthrough({ dir = null, log = () => {} } = {}) {
   const tighter = clone(looser); tighter.capabilities.find((c) => c.id === 'CAP-MAIN-INTEGRATE').probes.push({ tool: 'Bash', command: 'git push --force origin HEAD:main' });
   const dTight = authorityDelta(looser, tighter);
   const lawTight = im.propose(A.head, { title: 'main への強制 push の probe を足す', tier: 'law', target: { paths: [CAPS_PATH] }, content: { capabilities: tighter }, capabilities: { old: looser, new: tighter } });
-  evalOf(lawTight, { before: { total: 50, passed: 50 }, after: { total: 51, passed: 51 }, new_cases_fail_on_before: 1 }); reviewOf(lawTight);
+  evalOf(lawTight, { before: { total: 50, passed: 50 }, after: { total: 51, passed: 51 }, new_cases_fail_on_before: 1 }); reviewOf(lawTight); reviewOf(lawTight, A.judgeClaude);
   const adoptedTight = adoptOf(lawTight.id);
   if (dTight.class !== 'tightening' || adoptedTight.status !== 'adopted') throw new Error('締める変更が通常の経路で採用されない');
   log(8, `法律の変更：緩める（${dLoose.class}・${routeFor(dLoose).lane}）は採用できず、締める（${dTight.class}）は採用された`);

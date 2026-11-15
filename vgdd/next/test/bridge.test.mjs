@@ -100,8 +100,32 @@ test('provenanceFromVerdict：refs.findings から経験の出どころ。refs �
 const retrievedAt = (rows, task, ids, { actor = A.worker1, which = 'start', shift = 0 } = {}) => {
   const r = rows.find((x) => x.op === which && x.node === task);
   const at = new Date(V.parseTs(r.at) + shift).toISOString();
-  return { type: 'vgdd.experience.v1', op: 'retrieved', actor: V.normActor(actor), task, item_ids: ids, at, seq: 1 };
+  return { type: 'vgdd.experience.v1', op: 'retrieved', actor: V.normActor(actor), role: 'worker', task, item_ids: ids, at, seq: 1 };
 };
+
+test('審査4（feedbackFromRun の疑い）：取り出しの行も、経験の部品と同じ規則で 1 行ずつ確かめる。合わない行は数えず、理由を返す', () => {
+  const run = mkRun([[J('judge', 'claude'), J('judge', 'codex')]]).rows;
+  const ok = retrievedAt(run, 'T-101', ['exp-000001']);
+  const cases = [
+    ['司法の役割に渡した取り出し', { ...ok, role: 'judge' }],
+    ['裁判所のスクリプトに渡した取り出し', { ...ok, role: 'gate_runner' }],
+    ['表にない役割（全角の名前）に渡した取り出し', { ...ok, role: 'ｗｏｒｋｅｒ２' }],
+    ['渡す先の役割がない取り出し', { ...ok, role: undefined }],
+    ['行為者の綴りが正規形でない（大文字の id）', { ...ok, actor: { ...ok.actor, id: ok.actor.id.toUpperCase() } }],
+    ['行為者の綴りが正規形でない（全角の役割）', { ...ok, actor: { ...ok.actor, role: 'ｗｏｒｋｅｒ' } }],
+    ['司法の行為者の取り出し', { ...ok, actor: V.normActor({ role: 'judge', kind: 'ai', id: 'claude-judge-1' }) }],
+    ['経験の記録の行でない（種類が違う）', { ...ok, type: 'vgdd.runstate.v1' }],
+    ['項目の id が文字列でない', { ...ok, item_ids: [1] }],
+  ];
+  for (const [label, ev] of cases) {
+    const out = B.feedbackFromRun(run, [ev]);
+    assert.deepEqual(out.feedback, [], label);
+    assert.ok(out.skipped.some((x) => /取り出しの行.*規則に合わない/.test(x.reason)), `${label}：${JSON.stringify(out.skipped)}`);
+  }
+  // 通す側：規則に合う行は数える（合わない行が混ざっても、合う行の評価は出る）
+  const mixed = B.feedbackFromRun(run, [ok, { ...ok, role: 'judge', item_ids: ['exp-000009'] }]);
+  assert.deepEqual(mixed.feedback.map((f) => f.item_ids), [['exp-000001']]);
+});
 
 test('feedbackFromRun：最初の判定が pass → helpful、return → harmful。判定がない・決められない票は出さない', () => {
   const passRun = mkRun([[J('judge', 'claude'), J('judge', 'codex')]]).rows;

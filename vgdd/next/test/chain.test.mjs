@@ -530,6 +530,331 @@ test('親フォルダの fsync が対応していない旨のエラー（EINVAL�
   assert.throws(() => run('EIO'), (e) => e.code === 'EIO');
 });
 
+// ---- 独立した審査（4 回目）の発見 C-1〜C-6・L-1 と、変異の試験の生き残り ----
+
+test('C-1：toJSON を持つ値・疎な配列・BigInt は not_canonical で拒み、何も書かない。記録はその後も使える', () => {
+  const { c, file, dir } = fresh();
+  fill(c, 1);
+  const snap = snapshotDir(dir);
+  const sparse = [1]; sparse[2] = 3;
+  const withToJSON = { toJSON: () => 'x', a: 1 };
+  for (const body of [{ type: 't', when: new Date(0) }, { type: 't', xs: sparse }, { type: 't', o: withToJSON }, { type: 't', n: 1n }, { type: 't', nested: { d: new Date(0) } }]) {
+    const e = brokenCode(() => c.append(body));
+    assert.equal(e.code, 'not_canonical', e.message);
+    assert.deepEqual(snapshotDir(dir), snap);
+  }
+  assert.deepEqual(c.verify(), { ok: true, count: 1 });
+  assert.equal(c.append({ type: 't' }).seq, 2);
+  void file;
+});
+
+test('C-1（通す側）：JSON として同じに戻る値（undefined の欄、配列の中の undefined、-0、日本語・絵文字・制御文字）は通り、書いた行がそのまま読める', () => {
+  const { c, file } = fresh();
+  const r = c.append({ type: 't', skip: undefined, xs: [1, undefined, 3], z: -0, s: 'あ😀\u0001 ', big: 1e21, nested: { k: [{}] } });
+  assert.deepEqual(r.xs, [1, null, 3]);
+  assert.ok(!('skip' in r));
+  const line = readText(file).trim();
+  assert.equal(line, JSON.stringify(r));
+  assert.deepEqual(c.verify(), { ok: true, count: 1 });
+  assert.deepEqual(c.read()[0], r);
+});
+
+test('C-2：.head.tmp の記号リンクはたどらず、リンク先を書き換えない。unsafe_file で止め、head も進めない', { skip: process.platform === 'win32' }, () => {
+  const { c, file } = fresh();
+  fill(c, 1);
+  const victim = path.join(tmp(), 'victim.txt'); fs.writeFileSync(victim, 'IMPORTANT\n');
+  fs.symlinkSync(victim, `${file}.head.tmp`);
+  const e = brokenCode(() => c.append({ type: 't' }));
+  assert.equal(e.code, 'unsafe_file', e.message);
+  assert.equal(e.detail, 'c.jsonl.head.tmp: not_regular');
+  assert.equal(readText(victim), 'IMPORTANT\n');
+  assert.equal(headOf(file).seq, 1);
+});
+
+test('C-2（競合）：lstat の後に記号リンクが置かれても、開くときにたどらない（O_NOFOLLOW）。lstat と開いたものが違えば止める', { skip: process.platform === 'win32' }, () => {
+  // lstat の時点では無かった recovery.jsonl が、開く直前に記号リンクとして現れる
+  {
+    const { c, file } = fresh();
+    fill(c, 1);
+    const victim = path.join(tmp(), 'victim.txt'); fs.writeFileSync(victim, 'IMPORTANT\n');
+    fs.appendFileSync(file, '{"torn');
+    const rec = `${file}.recovery.jsonl`;
+    const oOpen = fs.openSync; let planted = false;
+    fs.openSync = function (p, ...a) { if (!planted && String(p) === rec) { planted = true; fs.symlinkSync(victim, rec); } return oOpen.call(fs, p, ...a); };
+    let e;
+    try { e = brokenCode(() => c.append({ type: 't' })); } finally { fs.openSync = oOpen; }
+    assert.ok(planted);
+    assert.equal(e.code, 'unsafe_file'); assert.equal(e.detail, 'c.jsonl.recovery.jsonl: symlink');
+    assert.equal(readText(victim), 'IMPORTANT\n');
+  }
+  // lstat の後に、通常のファイルが別の通常のファイルに差し替えられる
+  {
+    const { c, file } = fresh();
+    fill(c, 1);
+    const rec = `${file}.recovery.jsonl`;
+    fs.writeFileSync(rec, '');
+    fs.appendFileSync(file, '{"torn');
+    const oOpen = fs.openSync; let swapped = false;
+    fs.openSync = function (p, ...a) { if (!swapped && String(p) === rec) { swapped = true; fs.writeFileSync(`${rec}.new`, 'other\n'); fs.renameSync(`${rec}.new`, rec); } return oOpen.call(fs, p, ...a); };
+    let e;
+    try { e = brokenCode(() => c.append({ type: 't' })); } finally { fs.openSync = oOpen; }
+    assert.ok(swapped);
+    assert.equal(e.code, 'unsafe_file'); assert.equal(e.detail, 'c.jsonl.recovery.jsonl: changed_while_opening');
+    assert.equal(readText(rec), 'other\n');
+  }
+});
+
+test('C-2（通す側）：前に落ちて残った通常のファイルの .head.tmp は消して書き直す', () => {
+  const { c, file } = fresh();
+  fill(c, 1);
+  fs.writeFileSync(`${file}.head.tmp`, '{"seq":9');
+  assert.equal(c.append({ type: 't' }).seq, 2);
+  assert.ok(!fs.existsSync(`${file}.head.tmp`));
+  assert.deepEqual(c.verify(), { ok: true, count: 2 });
+});
+
+test('C-2：.recovery.jsonl・本体の記号リンクとハードリンクはたどらず、リンク先に追記しない', { skip: process.platform === 'win32' }, () => {
+  // 復旧の記録が記号リンク（形2の復旧を起こす）
+  {
+    const { c, file } = fresh();
+    fill(c, 1);
+    const victim = path.join(tmp(), 'victim.txt'); fs.writeFileSync(victim, 'IMPORTANT\n');
+    fs.appendFileSync(file, '{"torn');
+    fs.symlinkSync(victim, `${file}.recovery.jsonl`);
+    const e = brokenCode(() => c.append({ type: 't' }));
+    assert.equal(e.code, 'unsafe_file'); assert.equal(e.detail, 'c.jsonl.recovery.jsonl: not_regular'); // 開く前の lstat で止める（O_NOFOLLOW は二重の守り）
+    assert.equal(readText(victim), 'IMPORTANT\n');
+    assert.throws(() => c.recoveries(), (x) => x.code === 'unsafe_file');
+  }
+  // 復旧の記録がハードリンク
+  {
+    const { c, file } = fresh();
+    fill(c, 1);
+    const victim = path.join(tmp(), 'victim.txt'); fs.writeFileSync(victim, 'IMPORTANT\n');
+    fs.appendFileSync(file, '{"torn');
+    fs.linkSync(victim, `${file}.recovery.jsonl`);
+    assert.equal(brokenCode(() => c.append({ type: 't' })).code, 'unsafe_file');
+    assert.equal(readText(victim), 'IMPORTANT\n');
+  }
+  // 本体がハードリンク（追記がリンク先にも入る）
+  {
+    const { c, file } = fresh();
+    fill(c, 1);
+    const other = path.join(tmp(), 'other.jsonl');
+    fs.linkSync(file, other);
+    const before = readText(other);
+    assert.equal(brokenCode(() => c.append({ type: 't' })).code, 'unsafe_file');
+    assert.equal(readText(other), before);
+  }
+  // 本体がハードリンクで、書きかけの末尾がある（形2の切り詰めがリンク先も切り詰める）
+  {
+    const { c, file } = fresh();
+    fill(c, 1);
+    fs.appendFileSync(file, '{"torn');
+    const other = path.join(tmp(), 'other.jsonl');
+    fs.linkSync(file, other);
+    const before = readText(other);
+    const e = brokenCode(() => c.append({ type: 't' }));
+    assert.equal(e.code, 'unsafe_file'); assert.equal(e.detail, 'c.jsonl: hardlink');
+    assert.equal(readText(other), before);
+  }
+  // 記録のフォルダ自身が記号リンク
+  {
+    const real = tmp(); const linkDir = path.join(tmp(), 'linked');
+    fs.symlinkSync(real, linkDir);
+    const c = openChain(path.join(linkDir, 'c.jsonl'), { now: () => AT, lockWaitMs: 300 });
+    assert.equal(brokenCode(() => c.append({ type: 't' })).code, 'unsafe_file');
+    assert.deepEqual(fs.readdirSync(real), []);
+  }
+});
+
+test('C-2（通す側）：通常のファイルの .recovery.jsonl には追記し、復旧が通る', () => {
+  const { c, file } = fresh();
+  fill(c, 1);
+  fs.writeFileSync(`${file}.recovery.jsonl`, '');
+  fs.appendFileSync(file, '{"torn');
+  assert.equal(c.append({ type: 't' }).seq, 2);
+  assert.deepEqual(c.recoveries().map((x) => x.kind), ['discard_torn']);
+});
+
+test('C-3：head がなく行がある記録は、読み手も head_missing で止める（1 行でも）。両方が空なら新しい記録', () => {
+  const { c, file } = fresh();
+  fill(c, 3);
+  fs.rmSync(`${file}.head`);
+  const first = readText(file).split('\n')[0];
+  fs.writeFileSync(file, `${first}\n`);
+  assert.deepEqual(c.verify(), { ok: false, code: 'chain_broken', detail: 'head_missing' });
+  assert.equal(brokenCode(() => c.read()).detail, 'head_missing');
+  assert.equal(brokenCode(() => c.append({ type: 't' })).detail, 'head_missing');
+  // head がなく、書きかけの 1 行だけ
+  fs.writeFileSync(file, '{"seq":1');
+  assert.equal(c.verify().detail, 'head_missing');
+  // 通す側：最初の追記の途中（空の本体を置いた後、head の前）で落ちた形は、空の記録として読める
+  fs.writeFileSync(file, '');
+  assert.deepEqual(c.verify(), { ok: true, count: 0 });
+});
+
+test('C-4：head の後ろの完全な 1 行が鎖につながらないとき、読み手は pending: unrecoverable を返す。書き手は止まる', () => {
+  const { c, file } = fresh();
+  fill(c, 1);
+  fs.appendFileSync(file, '{"junk":1}\n');
+  assert.deepEqual(c.verify(), { ok: true, count: 1, pending: 'unrecoverable' });
+  assert.equal(brokenCode(() => c.append({ type: 't' })).code, 'chain_broken');
+  // 通す側：鎖としてつながる 1 行は roll_forward のまま
+  const f2 = fresh(); fill(f2.c, 1);
+  fs.appendFileSync(f2.file, `${JSON.stringify(nextRow(f2.c.read()))}\n`);
+  assert.equal(f2.c.verify().pending, 'roll_forward');
+});
+
+test('C-5：check が渡された配列を変えても、prev と seq は変わらず、鎖は壊れない', () => {
+  const { c } = fresh();
+  fill(c, 2);
+  const r = c.append({ type: 't' }, (rs) => { rs.pop(); rs.length = 0; });
+  assert.equal(r.seq, 3);
+  assert.deepEqual(c.verify(), { ok: true, count: 3 });
+  const r2 = c.append({ type: 't' }, (rs) => { rs.push({ hash: 'x' }); });
+  assert.equal(r2.seq, 4); assert.equal(r2.prev, r.hash);
+  assert.deepEqual(c.verify(), { ok: true, count: 4 });
+});
+
+test('C-6：重複したキー・空白・エスケープの違いなど、書いたとおりの綴りでない行は鎖が通らない（not_canonical_line）', () => {
+  const variants = [
+    ['重複したキー', (l) => l.replace('{', '{"verdict":"allow",')],
+    ['空白を足した', (l) => l.replace(':', ': ')],
+    ['文字をエスケープした', (l) => l.replace('"type"', '"\\u0074ype"')],
+  ];
+  for (const [name, change] of variants) {
+    const { c, file } = fresh();
+    c.append({ type: 't', verdict: 'deny' });
+    const line = readText(file).trim();
+    fs.writeFileSync(file, `${change(line)}\n`);
+    assert.deepEqual(JSON.parse(change(line)).verdict, 'deny', name);
+    assert.deepEqual(c.verify(), { ok: false, code: 'chain_broken', detail: 'not_canonical_line' }, name);
+    assert.equal(brokenCode(() => c.append({ type: 't' })).code, 'chain_broken', name);
+  }
+  // head の後ろの 1 行が書いたとおりの綴りでなければ、形1の復旧の対象にしない
+  const { c, file } = fresh();
+  fill(c, 1);
+  const row = nextRow(c.read());
+  fs.appendFileSync(file, `${JSON.stringify(row).replace('{', '{"type":"forged",')}\n`);
+  assert.equal(c.verify().pending, 'unrecoverable');
+  assert.equal(brokenCode(() => c.append({ type: 't' })).code, 'chain_broken');
+});
+
+test('L-1：ロックの持ち主の情報を書けなかったとき、ロックを消さずに投げる（確かめられない他人のロックに触らない）', () => {
+  const { c, file } = fresh();
+  const orig = fs.writeFileSync;
+  let planted = false;
+  fs.writeFileSync = function (p, ...a) {
+    if (!planted && String(p) === path.join(lockOf(file), 'owner')) {
+      planted = true;
+      // 止まっている間に、別の者が空のロックを引き継いで持ち主の情報を書いた
+      orig.call(fs, p, JSON.stringify({ pid: process.pid, host: os.hostname(), token: 'other' }));
+    }
+    return orig.call(fs, p, ...a);
+  };
+  try {
+    assert.throws(() => c.append({ type: 't' }), (e) => e.code === 'EEXIST');
+  } finally { fs.writeFileSync = orig; }
+  assert.ok(fs.existsSync(lockOf(file)), '他人のロックを消した');
+  assert.equal(JSON.parse(readText(path.join(lockOf(file), 'owner'))).token, 'other');
+});
+
+test('変異 #0：seq だけが違う行（prev とハッシュは正しい）を止める', () => {
+  const { c, file } = fresh();
+  fill(c, 3);
+  const rows = c.read();
+  const r2 = (() => { const { hash, ...b } = rows[1]; const f = { ...b, seq: 7 }; return { ...f, hash: sha256(canonical(f)) }; })();
+  const r3 = (() => { const { hash, ...b } = rows[2]; const f = { ...b, prev: r2.hash }; return { ...f, hash: sha256(canonical(f)) }; })();
+  fs.writeFileSync(file, `${[rows[0], r2, r3].map((r) => JSON.stringify(r)).join('\n')}\n`);
+  writeHeadRaw(file, 3, r3.hash);
+  assert.deepEqual(c.verify(), { ok: false, code: 'chain_broken', detail: 'seq 2' });
+});
+
+test('変異 #7：head のハッシュが末尾と合わない記録には、復旧（退避・切り詰め・head を進める）で手を入れない', () => {
+  for (const [name, add] of [
+    ['書きかけの末尾', (file) => fs.appendFileSync(file, '{"x"')],
+    ['鎖につながる完全な 1 行', (file, rows) => fs.appendFileSync(file, `${JSON.stringify(nextRow(rows))}\n`)],
+  ]) {
+    const { c, file, dir } = fresh();
+    fill(c, 3);
+    const rows = c.read();
+    writeHeadRaw(file, 3, 'e'.repeat(64));
+    add(file, rows);
+    const snap = snapshotDir(dir);
+    assert.equal(brokenCode(() => c.append({ type: 't' })).code, 'chain_broken', name);
+    assert.deepEqual(snapshotDir(dir), snap, name);
+    assert.deepEqual(c.recoveries(), [], name);
+  }
+});
+
+test('変異 #2・#4・#23・#18：止める理由の文字列（head_missing・truncated_line・empty_line・torn_tail）', () => {
+  // #2：書き手は head がない記録を head_missing で止める
+  { const { c, file } = fresh(); fill(c, 3); fs.rmSync(`${file}.head`); assert.equal(brokenCode(() => c.append({ type: 't' })).detail, 'head_missing'); }
+  // #4：読み手は、head が指す最後の行の改行が欠けた記録を truncated_line で止める
+  { const { c, file } = fresh(); fill(c, 3); fs.writeFileSync(file, readText(file).slice(0, -1)); assert.deepEqual(c.verify(), { ok: false, code: 'chain_broken', detail: 'truncated_line' }); }
+  // #23：空行（読み手・書き手）
+  {
+    const { c, file } = fresh(); fill(c, 3);
+    const ls = readText(file).split('\n').filter(Boolean);
+    fs.writeFileSync(file, `${ls[0]}\n\n${ls.slice(1).join('\n')}\n`);
+    assert.equal(c.verify().detail, 'empty_line');
+    assert.equal(brokenCode(() => c.append({ type: 't' })).detail, 'empty_line');
+  }
+  // #18：repairHead は書きかけの末尾を torn_tail で止める（行として完全でも改行がなければ）
+  {
+    const { c, file } = fresh(); fill(c, 3); const last = c.read()[2];
+    fs.rmSync(`${file}.head`); fs.writeFileSync(file, readText(file).slice(0, -1));
+    assert.equal(brokenCode(() => c.repairHead({ reason: 'r', expect: { seq: 3, hash: last.hash } })).detail, 'torn_tail');
+  }
+});
+
+test('変異 #25：引き継ぎの確かめの後、rename の前にロックが入れ替わったら、入れ替わったロックを動かさない', () => {
+  const { c, file } = fresh({ lockWaitMs: 150 });
+  plantLock(file, { pid: deadPid(), host: os.hostname(), started: AT, token: 'dead' });
+  const live = JSON.stringify({ pid: process.pid, host: os.hostname(), token: 'live' });
+  const oRead = fs.readFileSync; const oRename = fs.renameSync;
+  let swapped = false; const renamed = [];
+  fs.readFileSync = function (p, ...a) {
+    const out = oRead.call(fs, p, ...a);
+    if (!swapped && String(p) === path.join(lockOf(file), 'owner')) {
+      swapped = true; // 死んだ持ち主を読んだ直後に、別の者が引き継いで生きたロックを置いた
+      fs.rmSync(lockOf(file), { recursive: true, force: true });
+      fs.mkdirSync(lockOf(file)); fs.writeFileSync(path.join(lockOf(file), 'owner'), live);
+    }
+    return out;
+  };
+  fs.renameSync = function (a, b) { renamed.push(String(a)); return oRename.call(fs, a, b); };
+  try {
+    assert.equal(brokenCode(() => c.append({ type: 't' })).code, 'lock_busy');
+  } finally { fs.readFileSync = oRead; fs.renameSync = oRename; }
+  assert.ok(swapped);
+  assert.ok(!renamed.includes(lockOf(file)), '生きたロックを rename した');
+  assert.equal(readText(path.join(lockOf(file), 'owner')), live);
+});
+
+test('変異 #26：rename の直前にロックが入れ替わり、生きたロックを動かしてしまったら、元に戻して引き継がない', () => {
+  const { c, file } = fresh({ lockWaitMs: 150 });
+  plantLock(file, { pid: deadPid(), host: os.hostname(), started: AT, token: 'dead' });
+  const live = JSON.stringify({ pid: process.pid, host: os.hostname(), token: 'live' });
+  const oRename = fs.renameSync;
+  let swapped = false;
+  fs.renameSync = function (a, b) {
+    if (!swapped && String(a) === lockOf(file)) {
+      swapped = true;
+      fs.rmSync(lockOf(file), { recursive: true, force: true });
+      fs.mkdirSync(lockOf(file)); fs.writeFileSync(path.join(lockOf(file), 'owner'), live);
+    }
+    return oRename.call(fs, a, b);
+  };
+  try {
+    assert.equal(brokenCode(() => c.append({ type: 't' })).code, 'lock_busy');
+  } finally { fs.renameSync = oRename; }
+  assert.ok(swapped);
+  assert.equal(readText(path.join(lockOf(file), 'owner')), live, '生きたロックが戻っていない');
+  assert.deepEqual(c.recoveries(), []);
+});
+
 // ---- 性能 ----
 
 for (const n of [100, 2000]) {

@@ -1418,3 +1418,133 @@ test('R05：RS-PROTECTED は範囲を NFKC にしてから比べる（全角の 
   const m = mR({ protected: ['vgdd/**'] });
   assert.ok(rsRefused(() => m.go(EX, { op: 'plan', nodes: [{ id: 'T-101', depends_on: [], resources: ['ｖｇｄｄ/x'] }] })).includes('RS-PROTECTED'));
 });
+
+// ---- 独立した審査（4 回目）R-1：保護を後から足しても、作業中の節が申請・合格・統合まで進む ----
+// submit・verdict（合格と差し戻し）・release でも今の protected と比べ、重なれば blocked（blocked_reason: 'protected'）にする。
+// 出口は、オーナーの裁定（審査に合格した申請だけ rule の merge）・オーナーの置き換え・保護の見直しの後の unblock
+const r1World = (resources = ['vgdd/kernel/x'], config = {}) => {
+  const m = mR(config);
+  m.go(EX, { op: 'plan', nodes: [{ id: 'T-101', depends_on: [], resources }, { id: 'T-102', depends_on: [], resources: ['src/a/**'] }] });
+  for (const id of ['T-101', 'T-102']) m.go(OW, { op: 'approve', node: id, spec_digest: S1, policy_line: 'p0.4', def_digest: m.state().nodes[id].def_digest });
+  return m;
+};
+const protect = (m) => m.go(OW, cfgEv2(m, { protected: ['vgdd/**'], reason: '統治の核を保護する（締める）' }));
+const CR2m = [J('claude', 'CHANGES_REQUIRED'), J('codex', 'CHANGES_REQUIRED')];
+
+test('R-1 判例：作業中の節に重なる保護を足すと、submit は blocked（protected）になり、差し戻し・合格の経路に進まない', () => {
+  const m = r1World();
+  m.go(EX, { op: 'start', node: 'T-101', spec_digest: S1, lease_sec: 600 });
+  m.go(EX, { op: 'start', node: 'T-102', spec_digest: S1, lease_sec: 600 });
+  const c = protect(m);
+  assert.deepEqual(c.protected_busy, ['T-101'], 'config の戻り値で、保護と重なる作業中の節を知らせる');
+  const s = m.go(EX, { op: 'submit', node: 'T-101', request: R1 });
+  assert.equal(s.to, 'blocked'); assert.equal(s.kind, 'blocked_protected');
+  assert.equal(m.state().nodes['T-101'].blocked_reason, 'protected');
+  assert.ok(rsRefused(() => m.go(CT, { op: 'verdict', node: 'T-101', request: R1, audits: 'passed', verdicts: AP2 })), 'review でないので verdict は通らない');
+  assert.ok(rsRefused(() => m.go(OW, { op: 'rule', node: 'T-101', request: R1, decision: 'merge', reason: '通す' })).includes('RS-PROTECTED'), '審査に合格していない申請は裁定で統合できない');
+  assert.ok(rsRefused(() => m.go(OW, { op: 'unblock', node: 'T-101', reason: '再開' })).includes('RS-PROTECTED'));
+  assert.ok(rsRefused(() => m.go(EX, { op: 'plan', nodes: [{ id: 'T-111', depends_on: [], resources: ['src/k/**'] }], supersede: [{ old: 'T-101', new: 'T-111' }] })).includes('RS-PLAN-SUPERSEDE'), '行政は保護の判断待ちの節を置き換えで消せない');
+  assert.equal(m.go(OW, { op: 'plan', nodes: [{ id: 'T-111', depends_on: [], resources: ['src/k/**'] }], supersede: [{ old: 'T-101', new: 'T-111' }] }).ok, true, 'オーナーは置き換えで出られる');
+  // 陽性の対照：重ならない節は今までどおり
+  assert.equal(m.go(EX, { op: 'submit', node: 'T-102', request: R2 }).to, 'review');
+  assert.equal(m.go(CT, { op: 'verdict', node: 'T-102', request: R2, audits: 'passed', verdicts: AP2 }).to, 'merged');
+});
+
+test('R-1：review の節の verdict（合格・差し戻し・司法が使えない）は、保護と重なれば blocked。合格のときだけオーナーの裁定で統合できる', () => {
+  for (const [name, verdicts, mergeOk] of [['合格', AP2, true], ['重大でない不一致の合格', [J('claude'), J('codex', 'CHANGES_REQUIRED')], true], ['差し戻し', CR2m, false], ['司法が使えない', [J('claude')], false], ['重大な不一致', SPLIT_MAJOR, true]]) {
+    const m = r1World();
+    m.go(EX, { op: 'start', node: 'T-101', spec_digest: S1, lease_sec: 600 });
+    m.go(EX, { op: 'submit', node: 'T-101', request: R1 });
+    assert.deepEqual(protect(m).protected_busy, ['T-101'], name);
+    const v = m.go(CT, { op: 'verdict', node: 'T-101', request: R1, audits: 'passed', verdicts });
+    assert.equal(v.to, 'blocked', name); assert.equal(v.kind, 'blocked_protected', name);
+    assert.equal(m.state().nodes['T-101'].blocked_reason, 'protected', name);
+    assert.ok(rsRefused(() => m.go(OW, { op: 'rule', node: 'T-101', request: R1, decision: 'return', reason: '差し戻す' })).includes('RS-PROTECTED'), name);
+    if (mergeOk) assert.equal(m.go(OW, { op: 'rule', node: 'T-101', request: R1, decision: 'merge', reason: '保護を承知で通す' }).to, 'merged', name);
+    else assert.ok(rsRefused(() => m.go(OW, { op: 'rule', node: 'T-101', request: R1, decision: 'merge', reason: '通す' })).includes('RS-PROTECTED'), name);
+  }
+});
+
+test('R-1：監査の不合格の verdict（差し戻し）も、保護と重なれば作業に戻さず blocked', () => {
+  const m = r1World();
+  m.go(EX, { op: 'start', node: 'T-101', spec_digest: S1, lease_sec: 600 });
+  m.go(EX, { op: 'submit', node: 'T-101', request: R1 });
+  protect(m);
+  assert.equal(m.go(CT, { op: 'verdict', node: 'T-101', request: R1, audits: 'failed', verdicts: AP2 }).to, 'blocked');
+  assert.ok(rsRefused(() => m.go(EX, { op: 'start', node: 'T-101', spec_digest: S1, lease_sec: 600 })));
+});
+
+test('R-1：held の節の release は、保護と重なれば blocked。オーナーは裁定で統合できる（合格済みの申請）', () => {
+  const m = r1World(['vgdd/kernel/x'], { hold: true });
+  m.go(EX, { op: 'start', node: 'T-101', spec_digest: S1, lease_sec: 600 });
+  m.go(EX, { op: 'submit', node: 'T-101', request: R1 });
+  assert.equal(m.go(CT, { op: 'verdict', node: 'T-101', request: R1, audits: 'passed', verdicts: AP2 }).to, 'held');
+  assert.deepEqual(protect(m).protected_busy, ['T-101']);
+  const r = m.go(OW, { op: 'release', node: 'T-101', request: R1 });
+  assert.equal(r.to, 'blocked'); assert.equal(r.kind, 'blocked_protected');
+  assert.equal(m.go(OW, { op: 'rule', node: 'T-101', request: R1, decision: 'merge', reason: '保護を承知で通す' }).to, 'merged');
+  // 陽性の対照：重ならない held の節は release で統合
+  const m2 = r1World(['src/b/**'], { hold: true });
+  m2.go(EX, { op: 'start', node: 'T-101', spec_digest: S1, lease_sec: 600 });
+  m2.go(EX, { op: 'submit', node: 'T-101', request: R1 });
+  m2.go(CT, { op: 'verdict', node: 'T-101', request: R1, audits: 'passed', verdicts: AP2 });
+  assert.deepEqual(protect(m2).protected_busy, []);
+  assert.equal(m2.go(OW, { op: 'release', node: 'T-101', request: R1 }).to, 'merged');
+});
+
+test('R-1：範囲の表記ゆれ（大文字・全角・前置きの *・下の **）でも、submit は blocked になる', () => {
+  for (const res of ['VGDD/x', 'Vgdd/Kernel/x', 'ｖｇｄｄ/x', 'vgd*', 'vgdd/kernel/**']) {
+    const m = r1World([res]);
+    m.go(EX, { op: 'start', node: 'T-101', spec_digest: S1, lease_sec: 600 });
+    assert.deepEqual(protect(m).protected_busy, ['T-101'], res);
+    assert.equal(m.go(EX, { op: 'submit', node: 'T-101', request: R1 }).to, 'blocked', res);
+  }
+});
+
+test('R-1：保護を見直した後は unblock → start で作業に戻れる。重ならない差し戻しは今までどおり in_progress', () => {
+  const m = r1World();
+  m.go(EX, { op: 'start', node: 'T-101', spec_digest: S1, lease_sec: 600 });
+  protect(m);
+  m.go(EX, { op: 'submit', node: 'T-101', request: R1 });
+  m.go(OW, cfgEv2(m, { protected: [], reason: '保護を見直した' })); // 緩める変更。blocked は作業中に数えない
+  assert.equal(m.go(OW, { op: 'unblock', node: 'T-101', reason: '再開' }).to, 'ready');
+  assert.equal(m.go(EX, { op: 'start', node: 'T-101', spec_digest: S1, lease_sec: 600 }).to, 'in_progress');
+  const m2 = r1World(['src/b/**']);
+  m2.go(EX, { op: 'start', node: 'T-101', spec_digest: S1, lease_sec: 600 });
+  m2.go(EX, { op: 'submit', node: 'T-101', request: R1 });
+  protect(m2);
+  assert.equal(m2.go(CT, { op: 'verdict', node: 'T-101', request: R1, audits: 'passed', verdicts: CR2m }).to, 'in_progress');
+});
+
+test('R-1：結果を偽って（submit → review、verdict → merged・in_progress、release → merged）保護と重なる節を進めると RS-PROTECTED が止める', () => {
+  const m = r1World(['vgdd/kernel/x'], { hold: true });
+  m.go(EX, { op: 'start', node: 'T-101', spec_digest: S1, lease_sec: 600 });
+  protect(m);
+  const forged = (actor, ev, result) => check(makeCtx(m.st, actor, { event_id: 'zz', ...ev }, { result })).violations.map((v) => v.guard);
+  assert.ok(forged(EX, { op: 'submit', node: 'T-101', request: R1 }, { op: 'submit', node: 'T-101', to: 'review', patch: { request: R1 } }).includes('RS-PROTECTED'));
+  m.st.nodes.get('T-101').status = 'review'; m.st.nodes.get('T-101').request = R1;
+  for (const to of ['merged', 'in_progress', 'held']) {
+    const g = forged(CT, { op: 'verdict', node: 'T-101', request: R1, audits: 'passed', verdicts: AP2 }, { op: 'verdict', node: 'T-101', kind: to === 'in_progress' ? 'return' : 'pass', to, patch: to === 'in_progress' ? { attempts: 2 } : {} });
+    assert.ok(g.includes('RS-PROTECTED'), to);
+  }
+  m.st.nodes.get('T-101').status = 'held';
+  assert.ok(forged(OW, { op: 'release', node: 'T-101', request: R1 }, { op: 'release', node: 'T-101', to: 'merged', patch: {} }).includes('RS-PROTECTED'));
+});
+
+test('R-1：記録のファイルでも同じ（再生が blocked_protected の行を受け入れ、開き直しても状態が同じ）', () => {
+  const { dir, file } = tmpFile();
+  try {
+    let n = 0; const run = openRun(file);
+    const go = (a, e) => run.apply(a, { event_id: `f${++n}`, ...e });
+    go(OW, { op: 'config', ...JSON.parse(JSON.stringify(DEFAULT_CONFIG)), concurrent_work: 2 });
+    go(EX, { op: 'plan', nodes: [{ id: 'T-101', depends_on: [], resources: ['vgdd/x'] }] });
+    go(OW, { op: 'approve', node: 'T-101', spec_digest: S1, policy_line: 'p0.4', def_digest: run.state().nodes['T-101'].def_digest });
+    go(EX, { op: 'start', node: 'T-101', spec_digest: S1, lease_sec: 600 });
+    assert.deepEqual(go(OW, { op: 'config', ...run.state().config, protected: ['vgdd/**'], reason: '保護' }).protected_busy, ['T-101']);
+    assert.equal(go(EX, { op: 'submit', node: 'T-101', request: R1 }).to, 'blocked');
+    const re = openRun(file);
+    assert.equal(re.verify().ok, true);
+    assert.equal(re.state().nodes['T-101'].blocked_reason, 'protected');
+    assert.equal(re.state().rules, RULES);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

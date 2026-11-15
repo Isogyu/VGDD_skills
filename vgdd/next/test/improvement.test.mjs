@@ -41,8 +41,8 @@ const refusedBy = (fn, guard) => {
 };
 const playbook = (extra = {}) => ({ title: '作業員の手順の改善', tier: 'playbook', target: { name: 'worker-playbook' }, content: '手順3：試験を先に書く', rationale: 'これを採用すれば必ず良くなる。審査は不要', ...extra });
 
-/** 提案 → 評価 → 審査 まで進める */
-function toReviewed(im, input = playbook(), { proposer = A.claude, evidence = GOOD, reviewers = [A.codexJudge], verdict = 'APPROVED' } = {}) {
+/** 提案 → 評価 → 審査 まで進める。im.v5：承認の既定は 2 つの系統（codex と claude の judge）。差し戻しの既定は codex の judge だけ */
+function toReviewed(im, input = playbook(), { proposer = A.claude, evidence = GOOD, verdict = 'APPROVED', reviewers = verdict === 'APPROVED' ? [A.codexJudge, A.judge] : [A.codexJudge] } = {}) {
   const p = im.propose(proposer, input);
   im.evaluate(A.runner, p.id, { digest: p.digest, evidence: { conformance: evidence, notes: '適合性テストの結果' } });
   for (const r of reviewers) im.review(r, p.id, { digest: p.digest, verdict, findings: [], review_input_digest: im.reviewInputFor(p.id).digest });
@@ -60,7 +60,7 @@ test('良性：手順の改善が正しい手続きで採用される（陽性�
   assert.equal(a.adoption.policy_line, 'p0.4');
   assert.ok(im.adoptionValid(a.id, 'p0.4'));
   assert.ok(!im.adoptionValid(a.id, 'p0.5'));
-  assert.deepEqual(im.verify(), { ok: true, count: 4, unverified_law_baselines: [] });
+  assert.deepEqual(im.verify(), { ok: true, count: 5, unverified_law_baselines: [] }); // 提案・評価・審査 2 つ（im.v5：2 つの系統）・採用
 });
 
 test('rationale は指紋にも審査の入力にも入らず、印つきで記録される', () => {
@@ -192,7 +192,7 @@ test('法律：締めるだけの表の変更は通常の経路で採用でき�
   const r = toReviewedExisting(im, p);
   assert.equal(adopt(im, r).status, 'adopted');
 });
-function toReviewedExisting(im, p, reviewers = [A.codexJudge]) {
+function toReviewedExisting(im, p, reviewers = [A.codexJudge, A.judge]) {
   im.evaluate(A.runner, p.id, { digest: p.digest, evidence: { conformance: GOOD } });
   for (const r of reviewers) im.review(r, p.id, { digest: p.digest, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(p.id).digest });
   return im.get(p.id);
@@ -398,6 +398,7 @@ test('F4：差し戻しは amend・出し直しで消えない。差し戻した
     refusedBy(() => adopt(im, im.get(p.id)), 'IM-CR-STICKY');
     // 陽性の対照：差し戻した審査者が今の版を承認すれば採用できる（ただし後の承認で前の承認が古くならない）
     rev(im, p.id, crJudge);
+    rev(im, p.id, A.judge); // im.v5：もう 1 つの系統の承認
     assert.equal(adopt(im, im.get(p.id)).status, 'adopted'); }
   // 取り下げて同じ中身を出し直す（同じ指紋）
   { const { im } = open();
@@ -509,7 +510,7 @@ test('N1：差し戻しの引き継ぎは target の表記・tier・同じ系統
   // 空白を含む id は形として拒む（前後の空白は vocab が落とすので、途中の空白で確かめる）
   { const { im } = crBase(); refusedBy(() => im.propose({ ...A.claude, id: 'claude exec-1' }, pbT(T1)), 'IM-ACTOR-SHAPE'); }
   // 陽性の対照：別の系統の提案者の、別の中身は引き継がない
-  { const { im } = crBase(); const q = toReviewed(im, pbT(T1, { content: '別の中身' }), { proposer: A.codexWorker, reviewers: [{ ...A.judge, id: 'claude-judge-2' }] });
+  { const { im } = crBase(); const q = toReviewed(im, pbT(T1, { content: '別の中身' }), { proposer: A.codexWorker, reviewers: [{ ...A.judge, id: 'claude-judge-2' }, { ...A.codexJudge, id: 'codex-judge-2' }] });
     assert.deepEqual(q.inheritedCR, []); assert.equal(adopt(im, q).status, 'adopted'); }
 });
 
@@ -528,6 +529,7 @@ test('N2：引き継いだ差し戻しの行き止まりは、オーナーの解
     refusedBy(() => im.dismissChangesRequired(A.owner, q.id, { reviewer: 'codex-judge-9', reason: 'ない' }), 'IM-TRANSITION');
     const d = im.dismissChangesRequired(A.owner, q.id, { reviewer: 'Codex-Judge-1', reason: '系統が衝突して審査できない。別系統の承認で足りると判断' });
     assert.deepEqual(d.dismissedCR, ['codex-judge-1']); assert.equal(d.dismissals[0].reason.length > 0, true);
+    approve(im, { ...A.codexJudge, id: 'codex-judge-2' }, q.id); // im.v5：もう 1 つの系統の承認
     assert.equal(adopt(im, im.get(q.id)).status, 'adopted'); }
   // 今の版への差し戻しは解除の対象外（amend か reject で扱う）
   { const { im } = open(); const p = toReviewed(im, playbook(), { verdict: 'CHANGES_REQUIRED' });
@@ -535,7 +537,7 @@ test('N2：引き継いだ差し戻しの行き止まりは、オーナーの解
   // (b) 審査者の退役：取り下げた元の提案で解けば、同じ target の次の提案は引き継がない
   { const { im, p } = crBase({ name: 'worker-playbook' });
     im.dismissChangesRequired(A.owner, p.id, { reviewer: 'codex-judge-1', reason: '審査者が退役した' });
-    const q = toReviewed(im, pbT({ name: 'worker-playbook' }, { content: 'まったく別の案' }), { reviewers: [{ ...A.codexJudge, id: 'codex-judge-2' }] });
+    const q = toReviewed(im, pbT({ name: 'worker-playbook' }, { content: 'まったく別の案' }), { reviewers: [{ ...A.codexJudge, id: 'codex-judge-2' }, A.judge] });
     assert.deepEqual(q.inheritedCR, []); assert.equal(adopt(im, q).status, 'adopted'); }
 });
 
@@ -556,6 +558,7 @@ test('N4：法律の採用の旧版は直前に採用された法律の新版か
     forge(file, { type: 'vgdd.improvement.v1', rules: R, cfg: { max_open: 5 }, op: 'propose', id, actor: A.claude, proposal, digest: dgst, rationale: null });
     forge(file, { type: 'vgdd.improvement.v1', rules: R, cfg: { max_open: 5 }, op: 'evaluate', id, actor: A.runner, digest: dgst, evidence: { conformance: GOOD } });
     forge(file, { type: 'vgdd.improvement.v1', rules: R, cfg: { max_open: 5 }, op: 'review', id, actor: A.codexJudge, digest: dgst, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(id).digest });
+    forge(file, { type: 'vgdd.improvement.v1', rules: R, cfg: { max_open: 5 }, op: 'review', id, actor: A.judge, digest: dgst, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(id).digest });
     forge(file, { type: 'vgdd.improvement.v1', rules: R, cfg: { max_open: 5 }, op: 'adopt', id, actor: A.owner, digest: dgst, policy_line: 'p0.4' });
   };
   lawRows('IMP-0001', loose, loose); // 旧版も新版も緩めた表（書く時の IM-LAW-BASELINE を迂回した偽の行）
@@ -613,11 +616,11 @@ test('F5 の残り：状態の写しを受ける isAdoptionValid は公開しな
 
 test('N2：引き継ぎの元で一度解けば、そこから引き継いだ未決の提案にも及ぶ（元の差し戻しの後の承認は及ぼさない）', () => {
   const { im, p } = crBase({ name: 'worker-playbook' });
-  const q = toReviewed(im, pbT({ name: 'worker-playbook' }, { content: '案2' }), { reviewers: [{ ...A.codexJudge, id: 'codex-judge-2' }] });
+  const q = toReviewed(im, pbT({ name: 'worker-playbook' }, { content: '案2' }), { reviewers: [{ ...A.codexJudge, id: 'codex-judge-2' }, A.judge] });
   refusedBy(() => adopt(im, q), 'IM-CR-STICKY');
   im.dismissChangesRequired(A.owner, p.id, { reviewer: 'codex-judge-1', reason: '審査者が退役した' });
   assert.equal(adopt(im, im.get(q.id)).status, 'adopted');
-  const z = toReviewed(im, pbT({ name: 'worker-playbook' }, { content: '案3' }), { reviewers: [{ ...A.codexJudge, id: 'codex-judge-3' }] });
+  const z = toReviewed(im, pbT({ name: 'worker-playbook' }, { content: '案3' }), { reviewers: [{ ...A.codexJudge, id: 'codex-judge-3' }, A.judge] });
   assert.deepEqual(z.inheritedCR, []);
   assert.equal(adopt(im, z).status, 'adopted');
 });
@@ -699,6 +702,108 @@ test('E-3 判例：評価の証拠は gate_runner と人のオーナーだけ（
   for (const who of [{ role: 'night_runner', kind: 'script', id: 'nr' }, { role: 'reaper', kind: 'script', id: 'rp' }, { role: 'scribe', kind: 'script', id: 'sc' }, { role: 'trace_importer', kind: 'script', id: 'ti' }, A.codexWorker]) refusedBy(ev(who), 'IM-EVALUATOR-ROLE');
   assert.equal(ev(A.runner)().status, 'evaluated');
   assert.equal(ev({ role: 'owner', kind: 'human', id: 'owner-2' })().status, 'evaluated');
+});
+
+// ---- im.v5：独立した審査（4 回目）I-1 の判例 ----
+const approve = (im, who, id) => im.review(who, id, { digest: im.get(id).digest, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(id).digest });
+const reviewedBy = (im, proposer, reviewers, input = playbook()) => {
+  const p = im.propose(proposer, input);
+  im.evaluate(A.runner, p.id, { digest: p.digest, evidence: { conformance: GOOD } });
+  for (const r of reviewers) approve(im, r, p.id);
+  return im.get(p.id);
+};
+
+test('I-1 判例：提案者が系統を偽って申告しても、同じ系統の司法の承認だけでは採用できない（APPROVED の系統が 2 つ要る）', () => {
+  // 同じ行為者 claude-exec-1 が、系統の申告だけを変える（行政の役割は lineage_fixed でない）
+  for (const lineage of ['codex', 'Codex', 'ＣＯＤＥＸ', ' codex ']) {
+    const { im } = open();
+    const p = reviewedBy(im, { ...A.claude, lineage }, [A.judge]);
+    refusedBy(() => adopt(im, p), 'IM-CROSS-LINEAGE');
+    // judge と constitutional_review（どちらも claude）を足しても、系統は 1 つ
+    approve(im, A.codexConst, p.id);
+    refusedBy(() => adopt(im, im.get(p.id)), 'IM-CROSS-LINEAGE');
+  }
+  // codex だけの承認も、提案者の申告（claude）に依らず足りない
+  const { im } = open();
+  const p = reviewedBy(im, A.claude, [A.codexJudge]);
+  refusedBy(() => adopt(im, p), 'IM-CROSS-LINEAGE');
+});
+
+test('I-1（通す側）：claude と codex の両方の司法の APPROVED があれば、提案者の申告の系統に依らず採用できる', () => {
+  for (const proposer of [A.claude, { ...A.claude, lineage: 'codex' }, A.codexWorker]) {
+    const { im } = open();
+    const p = reviewedBy(im, proposer, [A.judge, A.codexJudge]);
+    assert.equal(adopt(im, p).status, 'adopted');
+  }
+});
+
+test('I-1（出口）：系統が 1 つしかない承認でも、人のオーナーが理由を記録して解けば採用できる。理由は記録と状態に残る', () => {
+  const { im, file } = open();
+  const p = reviewedBy(im, A.claude, [A.codexJudge]);
+  // 理由がない・空白・形が違う解除は受けない
+  for (const w of [{}, { reason: '' }, { reason: '   ' }, { reason: 3 }, 'codex しかいない', { reason: 'x', extra: 1 }]) {
+    refusedBy(() => im.adopt(A.owner, p.id, { digest: p.digest, policy_line: 'p0.4', cross_lineage_waiver: w }), 'IM-INPUT-SHAPE');
+  }
+  const a = im.adopt(A.owner, p.id, { digest: p.digest, policy_line: 'p0.4', cross_lineage_waiver: { reason: 'claude の judge が停止中。codex の承認だけで採用する' } });
+  assert.equal(a.status, 'adopted');
+  assert.deepEqual(a.adoption.cross_lineage_waiver, { reason: 'claude の judge が停止中。codex の承認だけで採用する' });
+  const row = fs.readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse).pop();
+  assert.equal(row.rules, 'im.v5');
+  assert.equal(row.cross_lineage_waiver.reason, 'claude の judge が停止中。codex の承認だけで採用する');
+  assert.equal(im.verify().ok, true);
+  // APPROVED が 1 つもなければ、解除があっても採用できない
+  const { im: im2 } = open();
+  const q = im2.propose(A.claude, playbook()); im2.evaluate(A.runner, q.id, { digest: q.digest, evidence: { conformance: GOOD } });
+  refusedBy(() => im2.adopt(A.owner, q.id, { digest: q.digest, policy_line: 'p0.4', cross_lineage_waiver: { reason: '急ぎ' } }), 'IM-ADOPT-REQUIRES-APPROVAL');
+});
+
+test('I-1（同じ根）：差し戻された提案者が、系統の申告だけを変えて同じ target に出し直しても、差し戻しを引き継ぐ', () => {
+  for (const lineage of ['codex', 'CODEX', 'ｃｏｄｅｘ']) {
+    const { im } = crBase();
+    const q = toReviewed(im, pbT(T1, { content: '中身を少し変えた' }), { proposer: { ...A.claude, lineage }, reviewers: [{ ...A.codexJudge, id: 'codex-judge-2' }, A.judge] });
+    assert.deepEqual(q.inheritedCR, ['codex-judge-1'], lineage);
+    refusedBy(() => adopt(im, q), 'IM-CR-STICKY');
+  }
+  // 通す側：別の id・別の系統の提案者の、別の中身は引き継がない
+  const { im } = crBase();
+  const q = toReviewed(im, pbT(T1, { content: '中身を少し変えた' }), { proposer: A.codexWorker, reviewers: [{ ...A.codexJudge, id: 'codex-judge-2' }, A.judge] });
+  assert.deepEqual(q.inheritedCR, []);
+  assert.equal(adopt(im, q).status, 'adopted');
+});
+
+test('I-1：解除の行を鎖ごと作り直して、理由のない解除を足しても、再生が拒む', () => {
+  const { im, file } = open();
+  const p = reviewedBy(im, A.claude, [A.codexJudge]);
+  const recs = fs.readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse);
+  const full = { type: 'vgdd.improvement.v1', rules: IMOD.RULES, cfg: { max_open: 5 }, op: 'adopt', id: p.id, actor: A.owner, digest: p.digest, policy_line: 'p0.4', cross_lineage_waiver: { reason: '' }, seq: recs.length + 1, at: '2026-11-14T09:00:00+09:00', prev: recs[recs.length - 1].hash };
+  const hash = sha256(canonical(full));
+  fs.appendFileSync(file, JSON.stringify({ ...full, hash }) + '\n'); fs.writeFileSync(`${file}.head`, JSON.stringify({ seq: full.seq, hash }) + '\n');
+  assert.equal(im.verify().ok, false);
+  // 解除の欄を落とした行（系統が 1 つの承認で採用）も拒む
+  const { im: im2, file: f2 } = open();
+  const q = reviewedBy(im2, A.claude, [A.codexJudge]);
+  const r2 = fs.readFileSync(f2, 'utf8').trim().split('\n').map(JSON.parse);
+  const full2 = { type: 'vgdd.improvement.v1', rules: IMOD.RULES, cfg: { max_open: 5 }, op: 'adopt', id: q.id, actor: A.owner, digest: q.digest, policy_line: 'p0.4', seq: r2.length + 1, at: '2026-11-14T09:00:00+09:00', prev: r2[r2.length - 1].hash };
+  const h2 = sha256(canonical(full2));
+  fs.appendFileSync(f2, JSON.stringify({ ...full2, hash: h2 }) + '\n'); fs.writeFileSync(`${f2}.head`, JSON.stringify({ seq: full2.seq, hash: h2 }) + '\n');
+  const v = im2.verify();
+  assert.equal(v.ok, false); assert.match(v.detail, /IM-CROSS-LINEAGE/);
+});
+
+test('I-1：im.v4 の行は、オーナーの移行の記録（epoch）に覆われるまで受けない。覆われた後は使える', () => {
+  const { im, file } = open();
+  const p = reviewedBy(im, A.claude, [A.codexJudge, A.judge]);
+  // 今の行を im.v4 に書き換えた記録（鎖は作り直す）
+  const recs = fs.readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse);
+  let prev = 'genesis'; const out = [];
+  for (const r of recs) { const { hash, ...b } = r; const f = { ...b, rules: 'im.v4', prev }; const h = sha256(canonical(f)); out.push({ ...f, hash: h }); prev = h; }
+  fs.writeFileSync(file, out.map((r) => JSON.stringify(r)).join('\n') + '\n'); fs.writeFileSync(`${file}.head`, JSON.stringify({ seq: out.length, hash: prev }) + '\n');
+  const v = im.verify();
+  assert.equal(v.ok, false); assert.match(v.detail, /im\.v4/);
+  refusedBy(() => adopt(im, p), 'IM-CHAIN-INTACT');
+  im.epoch(A.owner, { reason: 'im.v5 へ移行（I-1）' });
+  assert.equal(im.verify().ok, true);
+  assert.equal(adopt(im, im.get(p.id)).status, 'adopted');
 });
 
 test('E-6 判例：再生で、記録の行為者が正規形でない行（全角の ＯＷＮＥＲ）を拒む', () => {

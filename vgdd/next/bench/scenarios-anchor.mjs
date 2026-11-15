@@ -363,6 +363,69 @@ export const SCENARIOS = [
     const an = w.open(); an.snapshot(A.runner);
     return an.contextFor('epoch', A.owner, { reason: '外す', drops: ['rulings'] });
   }),
+  // ---- 攻撃：4 回目の独立した審査（B1）の発見 ----
+  // N-1：書き換えた後、書き換える前の写しを指す設定で開いて照合する（表記ゆれ：別のパス・大文字のパス・受け入れの印を文字列で渡す）
+  ...[
+    ['別のパス（書き換える前の写し）', (w, copy) => w.sources.map((s) => (s.name === 'rulings' ? { ...s, path: copy } : s)), undefined],
+    ['大文字のパス（大文字小文字を区別しない FS では同じフォルダ）', (w) => w.sources.map((s) => (s.name === 'rulings' ? { ...s, path: s.path.replace('/z3/', '/Z3/') } : s)), undefined],
+    ['受け入れの印を文字列の "true" で渡す', (w, copy) => w.sources.map((s) => (s.name === 'rulings' ? { ...s, path: copy } : s)), { allowConfigMismatch: 'true' }],
+    ['上限だけ違う設定で開く', (w) => w.sources, { limitsOnly: true }],
+  ].map(([label, srcs, vo], k) => scenario(`AN-A${75 + k}`, 'attack', `照合の設定のすり替え：${label}（記録の写しと違う設定の照合を ok にしない）`, ['AN-CFG-COPY'], (dir, w) => {
+    const an = w.open(); an.snapshot(A.runner);
+    const copy = path.join(dir, 'copy-rulings.jsonl'); fs.copyFileSync(w.files.rulings, copy);
+    if (!(vo && vo.limitsOnly)) fs.writeFileSync(w.files.rulings, fs.readFileSync(w.files.rulings, 'utf8').replace(/pl/, 'XX'));
+    const opened = vo && vo.limitsOnly ? w.open({ limits: { maxDirFiles: 100 } }) : w.open({ sources: srcs(w, copy) });
+    return opened.verifyContext(vo && !vo.limitsOnly ? vo : {});
+  })),
+  // N-2：dir の入れ子のフォルダの中身を書き換える・消す・深すぎる入れ子で固定を逃れる
+  scenario('AN-A79', 'attack', '判定の集まりの入れ子のフォルダの中のファイルを書き換える', ['AN-DIR-ENTRIES'], (dir, w) => {
+    const sub = path.join(w.files.verdicts, 'sub'); fs.mkdirSync(sub); fs.writeFileSync(path.join(sub, 'v.json'), '{"verdict":"reject"}\n');
+    const an = w.open(); an.snapshot(A.runner); fs.writeFileSync(path.join(sub, 'v.json'), '{"verdict":"approve"}\n');
+    return an.verifyContext();
+  }),
+  scenario('AN-A80', 'attack', '判定の集まりの 2 段目の入れ子のファイルを消す', ['AN-DIR-ENTRIES'], (dir, w) => {
+    const d2 = path.join(w.files.verdicts, 'a', 'b'); fs.mkdirSync(d2, { recursive: true }); fs.writeFileSync(path.join(d2, 'v.json'), '{}');
+    const an = w.open(); an.snapshot(A.runner); fs.rmSync(path.join(d2, 'v.json'));
+    return an.verifyContext();
+  }),
+  scenario('AN-A81', 'attack', '判定の集まりの入れ子のフォルダを、別のフォルダへの記号リンクに差し替える', ['AN-DIR-ENTRIES'], (dir, w) => {
+    const sub = path.join(w.files.verdicts, 'sub'); fs.mkdirSync(sub); fs.writeFileSync(path.join(sub, 'v.json'), '{}');
+    const an = w.open(); an.snapshot(A.runner);
+    const other = path.join(dir, 'other'); fs.mkdirSync(other); fs.writeFileSync(path.join(other, 'v.json'), '{}');
+    fs.rmSync(sub, { recursive: true }); fs.symlinkSync(other, sub);
+    return an.verifyContext();
+  }),
+  scenario('AN-A82', 'attack', '入れ子が深すぎる dir（固定の上限を超える）を固定させる', ['AN-SIZE-LIMIT'], (dir, w) => {
+    let p = w.files.verdicts; for (let i = 0; i < 10; i += 1) { p = path.join(p, `d${i}`); fs.mkdirSync(p); }
+    return w.open().contextFor('snapshot', A.runner);
+  }),
+  // N-5：anchor の記録自身を、表記を変えて対象にする
+  ...[
+    ['大文字のファイル名', (f) => f.replace('anchors.jsonl', 'ANCHORS.jsonl'), 'plain'],
+    ['大文字のフォルダ名', (f) => f.replace('/anchors/', '/ANCHORS/'), 'plain'],
+    ['復旧の記録（.recovery.jsonl）', (f) => `${f}.recovery.jsonl`, 'plain'],
+    ['退避のファイル（.torn-*）', (f) => `${f}.torn-20261115-1`, 'plain'],
+    ['head の大文字（.HEAD）', (f) => `${f}.HEAD`, 'plain'],
+    ['anchor の記録を含むフォルダ（dir）', (f) => path.dirname(f), 'dir'],
+    ['anchor の記録を含むフォルダの祖先（dir・大文字）', (f) => path.dirname(path.dirname(f)).toUpperCase(), 'dir'],
+  ].map(([label, mk, kind], k) => scenario(`AN-A${83 + k}`, 'attack', `anchor の記録自身を対象にする（表記ゆれ：${label}）`, ['AN-PATH-SAFE'], (dir, w) => w.open({ sources: [SRC('self', mk(w.anchorsFile), kind)] }).contextFor('snapshot', A.runner))),
+  // 変異の試験の生き残りに対応する攻撃
+  scenario('AN-A90', 'attack', 'dir の中の 1 つのファイルが大きさの上限を超える', ['AN-SIZE-LIMIT'], (dir, w) => {
+    fs.writeFileSync(path.join(w.files.verdicts, 'VRD-big.json'), 'x'.repeat(4096));
+    return w.open({ limits: { maxDirFileBytes: 1024 } }).contextFor('snapshot', A.runner);
+  }),
+  scenario('AN-A91', 'attack', 'lstat と open の間に、対象の記録を別のファイルに差し替える', ['AN-NO-SYMLINK'], (dir, w) => {
+    const swap = `${w.files.rulings}.swap`; fs.writeFileSync(swap, fs.readFileSync(w.files.rulings));
+    const oOpen = fs.openSync; let done = false;
+    fs.openSync = function (p, ...r) { if (!done && p === w.files.rulings && typeof r[0] === 'number') { done = true; fs.renameSync(swap, w.files.rulings); } return oOpen.call(fs, p, ...r); };
+    try { return w.open().contextFor('snapshot', A.runner); } finally { fs.openSync = oOpen; }
+  }),
+  scenario('AN-A92', 'attack', '入れ子のフォルダを読んでいる間に、別のフォルダへの記号リンクに差し替える', ['AN-NO-SYMLINK'], (dir, w) => {
+    const sub = path.join(w.files.verdicts, 'sub'); fs.mkdirSync(sub); fs.writeFileSync(path.join(sub, 'v.json'), '{}');
+    const oRd = fs.readdirSync; let done = false;
+    fs.readdirSync = function (p, ...r) { const out = oRd.call(fs, p, ...r); if (!done && p === sub) { done = true; fs.renameSync(sub, `${sub}.real`); fs.symlinkSync(`${sub}.real`, sub); } return out; };
+    try { return w.open().contextFor('snapshot', A.runner); } finally { fs.readdirSync = oRd; }
+  }),
 
   // ---- 良性 ----
   scenario('AN-B1', 'benign', '記録が伸びただけ：何度 snapshot しても、全部の anchor が一致する', [], detect(() => {}, { snaps: 4 })),
@@ -388,6 +451,30 @@ export const SCENARIOS = [
     fs.appendFileSync(w.files.rulings, '{"partial":'); return w.open().contextFor('snapshot', A.runner);
   }),
   scenario('AN-B11', 'benign', '空のファイルも固定できる', [], (dir, w) => { fs.writeFileSync(w.files.rulings, ''); const an = w.open(); an.snapshot(A.runner); return an.verifyContext(); }),
+  // 4 回目の独立した審査（B1）の発見に対する陽性の対照
+  scenario('AN-B12', 'benign', '設定の写しとの食い違いを、呼び出し側が allowConfigMismatch: true で明示して受け入れた照合（書き換えのない写し）', [], (dir, w) => {
+    const an = w.open(); an.snapshot(A.runner);
+    const copy = path.join(dir, 'copy-rulings.jsonl'); fs.copyFileSync(w.files.rulings, copy);
+    return w.open({ sources: w.sources.map((s) => (s.name === 'rulings' ? { ...s, path: copy } : s)) }).verifyContext({ allowConfigMismatch: true });
+  }),
+  scenario('AN-B13', 'benign', '判定の集まりの入れ子のフォルダにファイルとフォルダが足されただけなら一致する', [], (dir, w) => {
+    const sub = path.join(w.files.verdicts, 'sub'); fs.mkdirSync(sub); fs.writeFileSync(path.join(sub, 'v.json'), '{}');
+    const an = w.open(); an.snapshot(A.runner); fs.writeFileSync(path.join(sub, 'v2.json'), '{}'); fs.mkdirSync(path.join(sub, 'later'));
+    return an.verifyContext();
+  }),
+  scenario('AN-B14', 'benign', 'anchor の記録と名前が似ているだけの別のファイル・隣のフォルダは対象にできる', [], (dir, w) => {
+    const near = `${path.dirname(w.anchorsFile)}x`; fs.mkdirSync(near); fs.writeFileSync(path.join(near, 'a.json'), '{}');
+    const sib = `${w.anchorsFile}2`; fs.mkdirSync(path.dirname(sib), { recursive: true }); writePlain(sib, 2);
+    return w.open({ sources: [SRC('near', near, 'dir'), SRC('sib', sib)] }).contextFor('snapshot', A.runner);
+  }),
+  scenario('AN-B15', 'benign', '読み取りの最中に、鎖のある記録へ正当な追記が 1 回入っても、snapshot は通り、壊れとして固定しない', [], (dir, w) => {
+    const an = w.open(); an.snapshot(A.runner);
+    const oOpen = fs.openSync; let done = false;
+    fs.openSync = function (p, ...r) { const fd = oOpen.call(fs, p, ...r); if (!done && p === w.files.ledger && typeof r[0] === 'number') { done = true; appendLedger(w.files.ledger, 1); } return fd; };
+    let s; try { s = an.snapshot(A.runner); } finally { fs.openSync = oOpen; }
+    if (!done || s.broken_chains.length || s.flagged) return { op: 'snapshot', actor: A.runner, forcedFailure: true }; // 壊れと固定したら、良性の失敗として出す
+    return an.verifyContext();
+  }),
 ];
 
 // ---------------------------------------------------------------------------

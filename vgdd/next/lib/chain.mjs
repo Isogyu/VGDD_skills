@@ -46,6 +46,15 @@
 //   - 復旧の記録（recovery.jsonl）・退避のファイルそのものには鎖がない。消せば復旧の跡が消える（本体の鎖と head は影響を受けない）
 //   - 途中の行が壊れた記録は、この部品では直せない。オーナーが、壊れたファイルと head を別名に退避し、残せる行を確かめたうえで新しく始める
 //   - repairHead は呼び出した者を確かめない。行政の AI が呼べる場所に置かない（配置の側で、人のオーナーだけが呼べる経路にする）
+//   - 書く側は記号リンクをたどらない（O_NOFOLLOW と lstat・fstat の照合。審査4 C-2）。本体・head の一時ファイル・recovery.jsonl・退避のファイルが
+//     記号リンク・通常のファイルでない・ハードリンク（リンクの数が 1 でない）のとき、また記録のフォルダ自身が記号リンクのときは Refused('unsafe_file')。
+//     祖先のフォルダの記号リンクは見ない（macOS の /var → /private/var のように、配置で普通にある）。祖先を差し替えられる者は、記録のフォルダごと差し替えられる
+//   - 行は「書いたとおりの綴り」だけを受ける（JSON.stringify(解析した値) === 行。審査4 C-6）。重複したキー・空白・エスケープの違いは chain_broken（not_canonical_line）。
+//     別の言語の解析器が違う意味で読む行を、鎖として通さないため。代わりに、ほかの道具で整形し直した記録は読めない
+//   - 追記の本体は、JSON として写したときに同じ値に戻るものだけ（toJSON を持つ値・疎な配列・BigInt などは not_canonical。審査4 C-1）。
+//     ハッシュと書く行は同じ写しから作る
+//   - ロックの i-node の照合（tryTakeover）は、i-node の番号を再利用するファイルシステム（ext4 など）ですり抜けうる（審査4 L-2）。rename の後の
+//     owner の照合で気付いて戻すが、戻すまでの間に3つ目のプロセスがロックを取れる。macOS（APFS）は番号を再利用しないので、ここでは確かめていない。Linux へ移すときに確かめる
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -93,12 +102,43 @@ function writeAll(fd, data) {
   let off = 0;
   while (off < buf.length) off += fs.writeSync(fd, buf, off, buf.length - off);
 }
+const C = fs.constants;
+const NOFOLLOW = C.O_NOFOLLOW ?? 0;
+/**
+ * 書くために開く（記号リンクをたどらない。審査4 C-2）。開いた後に fstat で、通常のファイルで、リンクの数が 1 で、
+ * 開く前の lstat と同じもの（あれば）であることを確かめる。合わなければ閉じて Refused('unsafe_file')。
+ * @param {'append'|'rw'|'create'} mode append：なければ作って末尾に追記／rw：あるものを読み書き／create：新しく作る（あれば EEXIST）
+ */
+function openForWrite(p, mode) {
+  let pre = null;
+  try { pre = fs.lstatSync(p); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  if (pre && !pre.isFile()) throw new Refused('unsafe_file', `${path.basename(p)}: not_regular`);
+  const flags = mode === 'append' ? C.O_WRONLY | C.O_APPEND | C.O_CREAT | NOFOLLOW
+    : mode === 'rw' ? C.O_RDWR | NOFOLLOW
+      : C.O_WRONLY | C.O_CREAT | C.O_EXCL | NOFOLLOW;
+  let fd;
+  try { fd = fs.openSync(p, flags, 0o644); } catch (e) {
+    if (e.code === 'ELOOP' || e.code === 'EMLINK') throw new Refused('unsafe_file', `${path.basename(p)}: symlink`);
+    throw e;
+  }
+  const st = fs.fstatSync(fd);
+  if (!st.isFile() || st.nlink !== 1 || (pre && (pre.ino !== st.ino || pre.dev !== st.dev))) {
+    fs.closeSync(fd);
+    throw new Refused('unsafe_file', `${path.basename(p)}: ${!st.isFile() ? 'not_regular' : st.nlink !== 1 ? 'hardlink' : 'changed_while_opening'}`);
+  }
+  return { fd, created: !pre };
+}
 /** 追記して fsync。ファイルを新しく作ったなら親フォルダも fsync */
 function appendDurable(file, data) {
-  const existed = fs.existsSync(file);
-  const fd = fs.openSync(file, 'a');
+  const { fd, created } = openForWrite(file, 'append');
   try { writeAll(fd, data); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-  if (!existed) fsyncDir(path.dirname(file));
+  if (created) fsyncDir(path.dirname(file));
+}
+/** 読むために開く前の確認：あれば通常のファイルであること（記号リンクをたどって読まない） */
+function regularOrAbsent(p) {
+  let st; try { st = fs.lstatSync(p); } catch (e) { if (e.code === 'ENOENT') return false; throw e; }
+  if (!st.isFile()) throw new Refused('unsafe_file', `${path.basename(p)}: not_regular`);
+  return true;
 }
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -113,6 +153,7 @@ function verifyLines(lines) {
   for (const line of lines) {
     let e; try { e = JSON.parse(line); } catch { throw new Refused('chain_broken', 'json'); }
     if (!isObj(e)) throw new Refused('chain_broken', 'shape');
+    if (JSON.stringify(e) !== line) throw new Refused('chain_broken', 'not_canonical_line'); // 書いたとおりの綴りだけ（審査4 C-6）
     const { hash, ...body } = e;
     let w; try { w = sha256(canonical(body)); } catch { throw new Refused('chain_broken', 'canonical'); }
     if (body.prev !== prev || body.seq !== out.length + 1 || hash !== w) throw new Refused('chain_broken', `seq ${out.length + 1}`);
@@ -150,8 +191,8 @@ export function openChain(file, opt = {}) {
   }
   /** 復旧の記録を読む。読めない行は { kind: 'unreadable_line' } として見せる（黙って落とさない） */
   function recoveries() {
-    if (!fs.existsSync(recoveryFile)) return [];
     const out = [];
+    if (!regularOrAbsent(recoveryFile)) return [];
     for (const l of fs.readFileSync(recoveryFile, 'utf8').split('\n')) {
       if (l === '') continue;
       try { const e = JSON.parse(l); out.push(isObj(e) ? e : { kind: 'unreadable_line', raw: l.slice(0, 200) }); } catch { out.push({ kind: 'unreadable_line', raw: l.slice(0, 200) }); }
@@ -198,6 +239,8 @@ export function openChain(file, opt = {}) {
 
   function withLock(fn) {
     fs.mkdirSync(dir, { recursive: true });
+    // 記録のフォルダ自身が記号リンクなら書かない（審査4 C-2。祖先は見ない：冒頭の限界）
+    if (!fs.lstatSync(dir).isDirectory()) throw new Refused('unsafe_file', 'dir: not_directory');
     const events = [];
     const deadline = Date.now() + lockWaitMs;
     const token = crypto.randomUUID();
@@ -211,7 +254,9 @@ export function openChain(file, opt = {}) {
     }
     const ownerFile = path.join(lock, 'owner');
     const mine = JSON.stringify({ pid: process.pid, host, started: new Date().toISOString(), token });
-    try { fs.writeFileSync(ownerFile, mine, { flag: 'wx' }); } catch (e) { fs.rmSync(lock, { recursive: true, force: true }); throw e; }
+    // 書けなかったときは、ロックを消さずに投げる。mkdir の後に長く止まると、空のロックとして別の者に引き継がれていることがあり、
+    // 自分のものと確かめられないロックに触らない（審査4 L-1）。自分の空のロックが残った場合は、staleEmptyLockMs の後に引き継がれる
+    fs.writeFileSync(ownerFile, mine, { flag: 'wx' });
     try { return fn(events); } finally {
       // 引き継がれていたら（token が違う）他人のロックを消さない
       let cur = null; try { cur = JSON.parse(fs.readFileSync(ownerFile, 'utf8')); } catch { /* 読めなければ消さない */ }
@@ -221,7 +266,7 @@ export function openChain(file, opt = {}) {
 
   // ---- 読み ----
   function readHead() {
-    if (!fs.existsSync(head)) return null;
+    if (!regularOrAbsent(head)) return null;
     let h; try { h = JSON.parse(fs.readFileSync(head, 'utf8')); } catch { throw new Refused('chain_broken', 'head'); }
     if (!h || !Number.isSafeInteger(h.seq) || h.seq < 0 || typeof h.hash !== 'string') throw new Refused('chain_broken', 'head');
     return h;
@@ -254,9 +299,11 @@ export function openChain(file, opt = {}) {
       if (lines.length && !h) throw new Refused('chain_broken', 'head_missing');
       if (lines.length !== want) throw new Refused('chain_broken', 'head_mismatch');
     } else {
-      // 読み手：head までの行がそろっていること。head より後ろは、書き込み中の1行（未完成でもよい）だけを許す
+      // 読み手：head までの行がそろっていること。head より後ろは、書き込み中の1行（未完成でもよい）だけを許す。
+      // head がないのに行がある記録は、書き手と同じく head_missing（最初の追記は行より先に head を置くので、正常な落ち方では起きない。審査4 C-3）
+      if (lines.length && !h) throw new Refused('chain_broken', 'head_missing');
       if (lines.length < want) throw new Refused('chain_broken', 'head_mismatch');
-      if (lines.length > want + 1) throw new Refused('chain_broken', lines.length && !h ? 'head_missing' : 'head_mismatch');
+      if (lines.length > want + 1) throw new Refused('chain_broken', 'head_mismatch');
       if (lines.length === want && !complete) throw new Refused('chain_broken', 'truncated_line');
       if (lines.length === want + 1) extra = { line: lines[want], complete };
       lines = lines.slice(0, want);
@@ -264,9 +311,10 @@ export function openChain(file, opt = {}) {
     const out = verifyLines(lines);
     if (h && lastHashOf(out) !== h.hash) throw new Refused('chain_broken', 'head_mismatch');
     let pending = null;
-    if (extra && h) { // head がない記録は復旧の対象にならない（pending も出さない）
+    if (extra && h) {
+      // 書き手が自動で直せる形（roll_forward・discard_torn）か、直せずに止まり続ける形（unrecoverable。審査4 C-4）か
       if (!extra.complete) pending = 'discard_torn';
-      else if (candidateOf(extra.line, out) !== null) pending = 'roll_forward';
+      else pending = candidateOf(extra.line, out) !== null ? 'roll_forward' : 'unrecoverable';
     }
     return { out, pending };
   }
@@ -274,7 +322,7 @@ export function openChain(file, opt = {}) {
   /** head の後ろの完全な1行が、鎖として正しくつながる行なら、その行（解いた形）。そうでなければ null */
   function candidateOf(line, before) {
     let e; try { e = JSON.parse(line); } catch { return null; }
-    if (!isObj(e)) return null;
+    if (!isObj(e) || JSON.stringify(e) !== line) return null;
     const { hash, ...body } = e;
     let w; try { w = sha256(canonical(body)); } catch { return null; }
     if (body.prev !== lastHashOf(before) || body.seq !== before.length + 1 || hash !== w) return null;
@@ -285,7 +333,9 @@ export function openChain(file, opt = {}) {
   /** head を、一時ファイルに書く → fsync → rename → 親フォルダを fsync の順で置き換える */
   function writeHead(seq, hash) {
     const tmp = `${head}.tmp`;
-    const fd = fs.openSync(tmp, 'w');
+    // 一時ファイルは新しく作る（O_EXCL・O_NOFOLLOW）。前に落ちて残った通常のファイルだけを消してから作り直す。記号リンクなどは消さずに止める（審査4 C-2）
+    if (regularOrAbsent(tmp)) fs.unlinkSync(tmp);
+    const { fd } = openForWrite(tmp, 'create');
     try { writeAll(fd, JSON.stringify({ seq, hash }) + '\n'); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
     fs.renameSync(tmp, head);
     fsyncDir(dir);
@@ -325,12 +375,12 @@ export function openChain(file, opt = {}) {
       let tornPath; let fd = null;
       for (let n = 1; fd === null; n += 1) {
         tornPath = `${file}.torn-${stamp}-${n}`;
-        try { fd = fs.openSync(tornPath, 'wx'); } catch (e) { if (e.code !== 'EEXIST') throw e; }
+        try { fd = openForWrite(tornPath, 'create').fd; } catch (e) { if (e.code !== 'EEXIST') throw e; }
       }
       try { writeAll(fd, torn); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
       fsyncDir(dir);
       events.push(logRecovery({ kind: 'discard_torn', seq: h.seq, torn_file: path.basename(tornPath), torn_bytes: torn.length, torn_sha256: sha256(torn) }));
-      const wfd = fs.openSync(file, 'r+');
+      const wfd = openForWrite(file, 'rw').fd;
       try { fs.ftruncateSync(wfd, tornStart); fs.fsyncSync(wfd); } finally { fs.closeSync(wfd); }
       return true;
     }
@@ -361,13 +411,21 @@ export function openChain(file, opt = {}) {
       let snap = snapshot();
       if (abnormal(snap) && recover(snap, events)) snap = snapshot();
       const records = readRaw(true, snap).out;
-      if (check) check(records);
-      if (!snap.h) initEmpty(snap); // 空の記録の最初の追記：先に head（seq 0）を置く
+      // prev と seq は check の前に決める（check が渡された配列を変えても、鎖を壊さない。審査4 C-5）
       const prev = lastHashOf(records);
-      const full = { ...body, seq: records.length + 1, at: now(), prev };
-      const hash = sha256(canonical(full));
-      const rec = { ...full, hash };
-      appendDurable(file, JSON.stringify(rec) + '\n'); // 行を追記して fsync（新規なら親フォルダも）
+      const seq = records.length + 1;
+      if (check) check(records);
+      // ハッシュと書く行を、JSON として写した同じ値から作る。写すと値が変わる本体（toJSON を持つ値・疎な配列など）は拒む（審査4 C-1）
+      const full = { ...body, seq, at: now(), prev };
+      let wire;
+      try { wire = JSON.parse(JSON.stringify(full)); } catch { throw new Refused('not_canonical', 'json'); }
+      if (!isObj(wire) || canonical(wire) !== canonical(full)) throw new Refused('not_canonical', 'changes_when_serialized');
+      if (!snap.h) initEmpty(snap); // 空の記録の最初の追記：先に head（seq 0）を置く
+      const hash = sha256(canonical(wire));
+      const rec = { ...wire, hash };
+      const line = JSON.stringify(rec);
+      if (JSON.stringify(JSON.parse(line)) !== line) throw new Refused('not_canonical', 'spelling'); // 読み手の綴りの検査（C-6）と同じ条件
+      appendDurable(file, line + '\n'); // 行を追記して fsync（新規なら親フォルダも）
       writeHead(full.seq, hash);                      // 一時ファイル → fsync → rename → 親フォルダ fsync
       return withEvents(rec, events);
     });
@@ -380,7 +438,7 @@ export function openChain(file, opt = {}) {
    */
   function read() { return readRaw(false).out; }
 
-  /** 検証だけ。投げずに結果を返す。pending：復旧待ちの跡（'roll_forward' | 'discard_torn'）。なければ欄を出さない（既存の戻り値の形を変えない）。読み手は復旧しない */
+  /** 検証だけ。投げずに結果を返す。pending：復旧待ちの跡（'roll_forward' | 'discard_torn'）か、書き手が止まり続ける跡（'unrecoverable'：head の後ろに鎖につながらない完全な1行）。なければ欄を出さない（既存の戻り値の形を変えない）。読み手は復旧しない */
   function verify() {
     try { const r = readRaw(false); return { ok: true, count: r.out.length, ...(r.pending ? { pending: r.pending } : {}) }; } catch (e) {
       if (e instanceof Refused) return { ok: false, code: e.code, detail: e.detail };
@@ -402,7 +460,7 @@ export function openChain(file, opt = {}) {
     if (!isObj(expect) || !Number.isSafeInteger(expect.seq) || expect.seq < 0 || typeof expect.hash !== 'string' || expect.hash === '') throw new Refused('bad_repair', 'expect');
     return withLock((events) => {
       let state = 'absent';
-      if (fs.existsSync(head)) { try { readHead(); state = 'ok'; } catch { state = 'bad'; } }
+      if (regularOrAbsent(head)) { try { readHead(); state = 'ok'; } catch { state = 'bad'; } }
       if (state === 'ok') throw new Refused('repair_refused', 'head_ok');
       const snap = { h: null, buf: fs.existsSync(file) ? (fs.lstatSync(file).isFile() ? fs.readFileSync(file) : (() => { throw new Refused('repair_refused', 'not_file'); })()) : null };
       if (snap.buf && snap.buf.length > 0 && snap.buf[snap.buf.length - 1] !== 10) throw new Refused('repair_refused', 'torn_tail');

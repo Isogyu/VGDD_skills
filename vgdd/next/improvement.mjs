@@ -13,7 +13,7 @@
 //   - 再提案は前の提案の未解消の差し戻しを引き継ぐ。引き継ぐのは (a) 同じ指紋の提案（提案者を問わない）と
 //     (b) 同じ提案者・同じ tier・同じ target の提案。取り下げても引き継ぎは消えない
 //   - オーナーが却下（rejected）した提案と同じ指紋の再提案は受けない（中身を変えて出し直す。差し戻しは (b) で引き継ぐ）
-//   - 引き継ぎの鍵（N1）：同じ指紋なら系統を問わず。同じ系統（id ではなく lineage）の提案者なら、target の鍵（paths は小文字の
+//   - 引き継ぎの鍵（N1）：同じ指紋なら系統を問わず。同じ系統（lineage）か同じ id（im.v5）の提案者なら、target の鍵（paths は小文字の
 //     各パス、ほかは「名前=値」）が1つでも重なれば引き継ぐ。tier は鍵にしない。重なりで引き継ぐので巻き込みは広い（同じファイルに
 //     触れる別の提案も止まる）。その出口として、オーナーだけが理由つきで差し戻しを解ける（dismissChangesRequired。N2）。
 //     引き継ぎの元で一度解けば、そこから引き継いだ提案にも及ぶ。未決の提案の今の版への差し戻しは解けない（amend・reject で扱う）
@@ -44,7 +44,7 @@
 
 import { openChain, digest, canonical, Refused } from './lib/chain.mjs';
 import { authorityDelta, routeFor } from './authority-delta.mjs';
-import { parseActor, normActor, isOwner as vocabIsOwner, isJudicialRole, normLineage, differentLineage, policyLineOf as vocabPolicyLineOf, isPolicyLine, ROLES, ROLE_TABLE, refusal } from './lib/vocab.mjs';
+import { parseActor, normActor, isOwner as vocabIsOwner, isJudicialRole, AI_LINEAGES, policyLineOf as vocabPolicyLineOf, isPolicyLine, ROLES, ROLE_TABLE, refusal } from './lib/vocab.mjs';
 
 export const RECORD_TYPE = 'vgdd.improvement.v1';
 export const TIERS = ['experience', 'playbook', 'composition', 'law', 'verifier', 'constitution'];
@@ -61,7 +61,13 @@ const OPS = ['propose', 'amend', 'evaluate', 'review', 'adopt', 'reject', 'withd
  * あってそれに覆われるときだけ、構造の検査（遷移の表・id の順番・鎖）だけで状態に入れる。覆われない古い版の行は bad_record。
  * 限界：鎖を書ける者（オーナーの権限）は、古い版の印を付けた偽の行を移行の記録の前に作り直せる（鎖の限界と同じ根）。
  */
-export const RULES = 'im.v4';
+export const RULES = 'im.v5';
+// im.v5（独立した審査 4 回目 I-1）：別系統の要求を、提案者の系統の申告に依らない条件にした。採用には、今の版・今の入力に APPROVED を出した司法の
+//   系統が 2 つ以上要る（今の語彙では claude と codex の両方）。司法の系統は役割で決まる（vocab の lineage_fixed）ので、行為者の申告で変えられない。
+//   im.v4 は「提案者と別の系統の APPROVED が 1 つ以上」で、行政の役割（系統が申告）が lineage: 'codex' と名乗ると、claude の judge だけで採用できた。
+//   厳しすぎるとき（片方の系統の司法が使えない）の出口は、人のオーナーが採用の入力に理由（cross_lineage_waiver: { reason }）を付けて解くこと。
+//   理由は採用の行と状態（adoption.cross_lineage_waiver）に残る。APPROVED が 1 つもない採用は、解いても通らない（IM-ADOPT-REQUIRES-APPROVAL）。
+//   提案者の系統を、オーナーが承認した編成の行為者の一覧と照合する案（報告の案 1）は入れていない。編成の承認を記録する部品がまだないため
 // im.v4：別系統の要求を「採用の時に、提案者と別の系統の司法の APPROVED が 1 つ以上」に変えた（IM-CROSS-LINEAGE）。評価者は gate_runner と
 //   人のオーナーだけ（IM-EVALUATOR-ROLE）。審査者は権限の表にある司法だけ。再生で記録の行為者が正規形であることを確かめる。
 // im.v3：行為者・系統・司法の役割・法律の系統は lib/vocab.mjs の語彙。各行に設定の写し（cfg: { max_open }）を持ち、写しが開く側の設定と違う
@@ -238,7 +244,7 @@ function inputOf(r) {
     case 'propose': case 'amend': return isObj(r.proposal) ? { ...r.proposal, ...(isObj(r.rationale) ? { rationale: r.rationale.text } : {}) } : null;
     case 'evaluate': return { digest: r.digest, evidence: r.evidence };
     case 'review': return { digest: r.digest, verdict: r.verdict, findings: r.findings, review_input_digest: r.review_input_digest };
-    case 'adopt': return { digest: r.digest, policy_line: r.policy_line };
+    case 'adopt': return { digest: r.digest, policy_line: r.policy_line, ...(r.cross_lineage_waiver !== undefined ? { cross_lineage_waiver: r.cross_lineage_waiver } : {}) };
     case 'withdraw': return r.reason === undefined || r.reason === null ? {} : { reason: r.reason };
     case 'dismiss_cr': return { reviewer: r.reviewer, reason: r.reason };
     default: return { reason: r.reason };
@@ -250,9 +256,10 @@ function apply(m, r) {
   if (r.op === 'propose') {
     // 引き継ぎ（N1）：(a) 同じ指紋の提案は系統を問わず、(b) 同じ系統の提案者で target の鍵が1つでも重なる提案（tier は問わない）
     const from = {};
-    const keys = targetKeys(r.proposal.target); const lin = lineageOf(r.actor);
+    const keys = targetKeys(r.proposal.target); const lin = lineageOf(r.actor); const me = idOf(r.actor);
     for (const q of m.values()) {
-      const linked = q.digest === r.digest || (lineageOf(q.proposer) === lin && overlaps(targetKeys(q.target), keys));
+      // 同じ系統か、同じ id の提案者（im.v5：系統の申告を変えるだけで引き継ぎから外れない。I-1 の同じ根）
+      const linked = q.digest === r.digest || ((lineageOf(q.proposer) === lin || idOf(q.proposer) === me) && overlaps(targetKeys(q.target), keys));
       if (linked) for (const id of unresolvedCR(q, m)) (from[id] ||= []).push(q.id);
     }
     s = { id: r.id, proposer: r.actor, status: 'proposed', evaluations: [], reviews: [], adoption: null, closed: null, history: [], inheritedCR: Object.keys(from).sort(), inheritedFrom: from, dismissedCR: [] };
@@ -266,7 +273,7 @@ function apply(m, r) {
       break;
     case 'evaluate': s.evaluations.push({ actor: r.actor, digest: r.digest, evidence: r.evidence, seq: r.seq }); s.status = 'evaluated'; break;
     case 'review': s.reviews.push({ actor: r.actor, digest: r.digest, verdict: r.verdict, findings: r.findings, review_input_digest: r.review_input_digest, seq: r.seq }); s.status = 'reviewed'; break;
-    case 'adopt': s.adoption = { actor: r.actor, digest: r.digest, policy_line: r.policy_line, seq: r.seq }; s.status = 'adopted'; break;
+    case 'adopt': s.adoption = { actor: r.actor, digest: r.digest, policy_line: r.policy_line, seq: r.seq, ...(r.cross_lineage_waiver !== undefined ? { cross_lineage_waiver: clone(r.cross_lineage_waiver) } : {}) }; s.status = 'adopted'; break;
     case 'rollback': s.closed = { op: r.op, actor: r.actor, reason: r.reason, seq: r.seq }; s.status = 'rolled_back'; break;
     case 'reject': s.closed = { op: r.op, actor: r.actor, reason: r.reason, seq: r.seq }; s.status = 'rejected'; break;
     case 'withdraw': s.closed = { op: r.op, actor: r.actor, reason: r.reason ?? null, seq: r.seq }; s.status = 'withdrawn'; break;
@@ -436,7 +443,12 @@ function inputShape(ctx) {
       if (!VERDICTS.has(i.verdict)) return 'verdict が APPROVED・CHANGES_REQUIRED でない';
       if (!Array.isArray(i.findings) || canon(i.findings) === null) return 'findings が配列でない';
       return null;
-    case 'adopt': return typeof i.digest === 'string' && typeof i.policy_line === 'string' ? null : 'digest・policy_line がない';
+    case 'adopt': {
+      if (typeof i.digest !== 'string' || typeof i.policy_line !== 'string') return 'digest・policy_line がない';
+      const w = i.cross_lineage_waiver;
+      if (w !== undefined && !(isObj(w) && Object.keys(w).length === 1 && nonEmpty(w.reason, 2000))) return 'cross_lineage_waiver は { reason: 理由の文字列 } だけ（理由は必須）';
+      return null;
+    }
     case 'reject': case 'rollback': return nonEmpty(i.reason) ? null : 'reason（理由）が要る';
     case 'withdraw': return i.reason === undefined || nonEmpty(i.reason) ? null : 'reason が文字列でない';
     case 'dismiss_cr': return nonEmpty(i.reviewer, 200) && nonEmpty(i.reason) ? null : 'reviewer（解く差し戻しの審査者の id）と reason（理由）が要る';
@@ -515,16 +527,19 @@ export const GUARDS = {
     const a = normActor(ctx.actor) || {};
     return JUDICIAL_ROLES.includes(a.role) && a.kind !== 'script' ? null : `審査は権限の表にある司法の役割（${JUDICIAL_ROLES.join('・')}）だけ`;
   },
-  // 採用の時の要求（im.v4）：今の版・今の入力に、提案者と別の系統の司法の APPROVED が 1 つ以上要る（tier によらず例外なし。同系統の見落とし・共謀への備え）。
-  // 同じ系統の司法も審査はできる（例：Claude の提案の憲法審査は claude の constitutional_review）が、この要求を満たす数には入らない。
+  // 採用の時の要求（im.v5）：今の版・今の入力に APPROVED を出した司法の系統が 2 つ以上要る（tier によらず例外なし。同系統の見落とし・共謀への備え）。
+  // 同じ系統の司法が何体承認しても、系統は 1 つと数える（例：Claude の提案の憲法審査は claude の constitutional_review。codex の司法の承認も要る）。
   // CHANGES_REQUIRED は系統を問わず効く（IM-ADOPT-REQUIRES-APPROVAL・IM-CR-STICKY）。系統は vocab の知っている系統で比べ、司法の系統は役割で決まる。
   // im.v3 までは「審査者は全員が提案者と別の系統」で、正直な同系統の憲法審査を拒み、系統を偽った申告だけが通る誘因になっていた
+  // im.v5（I-1）：提案者の系統（申告）は使わない。APPROVED を出した司法の系統（役割で決まる）が 2 つ以上。人のオーナーが理由を付けて解ける
   'IM-CROSS-LINEAGE': (ctx) => {
     if (ctx.op !== 'adopt' || !cur(ctx)) return null;
-    const pl = lineageOf(cur(ctx).proposer);
     const fresh = freshApproved(cur(ctx));
     if (fresh.length === 0) return null; // APPROVED が 1 つもないことは IM-ADOPT-REQUIRES-APPROVAL が見る
-    return fresh.some((r) => differentLineage(lineageOf(r.actor), pl)) ? null : `提案者（${pl}）と別の系統の司法の APPROVED が今の版にない（同じ系統の審査だけでは採用できない）`;
+    const lineages = [...new Set(fresh.map((r) => lineageOf(r.actor)).filter((l) => AI_LINEAGES.includes(l)))].sort();
+    if (lineages.length >= 2) return null;
+    if (isObj(ctx.input) && isObj(ctx.input.cross_lineage_waiver) && nonEmpty(ctx.input.cross_lineage_waiver.reason, 2000) && isOwner(ctx.actor)) return null;
+    return `今の版に APPROVED を出した司法の系統が ${lineages.join('・') || 'なし'} だけ（2 つの系統が要る。提案者の系統の申告には依らない。片方の系統が使えないときは、オーナーが cross_lineage_waiver に理由を付けて解く）`;
   },
   // 評価・審査・採用は提案の今の指紋に結び付ける
   'IM-DIGEST-BOUND': (ctx) => {
@@ -692,7 +707,8 @@ export function openImprovements(file, opt = {}) {
     amend: (actor, id, input) => guarded('amend', actor, id, input, proposalBody),
     evaluate: (actor, id, input) => guarded('evaluate', actor, id, input, ({ input: i }) => ({ digest: i.digest, evidence: clone(i.evidence) })),
     review: (actor, id, input) => guarded('review', actor, id, input, ({ input: i }) => ({ digest: i.digest, verdict: i.verdict, findings: clone(i.findings), review_input_digest: i.review_input_digest })),
-    adopt: (actor, id, input) => guarded('adopt', actor, id, input, ({ input: i }) => ({ digest: i.digest, policy_line: i.policy_line })),
+    /** 採用。input = { digest, policy_line, cross_lineage_waiver?: { reason } }（系統が 1 つの承認で採用するときの、オーナーの理由。im.v5） */
+    adopt: (actor, id, input) => guarded('adopt', actor, id, input, ({ input: i }) => ({ digest: i.digest, policy_line: i.policy_line, ...(i.cross_lineage_waiver !== undefined ? { cross_lineage_waiver: { reason: i.cross_lineage_waiver.reason } } : {}) })),
     reject: (actor, id, input) => guarded('reject', actor, id, input, ({ input: i }) => ({ reason: i.reason })),
     withdraw: (actor, id, input = {}) => guarded('withdraw', actor, id, input, ({ input: i }) => (i.reason === undefined ? {} : { reason: i.reason })),
     rollback: (actor, id, input) => guarded('rollback', actor, id, input, ({ input: i }) => ({ reason: i.reason })),

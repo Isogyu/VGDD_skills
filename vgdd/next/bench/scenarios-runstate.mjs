@@ -304,6 +304,33 @@ A('RS-A155', 'E-7：保護に重なる blocked の節を rule の return で作�
   build: (r) => { plan(r, [N('T-001', [], ['vgdd/x'])]); approve(r, 'T-001'); start(r, 'T-001'); submit(r, 'T-001'); verdict(r, 'T-001', R1, 'passed', SPLIT_MAJOR); go(r, OW, cfgEv({ concurrent_work: 2, protected: ['vgdd/**'], reason: '締める' })); },
   actor: OW, event: { op: 'rule', node: 'T-001', request: R1, decision: 'return', reason: 'やり直す' } });
 
+// ---- 独立した審査（4 回目）R-1：作業中の節に重なる保護を後から足したとき、申請・判定・統合で止める ----
+// 本物の結果（computeResult）は blocked（protected）を出す。攻撃は、結果を決める部分が壊れた・改ざんされた場合の備えとして、
+// 素朴な（保護を見ない）結果を ctx.result に入れて、RS-PROTECTED が止めるかを見る。範囲の表記ゆれ（大文字・全角・前置きの *・下の **）の変種つき
+const PROT_SPELL = [['', 'vgdd/kernel/x'], ['大文字', 'VGDD/x'], ['大文字小文字の混在', 'Vgdd/Kernel/x'], ['全角', 'ｖｇｄｄ/x'], ['前置きの *', 'vgd*'], ['下の **', 'vgdd/kernel/**']];
+const protOn = (r) => go(r, OW, cfgEv({ ...r.state().config, protected: ['vgdd/**'], reason: '統治の核を保護する（締める）' }));
+const protInProgress = (res, o = {}) => (r) => { plan(r, [{ ...N('T-001', [], [res]), ...(o.sec ? { security_review: true } : {}) }]); approve(r, 'T-001'); start(r, 'T-001'); if (o.review || o.held) submit(r, 'T-001'); if (o.held) verdict(r, 'T-001', R1, 'passed', AP2); protOn(r); };
+PROT_SPELL.forEach(([label, res], i) => {
+  const sfx = label ? `（範囲の綴り：${label} ${res}）` : '';
+  A(`RS-A${156 + i * 4}`, `R-1：保護を足した後、作業中の節（${res}）の submit を review に進める${sfx}`, ['RS-PROTECTED'], {
+    build: protInProgress(res), event: { op: 'submit', node: 'T-001', request: R1 }, res: (r, ev) => ({ op: 'submit', node: ev.node, to: 'review', patch: { request: R1 } }) });
+  A(`RS-A${157 + i * 4}`, `R-1：保護を足した後、申請中の節の差し戻し（重大でない CHANGES_REQUIRED）で作業を続ける${sfx}`, ['RS-PROTECTED'], {
+    build: protInProgress(res, { review: true }), actor: CT, event: verdictEv('passed', CR2), res: naive('in_progress', 'return') });
+  A(`RS-A${158 + i * 4}`, `R-1：保護を足した後、申請中の節を verdict の合格で統合する${sfx}`, ['RS-PROTECTED'], {
+    build: protInProgress(res, { review: true }), actor: CT, event: verdictEv('passed', AP2), res: naive('merged') });
+  A(`RS-A${159 + i * 4}`, `R-1：保護を足した後、夜間に合格した節（held）を release で統合する${sfx}`, ['RS-PROTECTED'], {
+    world: holdWorld, build: protInProgress(res, { held: true }), actor: OW, event: { op: 'release', node: 'T-001', request: R1 }, res: (r, ev) => ({ op: 'release', node: ev.node, to: 'merged', patch: {} }) });
+});
+A('RS-A180', 'R-1：保護と重なって止めた申請（審査に合格していない）を、オーナーの裁定で統合する', ['RS-PROTECTED'], {
+  build: (r) => { protInProgress('vgdd/x')(r); submit(r, 'T-001'); }, actor: OW, event: { op: 'rule', node: 'T-001', request: R1, decision: 'merge', reason: '通す' } });
+A('RS-A181', 'R-1：保護と重なって差し戻しで止めた申請を、オーナーの裁定で統合する', ['RS-PROTECTED'], {
+  build: (r) => { protInProgress('VGDD/x', { review: true })(r); verdict(r, 'T-001', R1, 'passed', CR2); }, actor: OW, event: { op: 'rule', node: 'T-001', request: R1, decision: 'merge', reason: '通す' } });
+A('RS-A182', 'R-1：保護の判断待ち（blocked: protected）の節を、行政が置き換えで消す', ['RS-PLAN-SUPERSEDE'], {
+  build: (r) => { protInProgress('vgdd/x')(r); submit(r, 'T-001'); }, event: { op: 'plan', nodes: [N('T-012')], supersede: [{ old: 'T-001', new: 'T-012' }] } });
+A('RS-A183', 'R-1：セキュリティ審査の不合格の申請を、保護で止めるときに裁定で統合できる形（rule_merge_ok）にする', ['RS-SECURITY-FAIL'], {
+  build: protInProgress('vgdd/x', { review: true, sec: true }), actor: CT, event: verdictEv('passed', [...AP2, SEC_NG]),
+  res: (r, ev) => ({ op: 'verdict', node: ev.node, kind: 'blocked_protected', to: 'blocked', patch: { blocked_reason: 'protected', rule_merge_ok: true } }) });
+
 function benign(id, title, flow) {
   SCENARIOS.push({ id, kind: 'benign', title, run: (guardNames) => {
     try {
@@ -556,4 +583,28 @@ benign('RS-B27', 'E-8：票の ID の宣言を U- に変えた後、新しい節
   plan(r, [N('U-101', ['T-001'])]);
   go(r, OW, { op: 'plan', nodes: [N('U-102')], supersede: [{ old: 'T-002', new: 'U-102' }] });
   expect(r.state().nodes['T-002'].superseded_by === 'U-102', '置き換え');
+});
+
+benign('RS-B28', 'R-1：保護を後から足しても、重ならない節は申請・合格・統合まで通る。重なる節は blocked になり、合格済みならオーナーの裁定で統合できる', (w) => {
+  const r = w();
+  plan(r, [N('T-001', [], ['vgdd/kernel/x']), N('T-002', [], ['src/a/**'])]); approve(r, 'T-001'); approve(r, 'T-002');
+  start(r, 'T-001'); start(r, 'T-002'); submit(r, 'T-001');
+  const c = protOn(r);
+  expect(JSON.stringify(c.protected_busy) === '["T-001"]', 'config が重なる作業中の節を知らせる');
+  submit(r, 'T-002', R2); verdict(r, 'T-002', R2, 'passed', AP2);
+  expect(st(r, 'T-002') === 'merged', '重ならない節は merged');
+  verdict(r, 'T-001', R1, 'passed', AP2);
+  expect(st(r, 'T-001') === 'blocked' && r.state().nodes['T-001'].blocked_reason === 'protected', '重なる節は blocked');
+  go(r, OW, { op: 'rule', node: 'T-001', request: R1, decision: 'merge', reason: '保護を承知で通す' });
+  expect(st(r, 'T-001') === 'merged', 'オーナーの裁定で統合');
+});
+benign('RS-B29', 'R-1：保護と重なって止めた節は、オーナーが置き換えるか、保護を見直して unblock で作業に戻せる', (w) => {
+  const r = w();
+  plan(r, [N('T-001', [], ['vgdd/x']), N('T-002', [], ['Vgdd/y'])]); approve(r, 'T-001'); approve(r, 'T-002');
+  start(r, 'T-001'); start(r, 'T-002'); protOn(r); submit(r, 'T-001'); submit(r, 'T-002', R2);
+  go(r, OW, { op: 'plan', nodes: [N('T-011', [], ['src/k/**'])], supersede: [{ old: 'T-001', new: 'T-011' }] });
+  go(r, OW, cfgEv({ ...r.state().config, protected: [], reason: '保護を見直した' }));
+  go(r, OW, { op: 'unblock', node: 'T-002', reason: '再開' });
+  start(r, 'T-002');
+  expect(st(r, 'T-002') === 'in_progress', 'unblock の後に着手できる');
 });

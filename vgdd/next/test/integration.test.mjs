@@ -194,7 +194,7 @@ describe('結合：3 つの票を開発の領域パックで進める（共通�
     const ev = p.evaluations[0].evidence.conformance;
     assert.ok(ev.after.total > ev.before.total);
     assert.ok(ev.new_cases_fail_on_before >= 1);
-    assert.deepEqual(p.reviews.map((r) => [r.actor.role, r.actor.lineage, r.verdict]), [['codex_judge', 'codex', 'APPROVED']]);
+    assert.deepEqual(p.reviews.map((r) => [r.actor.role, r.actor.lineage, r.verdict]), [['codex_judge', 'codex', 'APPROVED'], ['judge', 'claude', 'APPROVED']]); // im.v5：2 つの系統
     assert.deepEqual(p.evaluations[0].actor, V.normActor(A.gate));
     assert.equal(W.im.adoptionValid(p.id), true);
     const t = W.tr.trace({ kind: 'improvement', id: W.playbook.id }, { direction: 'up' });
@@ -339,7 +339,7 @@ describe('解消：系統（lineage）の書式・正規化・別名', () => {
     const p = im.propose({ ...A.head, lineage: 'Claude' }, { title: 't', tier: 'playbook', target: { name: 'x' }, content: 'c' });
     im.evaluate(A.gate, p.id, { digest: p.digest, evidence: { conformance: { before: { total: 1, passed: 1 }, after: { total: 1, passed: 1 } } } });
     im.review({ role: 'judge', kind: 'ai', id: 'j', lineage: 'claude' }, p.id, { digest: p.digest, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(p.id).digest });
-    // im.v4：同じ系統（Claude と claude は同じ）の審査は、採用の時の別系統の要求に数えない
+    // im.v5：同じ系統（Claude と claude は同じ）の審査だけでは、採用の時の 2 つの系統の要求を満たさない
     assert.deepEqual(refused(() => im.adopt(A.owner, p.id, { digest: p.digest, policy_line: 'p0.4' })).guards, ['IM-CROSS-LINEAGE']);
     assert.deepEqual(parseActor({ ...A.head, lineage: 'CLAUDE' }).actor.lineage, 'claude');
   });
@@ -494,11 +494,11 @@ describe('解消：時刻の書式', () => {
 });
 
 describe('解消：規則の版・epoch・設定の持ち方', () => {
-  it('（前：experience だけ rules も epoch もなく type に操作名）全部の記録の行が type・rules・op を持ち、版は rs.v3・im.v4・tr.v4・ex.v2', () => {
+  it('（前：experience だけ rules も epoch もなく type に操作名）全部の記録の行が type・rules・op を持ち、版は rs.v4・im.v5・tr.v4・ex.v2', () => {
     const W = runWalkthrough({ dir: scratch() });
     const first = (f) => openChain(W.files[f]).read()[0];
-    assert.deepEqual([first('run').rules, first('run').op], ['rs.v3', 'config']);
-    assert.equal(first('improvement').rules, 'im.v4');
+    assert.deepEqual([first('run').rules, first('run').op], ['rs.v4', 'config']); // 独立した審査 4 回目 R-1
+    assert.equal(first('improvement').rules, 'im.v5'); // 独立した審査 4 回目 I-1
     assert.equal(first('trace').rules, 'tr.v4');
     const e = first('experience');
     assert.deepEqual([e.type, e.rules], ['vgdd.experience.v1', 'ex.v2']);

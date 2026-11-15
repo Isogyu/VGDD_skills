@@ -8,12 +8,16 @@
 //   - 入力の記録が本物であること（runstate の記録の行は replay で規則に合うことだけ確かめる。鎖の検証は呼び出し側が chain.read() で行う）
 //   - 判定の id・指摘への参照・統合の参照が実在すること（runstate の verdict の refs・merge は外から来る値で、形と整合だけ確かめてある）
 //   - feedbackFromRun の helpful・harmful が、経験が本当に役に立ったかを表すこと（下の規則は「最初の判定の結果」という代理の指標）
+//   - feedbackFromRun に渡す取り出しの行が、本物の経験の記録の行であること。1 行ずつ、経験の部品の再生と同じ規則（行為者の正規形・
+//     EX-RETRIEVE-ACTOR・EX-RETRIEVE-JUDGE）は確かめるが、記録全体の鎖・版・設定の写しは確かめない（呼び出し側が openChain(経験).read() で
+//     鎖を確かめた行を渡す前提。runRecords と同じ。独立した審査 4 回目の疑い）
 
 import { validateDomainPack } from '../domain.mjs';
 import { replay as rsReplay, RECORD_TYPE as RS_TYPE } from '../runstate.mjs';
-import { digest } from './chain.mjs';
+import { digest, canonical } from './chain.mjs';
+import { check as exCheck, RECORD_TYPE as EX_TYPE } from '../experience.mjs';
 import {
-  REVIEW_MODES, AI_LINEAGES, reviewModeOf, verdictId, auditId, asDigest, parseWorkItemSpec, isFindingRef, parseFindingRef, parseTs, sameActor,
+  REVIEW_MODES, AI_LINEAGES, reviewModeOf, verdictId, auditId, asDigest, parseWorkItemSpec, isFindingRef, parseFindingRef, parseTs, sameActor, normActor,
 } from './vocab.mjs';
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -183,6 +187,17 @@ export function provenanceFromVerdict(runRecord, opt = {}) {
   return { provenance: out, reason: out.length ? null : '指摘への参照が vocab の形でない' };
 }
 
+/** 取り出しの行が、経験の部品の再生と同じ規則に合うか（合わなければ理由）。経験の記録の reduce の retrieved の扱いと同じ検査 */
+function retrievedProblem(e) {
+  if (e.type !== EX_TYPE) return `経験の記録の行でない（type ${String(e.type).slice(0, 40)}）`;
+  if (typeof e.role !== 'string') return '渡す先の役割（role）がない';
+  if (!e.item_ids.every((x) => typeof x === 'string')) return '項目の id が文字列でない';
+  let canon = false; try { canon = isObj(e.actor) && canonical(e.actor) === canonical(normActor(e.actor)); } catch { canon = false; }
+  if (!canon) return '行為者の綴りが vocab の正規形でない';
+  const r = exCheck({ op: 'retrieve', actor: e.actor, audience: { role: e.role } }, ['EX-RETRIEVE-ACTOR', 'EX-RETRIEVE-JUDGE']);
+  return r.ok ? null : r.violations.map((v) => v.guard).join('・');
+}
+
 /**
  * 経験の feedback の入力の案を作る（決定論的）。評価は代理の指標なので、数える取り出しを狭く決める（独立した審査 E-1・E-9）。
  * 規則：
@@ -193,9 +208,14 @@ export function provenanceFromVerdict(runRecord, opt = {}) {
  *      (a) task がその票で、(b) 時刻（行の at）が「その申請の submit の直前の start の時刻以降、その submit の時刻まで」にあり
  *      （submit と同じ時刻（記録の時刻はミリ秒まで）の取り出しは数える。それより後は数えない）、
  *      (c) 取り出した行為者（retrieved の actor）が、その start を起こした行為者か、その start の assignee と同じもの。
+ *      (d) 行そのものが、経験の部品の再生と同じ規則に合う（経験の記録の行で、行為者が正規形、取り出せる役割、渡す先が司法でない）。
  *      時刻が読めない・範囲の外・行為者が違う取り出しは数えず、skipped に理由を返す（申告の task だけでは評価を付けない）。
  *   4. 証拠は、その申請の判定の id（verdict の refs.verdicts の最初、なければ vocab の verdictId で judge の種類から作る）。
  *   限界：取り出した経験を作業員が実際に読んだか・使ったかは分からない。時刻は二つの鎖の書いた側の時刻で、同じ時計とは限らない。
+ *   前提：retrievedEvents は、鎖を確かめた経験の記録の行（openChain(経験の記録).read()）。この関数は行を 1 つずつ確かめるだけで、
+ *     記録全体の鎖・規則の版・設定の写しは確かめない（行を作り直して渡せる呼び出し側は、評価を作れる。runRecords の鎖も同じ前提）。
+ *     作業員は、合格しそうな申請の直前に、上げたい経験を取り出せば helpful を付けられる（代理の指標の限界）。この評価を経験の昇格
+ *     （improvement の tier: 'experience'）の根拠にするときは、オーナーが見る前提。
  * @param {object[]} runRecords runstate の記録の行
  * @param {object[]} retrievedEvents experience の記録の行（op: 'retrieved' 以外は無視）
  * @returns {{ feedback: {item_ids:string[], outcome:'helpful'|'harmful', evidence:{kind:'verdict', ref:string, task:string}}[], skipped: {task:string|null, reason:string}[] }}
@@ -217,6 +237,8 @@ export function feedbackFromState(st, runRecords, retrievedEvents) {
   const byTask = new Map();
   for (const e of retrievedEvents) {
     if (!isObj(e) || e.op !== 'retrieved' || typeof e.task !== 'string' || !Array.isArray(e.item_ids)) continue;
+    const bad = retrievedProblem(e);
+    if (bad) { skipped.push({ task: e.task, reason: `取り出しの行（seq ${e.seq}）が経験の記録の規則に合わない（${bad}）` }); continue; }
     (byTask.get(e.task) || byTask.set(e.task, []).get(e.task)).push(e);
   }
   const rows = runRecords.filter((r) => isObj(r) && r.type === RS_TYPE);

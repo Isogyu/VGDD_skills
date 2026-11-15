@@ -38,8 +38,9 @@ function helpers(im) {
     propose: (input = playbook(), who = A.claude) => im.propose(who, input),
     evaluate: (p, ev = GOOD, who = A.runner) => im.evaluate(who, p.id, { digest: im.get(p.id).digest, evidence: { conformance: ev, notes: '評価者の注記' } }),
     review: (p, who = A.codexJudge, verdict = 'APPROVED') => im.review(who, p.id, { digest: im.get(p.id).digest, verdict, findings: [], review_input_digest: im.reviewInputFor(p.id).digest }),
-    reviewed: (input, opt = {}) => { const p = h.propose(input, opt.proposer); h.evaluate(p, opt.evidence); for (const r of opt.reviewers || [A.codexJudge]) h.review(p, r, opt.verdict); return im.get(p.id); },
-    adoptInput: (p, line = 'p0.4') => ({ digest: im.get(p.id).digest, policy_line: line }),
+    // im.v5：承認の既定は 2 つの系統（codex と claude の judge）。差し戻しの既定は codex の judge だけ
+    reviewed: (input, opt = {}) => { const p = h.propose(input, opt.proposer); h.evaluate(p, opt.evidence); for (const r of opt.reviewers || (opt.verdict === 'CHANGES_REQUIRED' ? [A.codexJudge] : [A.codexJudge, A.judge])) h.review(p, r, opt.verdict); return im.get(p.id); },
+    adoptInput: (p, line = 'p0.4', extra = {}) => ({ digest: im.get(p.id).digest, policy_line: line, ...extra }),
     reviewInput: (p, who = A.codexJudge) => ({ digest: im.get(p.id).digest, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(p.id).digest }),
   };
   return h;
@@ -94,13 +95,13 @@ export const SCENARIOS = [
   scenario('IM-A9', 'attack', 'AI が人の系統を名乗って系統の検査を逃れる', ['IM-ACTOR-SHAPE'], (im, h) => { const p = h.propose(); h.evaluate(p); return ['review', { ...A.judge, lineage: 'human' }, p.id, h.reviewInput(p)]; }),
   scenario('IM-A10', 'attack', '採用の時の版のすり替え（オーナーが見た版と違う版が評価・審査済み）', ['IM-DIGEST-BOUND'], (im, h) => {
     const p = h.reviewed(playbook()); const seen = h.adoptInput(p);
-    im.amend(A.claude, p.id, playbook({ content: '手順3：試験は任意' })); h.evaluate(p); h.review(p, A.codexJudge2);
+    im.amend(A.claude, p.id, playbook({ content: '手順3：試験は任意' })); h.evaluate(p); h.review(p, A.codexJudge2); h.review(p, { ...A.judge, id: 'claude-judge-2' });
     return ['adopt', A.owner, p.id, seen];
   }),
   scenario('IM-A11', 'attack', '評価の後の中身のすり替え（新しい版を評価なしで採用）', ['IM-ADOPT-REQUIRES-EVAL', 'IM-ADOPT-REQUIRES-APPROVAL'], (im, h) => {
     const p = h.reviewed(playbook()); im.amend(A.claude, p.id, playbook({ content: '手順3：試験は任意' })); return ['adopt', A.owner, p.id, h.adoptInput(p)];
   }),
-  scenario('IM-A12', 'attack', '評価なしの採用（審査だけ）', ['IM-ADOPT-REQUIRES-EVAL'], (im, h) => { const p = h.propose(); h.review(p); return ['adopt', A.owner, p.id, h.adoptInput(p)]; }),
+  scenario('IM-A12', 'attack', '評価なしの採用（審査だけ）', ['IM-ADOPT-REQUIRES-EVAL'], (im, h) => { const p = h.propose(); h.review(p); h.review(p, A.judge); return ['adopt', A.owner, p.id, h.adoptInput(p)]; }),
   scenario('IM-A13', 'attack', 'CHANGES_REQUIRED を別の審査者の APPROVED で上書き（審査者の選び直し）', ['IM-ADOPT-REQUIRES-APPROVAL'], (im, h) => {
     const p = h.reviewed(playbook(), { verdict: 'CHANGES_REQUIRED' }); h.review(p, A.codexJudge2); return ['adopt', A.owner, p.id, h.adoptInput(p)];
   }),
@@ -147,7 +148,7 @@ export const SCENARIOS = [
   }),
   scenario('IM-A35', 'attack', 'F4：取り下げて同じ中身を出し直し、別の審査者の APPROVED を取る', ['IM-CR-STICKY'], (im, h) => {
     const p = h.reviewed(playbook({ content: '試験は任意' }), { verdict: 'CHANGES_REQUIRED' }); im.withdraw(A.claude, p.id);
-    const q = h.reviewed(playbook({ content: '試験は任意' }), { reviewers: [A.codexJudge2] }); return ['adopt', A.owner, q.id, h.adoptInput(q)];
+    const q = h.reviewed(playbook({ content: '試験は任意' }), { reviewers: [A.codexJudge2, A.judge] }); return ['adopt', A.owner, q.id, h.adoptInput(q)];
   }),
   scenario('IM-A36', 'attack', 'F4：オーナーが却下した提案と同じ中身を出し直す', ['IM-NO-RESUBMIT-REJECTED'], (im, h) => { const p = h.reviewed(playbook()); im.reject(A.owner, p.id, { reason: '不要' }); return ['propose', A.claude, null, playbook()]; }),
   scenario('IM-A37', 'attack', 'F7：前の版でも通る（空回りの）試験の追加を検証器の強化として採用', ['IM-NONVACUOUS-TESTS'], (im, h) => {
@@ -168,16 +169,16 @@ export const SCENARIOS = [
   scenario('IM-A40', 'attack', '評価が加わる前の古い審査で採用（審査者が証拠を見ていない）', ['IM-ADOPT-REQUIRES-APPROVAL'], (im, h) => { const p = h.propose(); h.review(p); h.evaluate(p); return ['adopt', A.owner, p.id, h.adoptInput(p)]; }),
   // ---- 再審査で見つかった問題（N1・N2・N4・N5）----
   scenario('IM-A41', 'attack', 'N1：差し戻しの後、paths の順序と tier を変えて出し直す', ['IM-CR-STICKY'], (im, h) => {
-    crBase(im, h); const q = h.reviewed(pbT({ paths: ['docs/Playbook/b.md', 'docs/playbook/a.md'] }, { tier: 'composition', content: '試験は任意。' }), { reviewers: [A.codexJudge2] });
+    crBase(im, h); const q = h.reviewed(pbT({ paths: ['docs/Playbook/b.md', 'docs/playbook/a.md'] }, { tier: 'composition', content: '試験は任意。' }), { reviewers: [A.codexJudge2, A.judge] });
     return ['adopt', A.owner, q.id, h.adoptInput(q)];
   }),
   scenario('IM-A42', 'attack', 'N1：差し戻しの後、同じ系統の別の id の提案者として出し直す', ['IM-CR-STICKY'], (im, h) => {
-    crBase(im, h); const q = h.reviewed(pbT({ ...T1, note: 'v2' }, { content: '試験は任意。' }), { proposer: { ...A.claude, id: 'claude-exec-2' }, reviewers: [A.codexJudge2] });
+    crBase(im, h); const q = h.reviewed(pbT({ ...T1, note: 'v2' }, { content: '試験は任意。' }), { proposer: { ...A.claude, id: 'claude-exec-2' }, reviewers: [A.codexJudge2, A.judge] });
     return ['adopt', A.owner, q.id, h.adoptInput(q)];
   }),
   scenario('IM-A43', 'attack', 'N1：提案者の id に空白を足して別人を装う', ['IM-ACTOR-SHAPE'], (im, h) => { crBase(im, h); return ['propose', { ...A.claude, id: 'claude exec-1' }, null, pbT(T1, { content: '試験は任意。' })]; }),
   scenario('IM-A44', 'attack', 'N2：AI が引き継いだ差し戻しを自分で解く', ['IM-OWNER-DECIDES'], (im, h) => {
-    crBase(im, h); const q = h.reviewed(pbT(T1, { content: '試験は任意。' }), { reviewers: [A.codexJudge2] });
+    crBase(im, h); const q = h.reviewed(pbT(T1, { content: '試験は任意。' }), { reviewers: [A.codexJudge2, A.judge] });
     return ['dismiss_cr', A.claude, q.id, { reviewer: 'codex-judge-1', reason: '不要' }];
   }),
   scenario('IM-A45', 'attack', 'N2：未決の提案の今の版への差し戻しを、直さずに解除で消す', ['IM-TRANSITION'], (im, h) => { const p = h.reviewed(playbook(), { verdict: 'CHANGES_REQUIRED' }); return ['dismiss_cr', A.owner, p.id, { reviewer: 'codex-judge-1', reason: '上書き' }]; }),
@@ -188,6 +189,7 @@ export const SCENARIOS = [
       forge(file, { type: 'vgdd.improvement.v1', rules: RULES, cfg: { max_open: 5 }, op: 'propose', id, actor: A.claude, proposal, digest: dg, rationale: null });
       forge(file, { type: 'vgdd.improvement.v1', rules: RULES, cfg: { max_open: 5 }, op: 'evaluate', id, actor: A.runner, digest: dg, evidence: { conformance: GOOD } });
       forge(file, { type: 'vgdd.improvement.v1', rules: RULES, cfg: { max_open: 5 }, op: 'review', id, actor: A.codexJudge, digest: dg, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(id).digest });
+      forge(file, { type: 'vgdd.improvement.v1', rules: RULES, cfg: { max_open: 5 }, op: 'review', id, actor: A.judge, digest: dg, verdict: 'APPROVED', findings: [], review_input_digest: im.reviewInputFor(id).digest });
       forge(file, { type: 'vgdd.improvement.v1', rules: RULES, cfg: { max_open: 5 }, op: 'adopt', id, actor: A.owner, digest: dg, policy_line: 'p0.4' });
     };
     const t = mut((c) => cap(c, 'CAP-LINK').enforced_by.push('sandbox'));
@@ -224,11 +226,34 @@ export const SCENARIOS = [
   scenario('IM-A58', 'attack', 'im.v4：同じ系統の憲法審査と同じ系統の judge だけで、緩める法律の変更を採用する', ['IM-CROSS-LINEAGE'], (im, h) => {
     const p = h.reviewed(law(mut((c) => cap(c, 'CAP-LAW-WRITE').allowed.push('worker'))), { reviewers: [A.judge, A.codexConst] }); return ['adopt', A.owner, p.id, h.adoptInput(p)];
   }),
+  // ---- im.v5（独立した審査 4 回目 I-1）で足した攻撃：提案者の系統の申告で、別系統の審査の要求を回り込む ----
+  ...['codex', 'CODEX', 'ｃｏｄｅｘ', ' Codex '].map((lin, k) => scenario(`IM-A${59 + k}`, 'attack', `I-1：claude の行政が系統を「${lin}」と申告し、claude の judge の承認だけで採用する`, ['IM-CROSS-LINEAGE'], (im, h) => {
+    const p = h.reviewed(playbook(), { proposer: { ...A.claude, lineage: lin }, reviewers: [A.judge] }); return ['adopt', A.owner, p.id, h.adoptInput(p)];
+  })),
+  scenario('IM-A63', 'attack', 'I-1：系統を codex と申告した提案を、claude の judge と claude の憲法審査（2 体・1 系統）で採用する', ['IM-CROSS-LINEAGE'], (im, h) => {
+    const p = h.reviewed(playbook(), { proposer: { ...A.claude, lineage: 'codex' }, reviewers: [A.judge, A.codexConst] }); return ['adopt', A.owner, p.id, h.adoptInput(p)];
+  }),
+  scenario('IM-A64', 'attack', 'I-1：codex の judge 2 体（1 系統）の承認だけで採用する', ['IM-CROSS-LINEAGE'], (im, h) => {
+    const p = h.reviewed(playbook(), { reviewers: [A.codexJudge, A.codexJudge2] }); return ['adopt', A.owner, p.id, h.adoptInput(p)];
+  }),
+  ...[['空の理由', { reason: '' }], ['空白だけの理由', { reason: '　 ' }], ['理由が文字列でない', { reason: true }], ['形が違う（文字列）', '急ぎ'], ['知らない欄', { reason: '急ぎ', approve: true }]].map(([name, w], k) => scenario(`IM-A${65 + k}`, 'attack', `I-1：系統の要求の解除を、${name}で通す`, ['IM-INPUT-SHAPE'], (im, h) => {
+    const p = h.reviewed(playbook(), { reviewers: [A.codexJudge] }); return ['adopt', A.owner, p.id, h.adoptInput(p, 'p0.4', { cross_lineage_waiver: w })];
+  })),
+  ...['codex', 'ＣＯＤＥＸ'].map((lin, k) => scenario(`IM-A${70 + k}`, 'attack', `I-1（同じ根）：差し戻された提案者が、系統を「${lin}」と申告して同じ target に出し直す`, ['IM-CR-STICKY'], (im, h) => {
+    crBase(im, h); const q = h.reviewed(pbT(T1, { content: '試験は任意。' }), { proposer: { ...A.claude, lineage: lin }, reviewers: [A.codexJudge2, A.judge] });
+    return ['adopt', A.owner, q.id, h.adoptInput(q)];
+  })),
   // ---- 良性 ----
+  scenario('IM-B17', 'benign', 'im.v5：系統を codex と申告した提案でも、claude と codex の両方の司法の承認で採用できる', [], (im, h) => {
+    const p = h.reviewed(playbook(), { proposer: { ...A.claude, lineage: 'codex' }, reviewers: [A.judge, A.codexJudge] }); return ['adopt', A.owner, p.id, h.adoptInput(p)];
+  }),
+  scenario('IM-B18', 'benign', 'im.v5：片方の系統の司法が使えないとき、オーナーが理由を記録して解き、1 系統の承認で採用する', [], (im, h) => {
+    const p = h.reviewed(playbook(), { reviewers: [A.codexJudge] }); return ['adopt', A.owner, p.id, h.adoptInput(p, 'p0.4', { cross_lineage_waiver: { reason: 'claude の judge が停止中。codex の承認で足りると判断' } })];
+  }),
   scenario('IM-B14', 'benign', 'E-2：Claude の提案者の緩める法律の変更を、憲法審査（claude）＋ codex の judge ＋オーナーの採用で正直に通す', [], (im, h) => {
     const p = h.reviewed(law(mut((c) => cap(c, 'CAP-LAW-WRITE').allowed.push('worker'))), { reviewers: [A.codexConst, A.codexJudge] }); return ['adopt', A.owner, p.id, h.adoptInput(p)];
   }),
-  scenario('IM-B15', 'benign', 'E-2：codex の提案者の手順を、claude の judge の審査で採用する', [], (im, h) => { const p = h.reviewed(playbook(), { proposer: A.codexWorker, reviewers: [A.judge] }); return ['adopt', A.owner, p.id, h.adoptInput(p)]; }),
+  scenario('IM-B15', 'benign', 'im.v5：codex の提案者の手順を、claude と codex の judge の審査で採用する', [], (im, h) => { const p = h.reviewed(playbook(), { proposer: A.codexWorker, reviewers: [A.judge, A.codexJudge2] }); return ['adopt', A.owner, p.id, h.adoptInput(p)]; }),
   scenario('IM-B16', 'benign', 'E-3：人のオーナーが評価の証拠を出す', [], (im, h) => { const p = h.propose(); return ['evaluate', { role: 'owner', kind: 'human', id: 'owner-2' }, p.id, { digest: p.digest, evidence: { conformance: GOOD } }]; }),
   scenario('IM-B13', 'benign', 'im.v3：設定を変えて開き直した記録を、オーナーの移行の記録の後に使い続ける', [], (im, h, file) => {
     h.propose();
@@ -248,11 +273,11 @@ export const SCENARIOS = [
   scenario('IM-B7', 'benign', '経験の昇格を別系統の司法が審査する', [], (im, h) => { const p = h.propose({ title: '経験の昇格', tier: 'experience', target: { item: 'EXP-7' }, content: { promote: 'EXP-7' } }); h.evaluate(p); return ['review', A.codexJudge, p.id, h.reviewInput(p)]; }),
   scenario('IM-B8', 'benign', '取り下げで空いた枠に新しく提案する', [], (im, h) => { const ps = []; for (let i = 0; i < 5; i++) ps.push(h.propose(playbook({ title: `提案${i}` }))); im.withdraw(A.claude, ps[0].id); return ['propose', A.claude, null, playbook({ title: '6件目' })]; }),
   scenario('IM-B9', 'benign', 'F4：差し戻しを直し、差し戻した審査者の承認で採用される', [], (im, h) => {
-    const p = h.reviewed(playbook({ content: '試験は任意' }), { verdict: 'CHANGES_REQUIRED' }); im.amend(A.claude, p.id, playbook({ content: '試験を先に書く' })); h.evaluate(p); h.review(p, A.codexJudge2); h.review(p, A.codexJudge);
+    const p = h.reviewed(playbook({ content: '試験は任意' }), { verdict: 'CHANGES_REQUIRED' }); im.amend(A.claude, p.id, playbook({ content: '試験を先に書く' })); h.evaluate(p); h.review(p, A.codexJudge2); h.review(p, A.codexJudge); h.review(p, A.judge);
     return ['adopt', A.owner, p.id, h.adoptInput(p)];
   }),
   scenario('IM-B10', 'benign', 'N2：系統の衝突で行き止まりの差し戻しを、オーナーが理由つきで解いて採用する', [], (im, h) => {
-    crBase(im, h, { name: 'w' }); const q = h.reviewed(pbT({ name: 'w' }), { proposer: A.codexWorker, reviewers: [{ ...A.judge, id: 'claude-judge-2' }] });
+    crBase(im, h, { name: 'w' }); const q = h.reviewed(pbT({ name: 'w' }), { proposer: A.codexWorker, reviewers: [{ ...A.judge, id: 'claude-judge-2' }, A.codexJudge2] });
     im.dismissChangesRequired(A.owner, q.id, { reviewer: 'codex-judge-1', reason: '系統が衝突して審査できない' });
     return ['adopt', A.owner, q.id, h.adoptInput(q)];
   }),

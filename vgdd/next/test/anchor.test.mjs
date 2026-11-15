@@ -11,7 +11,7 @@ import {
   normReceipt, manifestProblem, replay, DEFAULT_LIMITS,
 } from '../anchor.mjs';
 import {
-  A, tmp, rm, world, rechain, rechainAnchors, writePlain, writeDir, writeToolCalls, appendPlain, benchAnchor, SCENARIOS,
+  A, tmp, rm, world, rechain, rechainAnchors, writePlain, writeDir, writeToolCalls, appendPlain, appendChainRec, appendLedger, benchAnchor, SCENARIOS,
 } from '../bench/scenarios-anchor.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -587,4 +587,192 @@ test('ガードの純度：snapshot の文脈に対して、検査は状態を�
   assert.equal(an.state().rows, 0);
   for (const bad of [null, undefined, 5, 'x', [], { op: 'snapshot', state: 5 }, { op: 'receipt', input: null }, { op: 'epoch', input: { drops: 'x' } }]) assert.doesNotThrow(() => check(bad));
   assert.equal(canonical(anchorOf({ a: 1 })).startsWith('"sha256:'), true);
+}));
+
+// ---------------------------------------------------------------------------
+// 4 回目の独立した審査（B1）の発見の判例。どれも、直す前の版で落ちることを確かめてから直した
+// ---------------------------------------------------------------------------
+const viol = (fn) => { try { fn(); } catch (e) { assert.ok(e instanceof Refused, String(e)); return e.violations || []; } return assert.fail('止まるはずが通った'); };
+const ROOT = !!(process.getuid && process.getuid() === 0);
+
+test('N-1：設定の写しと違う設定（別のパス・表記ゆれのパス・上限）で開いた照合は ok にならない。受け入れは引数で明示し、結果に残す', () => withWorld((w, dir) => {
+  const an = w.open(); an.snapshot(A.runner);
+  const copy = path.join(dir, 'copy-rulings.jsonl'); fs.copyFileSync(w.files.rulings, copy);
+  fs.writeFileSync(w.files.rulings, fs.readFileSync(w.files.rulings, 'utf8').replace(/pl/, 'XX')); // 書き換え
+  assert.equal(an.verify().ok, false);
+  const redirect = w.sources.map((s) => (s.name === 'rulings' ? { ...s, path: copy } : s));
+  const r = w.open({ sources: redirect });
+  const v = r.verify();
+  assert.equal(v.ok, false, '書き換える前の写しに向けて開いても ok にしない');
+  assert.deepEqual(guardsOf(v), ['AN-CFG-COPY']);
+  assert.equal(v.record.config_matches, false); assert.equal(v.config_mismatch_accepted, false);
+  // 表記ゆれ：大文字のパス（大文字小文字を区別しない FS では同じファイル）・上限だけ違う
+  const upper = w.sources.map((s) => (s.name === 'rulings' ? { ...s, path: s.path.replace('/z3/', '/Z3/') } : s));
+  assert.ok(guardsOf(w.open({ sources: upper }).verify()).includes('AN-CFG-COPY'));
+  // 受け入れは true だけ（文字列・数・オブジェクトは受け入れない）
+  for (const bad of ['true', 1, {}, null]) assert.equal(r.verify({ allowConfigMismatch: bad }).ok, false, String(bad));
+  const acc = r.verify({ allowConfigMismatch: true });
+  assert.equal(acc.ok, true); assert.equal(acc.config_mismatch_accepted, true);
+  assert.match(acc.notes.join(' '), /受け入れ/);
+  // 陽性の対照：同じ設定の照合は、受け入れの印なしで通る
+  fs.copyFileSync(copy, w.files.rulings);
+  const v0 = w.open().verify(); assert.equal(v0.ok, true); assert.equal(v0.config_mismatch_accepted, false);
+  assert.deepEqual(guardsOf(w.open({ limits: { maxDirFiles: 100 } }).verify()), ['AN-CFG-COPY'], '上限だけ違う設定も食い違い');
+  // オーナーの epoch で設定の変更を受け入れた後は、引数なしで通る
+  r.epoch(A.owner, { reason: '裁定の記録の置き場所を移した' });
+  assert.equal(r.verify().ok, true);
+}));
+
+test('N-2：dir の入れ子のフォルダの中身も固定する（上限つきの再帰）。書き換え・削除・種類の差し替えは検出し、足すのは通す', () => withWorld((w) => {
+  const sub = path.join(w.files.verdicts, 'sub'); fs.mkdirSync(sub);
+  fs.writeFileSync(path.join(sub, 'v.json'), '{"verdict":"reject"}\n');
+  const deeper = path.join(sub, 'deeper'); fs.mkdirSync(deeper); fs.writeFileSync(path.join(deeper, 'w.json'), '{}');
+  const an = w.open(); an.snapshot(A.runner);
+  const names = an.state().anchors[0].manifest.sources.find((s) => s.name === 'verdicts').entries.map((e) => e[0]);
+  assert.ok(names.includes('sub/v.json') && names.includes('sub/deeper/w.json') && names.includes('sub'), names.join(','));
+  // 足すのは正当
+  fs.writeFileSync(path.join(sub, 'added.json'), '{}'); fs.mkdirSync(path.join(sub, 'newdir'));
+  assert.equal(an.verify().ok, true);
+  assert.equal(an.snapshot(A.runner).flagged, false);
+  // 入れ子の中の書き換え
+  fs.writeFileSync(path.join(sub, 'v.json'), '{"verdict":"approve"}\n');
+  let v = an.verify(); assert.equal(v.ok, false); assert.deepEqual(guardsOf(v), ['AN-DIR-ENTRIES']);
+  const s = an.snapshot(A.runner); assert.equal(s.flagged, true); assert.ok(s.regressions.some((g) => g.code === 'entry_rewritten'), JSON.stringify(s.regressions));
+  // 入れ子の中の削除
+  fs.rmSync(path.join(deeper, 'w.json'));
+  v = an.verify(); assert.equal(v.ok, false); assert.ok(v.findings.some((f) => f.status === 'entries_deleted'));
+  // 入れ子のフォルダを記号リンクに差し替える（たどらない）
+  fs.rmSync(deeper, { recursive: true }); fs.symlinkSync(w.files.verdicts, deeper);
+  v = an.verify(); assert.equal(v.ok, false);
+}));
+
+test('N-2：入れ子が深すぎる・入れ子を含めたファイルの数が上限を超える dir は固定しない', () => withWorld((w) => {
+  let p = w.files.verdicts; for (let i = 0; i < 10; i += 1) { p = path.join(p, `d${i}`); fs.mkdirSync(p); }
+  fs.writeFileSync(path.join(p, 'x.json'), '{}');
+  const vs = viol(() => w.open().snapshot(A.runner));
+  assert.ok(vs.some((x) => x.guard === 'AN-SIZE-LIMIT' && /dir_too_deep/.test(x.reason)), JSON.stringify(vs));
+  fs.rmSync(path.join(w.files.verdicts, 'd0'), { recursive: true });
+  // 深さは上限の中、数で超える（直下 5 + 入れ子 3 + フォルダ 1 > 8）
+  const sub = path.join(w.files.verdicts, 'sub'); fs.mkdirSync(sub); for (let i = 0; i < 3; i += 1) fs.writeFileSync(path.join(sub, `${i}.json`), '{}');
+  const vs2 = viol(() => w.open({ limits: { maxDirFiles: 8 } }).snapshot(A.runner));
+  assert.ok(vs2.some((x) => x.guard === 'AN-SIZE-LIMIT' && /too_many_files/.test(x.reason)), JSON.stringify(vs2));
+  // 陽性の対照：上限の中なら通る
+  assert.doesNotThrow(() => w.open({ limits: { maxDirFiles: 9 } }).snapshot(A.runner));
+}));
+
+test('N-3：読み取りの最中の正当な追記 1 回では、壊れた鎖を固定しない（head を先に読む。合わなければ 1 回だけ読み直す）', () => {
+  for (const [key, app] of [['trace', appendChainRec], ['ledger', appendLedger]]) {
+    for (const at of ['open', 'fstat']) {
+      withWorld((w) => {
+        const an = w.open(); an.snapshot(A.runner);
+        const oOpen = fs.openSync; const oStat = fs.fstatSync; let target = null; let done = false;
+        fs.openSync = function (p, ...r) {
+          const fd = oOpen.call(fs, p, ...r);
+          if (!done && p === w.files[key] && typeof r[0] === 'number') { if (at === 'open') { done = true; app(w.files[key], 1); } else target = fd; }
+          return fd;
+        };
+        fs.fstatSync = function (fd, ...r) { const st = oStat.call(fs, fd, ...r); if (!done && fd === target) { done = true; target = null; app(w.files[key], 1); } return st; };
+        let s; try { s = an.snapshot(A.runner); } finally { fs.openSync = oOpen; fs.fstatSync = oStat; }
+        assert.equal(done, true, `${key}/${at}：追記を差し込めた`);
+        assert.deepEqual(s.broken_chains, [], `${key}/${at}`); assert.equal(s.flagged, false, `${key}/${at} ${JSON.stringify(s.regressions)}`);
+        assert.ok(an.state().anchors.every((x) => x.regressions.length === 0));
+        assert.equal(an.verify().ok, true);
+      });
+    }
+  }
+  // 陰性の対照：本当に head と合わない記録は、読み直しても壊れとして固定する
+  withWorld((w) => {
+    const an = w.open(); an.snapshot(A.runner);
+    fs.writeFileSync(path.join(path.dirname(w.files.ledger), 'ledger.head'), `${JSON.stringify({ seq: 999, hash: 'f'.repeat(64) })}\n`);
+    fs.writeFileSync(`${w.files.trace}.head`, `${JSON.stringify({ seq: 2, hash: 'e'.repeat(64) })}\n`);
+    const s = an.snapshot(A.runner);
+    assert.deepEqual(s.broken_chains.map((b) => [b.name, b.code]).sort(), [['ledger', 'head_mismatch'], ['trace', 'head_mismatch']]);
+  });
+});
+
+test('N-4：読めない・ない状態を 1 回はさんでも、次の固定は、最後に読めた時点と比べて食い違いに入れる', { skip: ROOT }, () => withWorld((w) => {
+  const an = w.open(); an.snapshot(A.runner);
+  fs.chmodSync(w.files.rulings, 0o000);
+  let s = an.snapshot(A.runner);
+  assert.deepEqual(s.regressions.map((g) => [g.name, g.code]), [['rulings', 'source_unreadable']]);
+  fs.chmodSync(w.files.rulings, 0o644);
+  fs.writeFileSync(w.files.rulings, 'forged\n'); // 切り詰めて書き換え
+  s = an.snapshot(A.runner);
+  assert.equal(s.flagged, true); assert.deepEqual(s.regressions.map((g) => [g.name, g.code]), [['rulings', 'truncated']]);
+  // 同じ長さ以上の書き換え（rewritten）・記録が一度なくなった（absent）場合
+  const w2 = world(path.join(w.dir, 'w2'), 10); const an2 = w2.open(); an2.snapshot(A.runner);
+  const keep = fs.readFileSync(w2.files.spec_approvals, 'utf8');
+  fs.rmSync(w2.files.spec_approvals);
+  assert.deepEqual(an2.snapshot(A.runner).regressions.map((g) => g.code), ['source_gone']);
+  fs.writeFileSync(w2.files.spec_approvals, keep.replace('"pl"', '"xx"') + '{"more":1}\n');
+  assert.deepEqual(an2.snapshot(A.runner).regressions.map((g) => [g.name, g.code]), [['spec_approvals', 'rewritten']]);
+  // 陽性の対照：読めない間に伸びただけなら、食い違いなし
+  const w3 = world(path.join(w.dir, 'w3'), 10); const an3 = w3.open(); an3.snapshot(A.runner);
+  fs.chmodSync(w3.files.rulings, 0o000); an3.snapshot(A.runner); fs.chmodSync(w3.files.rulings, 0o644);
+  appendPlain(w3.files.rulings, 4);
+  const s3 = an3.snapshot(A.runner); assert.equal(s3.flagged, false, JSON.stringify(s3.regressions));
+}));
+
+test('N-5：anchor の記録自身・関連のファイル・それを含むフォルダは、大文字小文字を変えても対象にできない', () => withWorld((w) => {
+  const f = w.anchorsFile; const d = path.dirname(f);
+  const bad = [
+    [f.replace('anchors.jsonl', 'ANCHORS.jsonl'), 'plain'], [f.replace('/anchors/', '/Anchors/'), 'plain'], [`${f}.HEAD`, 'plain'], [`${f}.Lock`, 'plain'],
+    [`${f}.recovery.jsonl`, 'plain'], [`${f}.torn-20261115-1`, 'plain'], [`${f}.head.tmp`, 'plain'],
+    [d, 'dir'], [d.toUpperCase(), 'dir'], [path.dirname(d), 'dir'],
+  ];
+  for (const [p, kind] of bad) {
+    assert.ok(normalizeConfig({ sources: [{ name: 'self', path: p, kind }] }, f).errors.path.length > 0, p);
+    refusedBy(() => w.open({ sources: [{ name: 'self', path: p, kind }] }).snapshot(A.runner), 'AN-PATH-SAFE');
+  }
+  // 陽性の対照：名前が似ているだけの別のファイル・隣のフォルダは対象にできる
+  for (const [p, kind] of [[`${f}2`, 'plain'], [path.join(d, 'anchors-old.jsonl'), 'plain'], [`${d}x`, 'dir'], [path.join(path.dirname(d), 'z3'), 'dir']]) {
+    assert.deepEqual(normalizeConfig({ sources: [{ name: 'other', path: p, kind }] }, f).errors.path, [], p);
+  }
+  fs.mkdirSync(`${d}x`); fs.writeFileSync(path.join(`${d}x`, 'a.json'), '{}');
+  assert.doesNotThrow(() => w.open({ sources: [{ name: 'other', path: `${d}x`, kind: 'dir' }] }).snapshot(A.runner));
+}));
+
+test('変異の生き残り #14：鎖は正しいが規則に合わない行がある記録は、外に出さない。epoch で受け入れた後は出す', () => withWorld((w) => {
+  const an = w.open(); const s = an.snapshot(A.runner); an.snapshot(A.runner);
+  assert.equal(an.externalView(s.anchor).anchor, s.anchor);
+  rechainAnchors(w.anchorsFile, (rows) => { rows[1] = { ...rows[1], actor: A.worker }; });
+  assert.equal(an.verify().record.chain_ok, true);
+  refusedByCode(() => an.externalView(s.anchor), 'record_unsound');
+  an.epoch(A.owner, { reason: '偽の行を確認した' });
+  assert.equal(an.externalView(s.anchor).anchor, s.anchor);
+}));
+
+test('変異の生き残り #16・#6：dir のファイルの大きさの上限、記号リンクの拒否の理由（lstat で見つける）', () => withWorld((w) => {
+  fs.writeFileSync(path.join(w.files.verdicts, 'VRD-big.json'), 'x'.repeat(200));
+  const vs = viol(() => w.open({ limits: { maxDirFileBytes: 100 } }).snapshot(A.runner));
+  assert.ok(vs.some((x) => x.guard === 'AN-SIZE-LIMIT' && /verdicts:dir_file_too_large/.test(x.reason)), JSON.stringify(vs));
+  assert.doesNotThrow(() => w.open({ limits: { maxDirFileBytes: 200 } }).snapshot(A.runner));
+  const real = `${w.files.rulings}.real`; fs.renameSync(w.files.rulings, real); fs.symlinkSync(real, w.files.rulings);
+  const vs2 = viol(() => w.open({ limits: { maxDirFileBytes: 200 } }).snapshot(A.runner));
+  assert.ok(vs2.some((x) => x.guard === 'AN-NO-SYMLINK' && /rulings:symlink/.test(x.reason)), JSON.stringify(vs2));
+}));
+
+test('変異の生き残り #8：lstat と open の間に別のファイルへ差し替えられたら、固定しない（i-node の照合）', () => withWorld((w) => {
+  const swap = `${w.files.rulings}.swap`; fs.writeFileSync(swap, fs.readFileSync(w.files.rulings));
+  const oOpen = fs.openSync; let done = false;
+  fs.openSync = function (p, ...r) { if (!done && p === w.files.rulings && typeof r[0] === 'number') { done = true; fs.renameSync(swap, w.files.rulings); } return oOpen.call(fs, p, ...r); };
+  let vs; try { vs = viol(() => w.open().snapshot(A.runner)); } finally { fs.openSync = oOpen; }
+  assert.equal(done, true);
+  assert.ok(vs.some((x) => x.guard === 'AN-NO-SYMLINK' && /rulings:changed_while_opening/.test(x.reason)), JSON.stringify(vs));
+  assert.doesNotThrow(() => w.open().snapshot(A.runner)); // 差し替えがなければ通る
+}));
+
+test('N-2：入れ子のフォルダを読んでいる間に記号リンクへ差し替えられたら、固定しない（readdir の後の i-node の照合）', () => withWorld((w) => {
+  const sub = path.join(w.files.verdicts, 'sub'); fs.mkdirSync(sub); fs.writeFileSync(path.join(sub, 'v.json'), '{}');
+  const oRd = fs.readdirSync; let done = false;
+  fs.readdirSync = function (p, ...r) {
+    const out = oRd.call(fs, p, ...r);
+    if (!done && p === sub) { done = true; fs.renameSync(sub, `${sub}.real`); fs.symlinkSync(`${sub}.real`, sub); }
+    return out;
+  };
+  let vs; try { vs = viol(() => w.open().snapshot(A.runner)); } finally { fs.readdirSync = oRd; }
+  assert.equal(done, true);
+  assert.ok(vs.some((x) => x.guard === 'AN-NO-SYMLINK' && /verdicts:changed_while_opening/.test(x.reason)), JSON.stringify(vs));
+  fs.rmSync(sub); fs.renameSync(`${sub}.real`, sub);
+  assert.doesNotThrow(() => w.open().snapshot(A.runner)); // 差し替えがなければ通る
 }));

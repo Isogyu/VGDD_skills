@@ -53,7 +53,8 @@ import {
 
 export const RECORD_TYPE = 'vgdd.runstate.v1';
 /** 規則の版。ガードの規則を変えるたびに上げる。各行に rules として記録する（improvement.mjs と同じ。epoch で古い行を覆う） */
-export const RULES = 'rs.v3'; // rs.v3：RS-PROTECTED を作業に入る出来事にも広げ、RS-WORK-ITEM-ID を新しい id だけにした（独立した審査 E-7・E-8）
+export const RULES = 'rs.v4'; // rs.v4：保護と重なる節の submit・verdict・release を blocked（protected）にし、裁定・置き換えの扱いを足した（独立した審査 4 回目 R-1）。
+// rs.v3：RS-PROTECTED を作業に入る出来事にも広げ、RS-WORK-ITEM-ID を新しい id だけにした（独立した審査 E-7・E-8）
 export const MAX_EVENTS = 20000;
 /** 人（human）の出来事のために取っておく枠。人以外の出来事は、MAX_EVENTS - HUMAN_RESERVE に達したら拒む（行政が使い切ってオーナーの stop・epoch を塞がない） */
 export const HUMAN_RESERVE = 2000;
@@ -261,7 +262,7 @@ export function defDigestOf(d) {
 function newNode(d, gen = 0) {
   return { id: d.id, depends_on: [...d.depends_on], resources: [...d.resources], risk: d.risk ?? null, security_review: d.security_review === true, requirements: [...(d.requirements || [])], def_digest: defDigestOf(d), gen,
     status: 'ready', approval: null, attempts: 0, returns: 0, extra_returns: 0, extra_attempts: 0, extra_unavailable: 0, annulled: 0, unavail: {}, lease_until: null, request: null,
-    blocked_reason: null, superseded_by: null, started_by: null, assignee: null, merge: null, requests: [], requests_dropped: 0 };
+    blocked_reason: null, superseded_by: null, started_by: null, assignee: null, merge: null, requests: [], requests_dropped: 0, rule_merge_ok: false };
 }
 /** 申請の履歴に1件足す（指紋・結果の種類・記録の時刻）。上限を超えたら古いものから落とす */
 function withHistory(n, request, kind, at) {
@@ -329,6 +330,7 @@ const securityFailed = (verdicts) => secOf(verdicts).some((v) => v.verdict === '
 /**
  * @param {{ node, ev, cfg, at }} i  node は今の節、ev は正規化済みの verdict の出来事
  * @returns {{ kind, to, patch }}  kind: pass | pass_minor_disagreement | return | unavailable | blocked_returns | blocked_attempts | blocked_disagreement | blocked_unavailable
+ *   （保護と重なる節の blocked_protected は decide の外、computeResult が決める）
  */
 export function decide({ node, ev, cfg, at }) {
   // 差し戻しの上限に達した票の申請は、司法を見ずに blocked（SPEC §5。gate-runner の MAX_RETURNS の前検査）
@@ -371,6 +373,22 @@ const tgMemo = new WeakMap();
 /** この出来事の taskgraph 用の節の一覧（出来事ごとに1回だけ作る） */
 function tgBase(ctx) { let n = tgMemo.get(ctx); if (!n) { n = tgNodes(ctx.state); tgMemo.set(ctx, n); } return n; }
 
+/** 節の範囲が今の protected と重なれば理由の文字列、重ならなければ null（範囲は NFKC にしてから比べる。扱えない形の範囲は RS-PLAN-RESOURCES が止める） */
+function protectedHit(d, cfg) {
+  if (!d || !Array.isArray(cfg.protected) || cfg.protected.length === 0) return null;
+  for (const r of d.resources) for (const p of cfg.protected) if (parsePattern(r) && overlap(r.normalize('NFKC'), p)) return `節 ${d.id} の範囲 ${r.slice(0, 60)} が保護された範囲 ${p} と重なる`;
+  return null;
+}
+/** 保護と重なる作業中の節の id（config の戻り値で知らせる。並びは計画の順） */
+function protectedBusy(st, cfg) { return st.order.filter((id) => { const n = st.nodes.get(id); return BUSY.has(n.status) && !n.superseded_by && protectedHit(n, cfg) !== null; }); }
+/** 審査の結果のうち、オーナーの裁定（rule の merge）で統合してよいもの（合格と、判定が分かれたもの。今の設計の裁定の範囲） */
+const RULE_MERGE_KINDS = new Set(['pass', 'pass_minor_disagreement', 'blocked_disagreement']);
+/**
+ * 保護と重なる節の submit・verdict・release の結果（R-1）：状態を blocked（blocked_reason: 'protected'）にし、作業に戻さず統合もしない。
+ * rule_merge_ok は、この申請が審査に合格していた（または判定が分かれた）か。true のときだけオーナーの rule の merge で統合できる
+ */
+const protectedBlock = (op, node, extra) => ({ op, node, kind: 'blocked_protected', to: 'blocked', patch: { blocked_reason: 'protected', lease_until: null, ...extra } });
+
 /** 出来事の結果（状態をどう変えるか）。出来事が読めない・節がないときは null（その場合は他のガードが拒む） */
 function computeResult(ctx) {
   const v = view(ctx);
@@ -382,24 +400,29 @@ function computeResult(ctx) {
   const node = NODE_OPS.has(ev.op) ? st.nodes.get(ev.node) : undefined;
   if (NODE_OPS.has(ev.op) && !node) return null;
   switch (ev.op) {
-    case 'config': { const { op: _o, event_id: _e, reason: _r, ...c } = ev; return { op: 'config', config: c }; }
+    case 'config': { const { op: _o, event_id: _e, reason: _r, ...c } = ev; return { op: 'config', config: c, protected_busy: protectedBusy(st, c) }; }
     case 'clock_reset': return { op: 'clock_reset' };
     case 'plan': return { op: 'plan', add: ev.nodes, supersede: ev.supersede || [] };
     case 'approve': return { op: 'approve', node: ev.node, to: node.status, patch: { approval: { spec_digest: ev.spec_digest, policy_line: ev.policy_line, def_digest: ev.def_digest } } };
     case 'start': return { op: 'start', node: ev.node, to: 'in_progress', patch: { attempts: node.attempts + 1, lease_until: at + ev.lease_sec * 1000, started_by: v.actor ? v.actor.id : null, assignee: ev.assignee ?? null, request: null } };
-    case 'submit': return { op: 'submit', node: ev.node, to: 'review', patch: { request: ev.request } };
+    case 'submit': return protectedHit(node, cfg)
+      ? protectedBlock('submit', ev.node, { request: ev.request, rule_merge_ok: false })
+      : { op: 'submit', node: ev.node, to: 'review', patch: { request: ev.request } };
     case 'verdict': {
       const d = decide({ node, ev, cfg, at });
+      if (protectedHit(node, cfg)) return protectedBlock('verdict', ev.node, { rule_merge_ok: RULE_MERGE_KINDS.has(d.kind), ...withHistory(node, ev.request, 'blocked_protected', at) });
       // 申請の履歴：使えない審査（unavailable）は申請が審査の待ちのまま残るので、履歴に入れない
       const hist = d.kind === 'unavailable' ? {} : withHistory(node, ev.request, d.kind, at);
       return { op: 'verdict', node: ev.node, kind: d.kind, to: d.to, patch: { ...d.patch, ...hist, ...(d.to === 'merged' ? { merge: ev.merge ?? null } : {}) } };
     }
-    case 'release': return { op: 'release', node: ev.node, to: 'merged', patch: { lease_until: null, merge: ev.merge ?? null, ...withHistory(node, ev.request, 'release', at) } };
+    case 'release': return protectedHit(node, cfg)
+      ? protectedBlock('release', ev.node, { rule_merge_ok: true, ...withHistory(node, ev.request, 'blocked_protected', at) }) // held は合格済みの申請
+      : { op: 'release', node: ev.node, to: 'merged', patch: { lease_until: null, merge: ev.merge ?? null, ...withHistory(node, ev.request, 'release', at) } };
     case 'rule': return ev.decision === 'merge'
-      ? { op: 'rule', node: ev.node, to: 'merged', patch: { blocked_reason: null, lease_until: null, merge: ev.merge ?? null, ...withHistory(node, ev.request, 'rule_merge', at) } }
-      : { op: 'rule', node: ev.node, to: 'in_progress', patch: { returns: node.returns + 1, attempts: node.attempts + 1, lease_until: at + cfg.lease_sec * 1000, request: null, blocked_reason: null, ...withHistory(node, ev.request, 'rule_return', at) } };
+      ? { op: 'rule', node: ev.node, to: 'merged', patch: { blocked_reason: null, rule_merge_ok: false, lease_until: null, merge: ev.merge ?? null, ...withHistory(node, ev.request, 'rule_merge', at) } }
+      : { op: 'rule', node: ev.node, to: 'in_progress', patch: { returns: node.returns + 1, attempts: node.attempts + 1, lease_until: at + cfg.lease_sec * 1000, request: null, blocked_reason: null, rule_merge_ok: false, ...withHistory(node, ev.request, 'rule_return', at) } };
     case 'unblock': return { op: 'unblock', node: ev.node, to: 'ready', patch: { extra_returns: node.extra_returns + (ev.extra_returns || 0), extra_attempts: node.extra_attempts + (ev.extra_attempts || 0),
-      extra_unavailable: node.extra_unavailable + (ev.extra_unavailable || 0), blocked_reason: null, lease_until: null, request: null, started_by: null, assignee: null } };
+      extra_unavailable: node.extra_unavailable + (ev.extra_unavailable || 0), blocked_reason: null, rule_merge_ok: false, lease_until: null, request: null, started_by: null, assignee: null } };
     case 'annul': return { op: 'annul', node: ev.node, to: node.status, patch: { returns: Math.max(0, node.returns - 1), annulled: node.annulled + 1 } };
     case 'expire': {
       const exhausted = node.attempts >= attemptLimit(node, cfg);
@@ -421,9 +444,9 @@ function resultOf(ctx) {
 const nodeOf = (ctx, ev) => (ev && NODE_OPS.has(ev.op) ? ctx.state.nodes.get(ev.node) : undefined);
 /** op → (前の状態 → 行ける後の状態)。approve・annul は状態を変えない（どの状態からでも、同じ状態のまま） */
 const TRANSITIONS = {
-  start: { ready: ['in_progress'] }, submit: { in_progress: ['review'] },
+  start: { ready: ['in_progress'] }, submit: { in_progress: ['review', 'blocked'] }, // submit の blocked は保護と重なる節だけ（RS-PROTECTED）
   verdict: { review: ['review', 'in_progress', 'held', 'merged', 'blocked'] },
-  release: { held: ['merged'] }, rule: { blocked: ['merged', 'in_progress'] }, unblock: { blocked: ['ready'] },
+  release: { held: ['merged', 'blocked'] }, rule: { blocked: ['merged', 'in_progress'] }, unblock: { blocked: ['ready'] },
   expire: { in_progress: ['ready', 'blocked'] },
 };
 /** 設定の変更が「緩める」か（上限を上げる・hold を外す・必須の審査を減らす・系統の縛りを外す）。締める変更はいつでも許す */
@@ -576,12 +599,21 @@ export const GUARDS = {
   // オーナーの plan も同じ（統治の核の変更は、実行の記録でなく法律の改正の手続きで行う）
   // 計画の後に config で保護を足しても、計画済みの節を動かさない：start・unblock・rule の return（作業に入る出来事）でも、節の範囲を今の protected と比べる
   // （独立した審査 E-7）。重なる節は、オーナーが置き換えるか protected を見直す
+  // 作業中の節も同じ（独立した審査 4 回目 R-1）：submit・verdict（合格・差し戻しのどちらも）・release の結果は、重なれば blocked（blocked_reason: 'protected'）でなければならない。
+  // そのあとの統合は、オーナーの rule の merge だけで、審査に合格した（または判定が分かれた）申請に限る（rule_merge_ok）。
+  // 審査に合格していない申請は、置き換え（オーナー）か、保護を見直した後の unblock で出る
   'RS-PROTECTED': (ctx) => {
-    const { ev, node, cfg } = gp(ctx);
-    if (!ev || !Array.isArray(cfg.protected) || cfg.protected.length === 0) return null; // 扱えない形の範囲は RS-PLAN-RESOURCES が止める
-    const hit = (d) => { for (const r of d.resources) for (const p of cfg.protected) if (parsePattern(r) && overlap(r.normalize('NFKC'), p)) return `節 ${d.id} の範囲 ${r.slice(0, 60)} が保護された範囲 ${p} と重なる`; return null; };
-    if (ev.op === 'plan') { for (const d of ev.nodes) { const h = hit(d); if (h) return h; } return null; }
-    if (node && (ev.op === 'start' || ev.op === 'unblock' || (ev.op === 'rule' && ev.decision === 'return'))) return hit(node);
+    const { ev, node, res, cfg } = gp(ctx);
+    if (!ev) return null;
+    if (ev.op === 'plan') { for (const d of ev.nodes) { const h = protectedHit(d, cfg); if (h) return h; } return null; }
+    if (!node) return null;
+    if (ev.op === 'rule' && ev.decision === 'merge' && node.blocked_reason === 'protected' && node.rule_merge_ok !== true) return `保護と重なって止めた節の申請は、審査に合格していないので裁定で統合できない（置き換えるか、保護を見直して unblock する）: ${node.id}`;
+    if (ev.op === 'start' || ev.op === 'unblock' || (ev.op === 'rule' && ev.decision === 'return')) return protectedHit(node, cfg);
+    if (ev.op === 'submit' || ev.op === 'verdict' || ev.op === 'release') {
+      const h = protectedHit(node, cfg);
+      if (!h) return null;
+      return res && res.to === 'blocked' && res.patch && res.patch.blocked_reason === 'protected' ? null : `${h}（${ev.op} は blocked にしてオーナーの判断を待つ。結果: ${res ? res.to : '?'}）`;
+    }
     return null;
   },
   'RS-PLAN-APPEND-ONLY': (ctx) => {
@@ -608,7 +640,7 @@ export const GUARDS = {
       if (!o) return `置き換える節がない: ${p.old}`;
       if (o.status === 'merged' || o.superseded_by) return `統合済み・置き換え済みの節は置き換えられない: ${p.old}`;
       if (o.gen + 1 > MAX_SUPERSEDE_CHAIN) return `置き換えの鎖が長すぎる（上限 ${MAX_SUPERSEDE_CHAIN}）: ${p.old}`;
-      if ((o.status === 'held' || (o.status === 'blocked' && o.blocked_reason === 'disagreement')) && !human) return `オーナーの判断待ち（${o.status}）の節の置き換えはオーナーだけ（行政が判断の機会を消せない）: ${p.old}`;
+      if ((o.status === 'held' || (o.status === 'blocked' && (o.blocked_reason === 'disagreement' || o.blocked_reason === 'protected'))) && !human) return `オーナーの判断待ち（${o.status}）の節の置き換えはオーナーだけ（行政が判断の機会を消せない）: ${p.old}`;
       if (!newIds.has(p.new) || p.new === p.old) return `置き換え先はこの計画で新しく追加する別の節でなければならない: ${p.new}`;
       if (olds.has(p.old) || news.has(p.new)) return `置き換えの対応が重複している: ${p.old} → ${p.new}`;
       olds.add(p.old); news.add(p.new);
@@ -672,7 +704,7 @@ export const GUARDS = {
     const extra = ev.verdicts.map((x) => `${x.kind}:${x.lineage}`).filter((k) => !req.has(k));
     return extra.length ? `必須の審査の一覧にない審査（種類:系統）の結果がある: ${extra.join(', ')}（余分な審査者・知らない系統は拒む）` : null;
   },
-  'RS-RULE-SCOPE': (ctx) => { const { ev, node } = gp(ctx); return ev && ev.op === 'rule' && node && node.blocked_reason !== 'disagreement' ? '裁定できるのは、判定が分かれて blocked になった節だけ（ほかは unblock）' : null; },
+  'RS-RULE-SCOPE': (ctx) => { const { ev, node } = gp(ctx); return ev && ev.op === 'rule' && node && node.blocked_reason !== 'disagreement' && node.blocked_reason !== 'protected' ? '裁定できるのは、判定が分かれて blocked になった節と、保護と重なって blocked になった節だけ（ほかは unblock）' : null; },
   'RS-PASS-AUDIT': (ctx) => { const { ev, res } = gp(ctx); return ev && ev.op === 'verdict' && finalTo(res) && ev.audits !== 'passed' ? `監査が ${ev.audits} のまま合格にできない（SPEC §6-3）` : null; },
   'RS-PASS-QUORUM': (ctx) => {
     const { ev, node, res, cfg } = gp(ctx);
@@ -693,6 +725,7 @@ export const GUARDS = {
     const { ev, node, res, cfg } = gp(ctx);
     if (!ev || ev.op !== 'verdict' || !node || !res) return null;
     if (node.returns >= returnLimit(node, cfg) || ev.audits !== 'passed' || judiciaryInsufficient(ev.verdicts, requiredOf(node, cfg)) || !securityFailed(ev.verdicts)) return null;
+    if (res.kind === 'blocked_protected') return res.patch && res.patch.rule_merge_ok === true ? 'セキュリティ審査の不合格の申請を、保護の裁定で統合できる形にしない' : null;
     return res.kind === 'return' || res.kind === 'blocked_attempts' ? null : 'セキュリティ審査の不合格は、不一致・裁定より先に差し戻す（裁定で通せない）';
   },
   'RS-DISAGREE-BLOCK': (ctx) => {
@@ -758,7 +791,7 @@ export function makeCtx(state, actor, event, o = {}) {
 }
 
 // ---- 状態への反映（ガードを全部通った後だけ） ----
-const PATCH_KEYS = new Set(['approval', 'attempts', 'lease_until', 'started_by', 'assignee', 'request', 'returns', 'blocked_reason', 'unavail', 'extra_returns', 'extra_attempts', 'extra_unavailable', 'annulled', 'merge', 'requests', 'requests_dropped']);
+const PATCH_KEYS = new Set(['approval', 'attempts', 'lease_until', 'started_by', 'assignee', 'request', 'returns', 'blocked_reason', 'unavail', 'extra_returns', 'extra_attempts', 'extra_unavailable', 'annulled', 'merge', 'requests', 'requests_dropped', 'rule_merge_ok']);
 function reduce(st, actor, ev, res, at) {
   st.count += 1;
   st.last_at = at;
@@ -961,7 +994,7 @@ function openRunWith(file, nowFn, lockWaitMs) {
         cur = at === raw ? t : new Date(at).toISOString();
         const r = step(st, a, e, { at, wall });
         if (!r.ok) throw refusal(r.violations);
-        out = { node: r.res.node ? nodeView(st.nodes.get(r.res.node)) : null, kind: r.res.kind || null, to: r.res.to || null };
+        out = { node: r.res.node ? nodeView(st.nodes.get(r.res.node)) : null, kind: r.res.kind || null, to: r.res.to || null, ...(r.res.op === 'config' ? { protected_busy: r.res.protected_busy } : {}) };
       });
       applied.hashes.push(rec.hash);
       cache = applied;
@@ -1033,7 +1066,7 @@ export function memoryRun(opt = {}) {
       st.hashes.push(h);
       const { op, event_id, ...fields } = r.ev;
       rows.push({ at: new Date(at).toISOString(), body: { type: RECORD_TYPE, rules: RULES, op, event_id, actor: r.actor, ...fields } });
-      return { ok: true, duplicate: false, digest: asDigest(h), kind: r.res.kind || null, to: r.res.to || null };
+      return { ok: true, duplicate: false, digest: asDigest(h), kind: r.res.kind || null, to: r.res.to || null, ...(r.res.op === 'config' ? { protected_busy: r.res.protected_busy } : {}) };
     },
     state: () => publicState(st), next: () => nextOf(st), summary: () => summaryOf(st),
   };
