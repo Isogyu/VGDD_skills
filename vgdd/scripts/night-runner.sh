@@ -19,7 +19,7 @@
 
 set -euo pipefail
 
-REPO="${HOME}/tsubuyaki-worklog/app"; Z3="${VGDD_Z3_DIR:-${HOME}/tsubuyaki-z3}"
+REPO="${VGDD_REPO:-${HOME}/tsubuyaki-worklog/app}"; Z3="${VGDD_Z3_DIR:-${HOME}/tsubuyaki-z3}"   # p0.4.15：リポジトリは 引数 --repo ＞ 環境変数 VGDD_REPO ＞ 既定
 
 # p0.3.1：この裁判所（sandbox の外・オーナーの権限）が実行する git は、リポジトリのフックと fsmonitor を読まない（OBS-033）。
 #   作業員が共有の .git/config に設定を書いても、ここでは使われない。さらに .git/config の要約をオーナーの基準値と照合し、違えば止める
@@ -223,7 +223,7 @@ precheck() { # task, wt → 0 なら申請へ。stdout に理由
   git -C "$REPO" diff "main...$(br "$task")" | grep -nE 'sk-ant-api03-[A-Za-z0-9]{40,}|BEGIN (RSA|OPENSSH|PRIVATE)|@gmail\.com|AKIA[0-9A-Z]{16}' >/dev/null && { echo "秘密情報らしい文字列"; return 1; }
   if [ -d "$wt/node_modules" ]; then
     # p0.3.1：作業員の書いたテストは sandbox の中で実行する（OBS-034。gate-runner と同じ sandboxed-run.sh）
-    ( cd "$wt" && "$Z3/bin/sandboxed-run.sh" --dir "$wt" -- npm run -s test >/dev/null 2>&1 ) || { echo "npm test が不合格"; return 1; }
+    ( cd "$wt" && "$Z3/bin/sandboxed-run.sh" --dir "$wt" --repo "$REPO" -- npm run -s test >/dev/null 2>&1 ) || { echo "npm test が不合格"; return 1; }
   fi
   echo "OK"; return 0
 }

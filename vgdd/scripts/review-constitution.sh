@@ -13,7 +13,7 @@
 # 前提: .claude/agents/constitutional-review.md が配置済み（原本は vgdd/agents/）。claude CLI。
 
 set -euo pipefail
-REASON=""; BASE="HEAD"; OUT_DIR="${HOME}/tsubuyaki-z3/evidence/verdicts"; DRY=0; FILES=()
+REASON=""; BASE="HEAD"; OUT_DIR="${VGDD_Z3_DIR:-${HOME}/tsubuyaki-z3}/evidence/verdicts"; DRY=0; FILES=()   # p0.4.15：既定の出力先も VGDD_Z3_DIR を見る
 while [ $# -gt 0 ]; do
   case "$1" in
     --reason) REASON="$2"; shift 2;;

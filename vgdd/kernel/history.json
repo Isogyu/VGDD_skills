@@ -1,6 +1,6 @@
 {
   "schema": "vgdd.law-history.v1",
-  "note": "法律（vgdd/）の版ごとの公開の要約。立法補佐が版ごとに書き、オーナーの承認で入る。found_by は穴を見つけた主体（executive_head＝行政の長、legislative＝立法補佐、codex＝Codex の監査、judge＝Claude の司法、owner＝オーナー、operation＝運用の記録）。prev_failed は、その版で足した判例を前の版にかけて落ちた件数（空回りしていないことの証拠。測っていなければ null）",
+  "note": "法律（vgdd/）の版ごとの公開の要約。立法補佐が版ごとに書き、オーナーの承認で入る。found_by は穴を見つけた主体（executive_head＝行政の長、legislative＝立法補佐、codex＝Codex の監査、judge＝Claude の司法、owner＝オーナー、operation＝運用の記録、review＝独立した審査（立法補佐の依頼で別の主体が行った点検。Codex の監査を除く）、research＝外部の調査の結果を、立法補佐が公式の文書（一次資料）で確かめたもの（文書の確認で、実機の確認ではない））。prev_failed は、その版で足した判例を前の版にかけて落ちた件数（空回りしていないことの証拠。測っていなければ null）",
   "versions": [
     {
       "version": "p0.2.0",
@@ -544,6 +544,92 @@
       ],
       "tests_total": 527,
       "prev_failed": 4,
+      "obs": []
+    },
+    {
+      "version": "p0.4.15",
+      "date": "2026-11-14",
+      "title": "別の名前の保護領域・別の場所のリポジトリでも同じ強制を働かせる（移植）。前の試行の記録の伏せ字を直す",
+      "fixed": [
+        "フックの Bash の照合が Z3 の名前（tsubuyaki-z3）を直書きしており、別の名前の Z3 では Bash による Z3 の読み取り・書き込み・STOP の作成と移動の拒否が効かなかった（Edit・Read 側は VGDD_Z3_DIR に追随していた）。照合を実際の Z3 の場所から作り、短すぎる・ありふれた名前・リポジトリとの入れ子ではすべての操作を拒否する",
+        "judge.sh・judge-codex.sh・review-constitution.sh・verify-chain.mjs の既定の出力先・入力が VGDD_Z3_DIR を無視していた",
+        "リポジトリの場所の渡し方がスクリプトごとに --repo だけ・VGDD_REPO だけに分かれていた（引数 --repo ＞ VGDD_REPO ＞ 既定にそろえる）",
+        "元の案件に固有の保護の対象（準備資料・作業記録）がフックに直書きだった（Z3 の kernel.config.json で足せる。extra_readonly_dirs は足すだけ、readonly_dirs は置き換え。なければ今までの2つ。壊れていればすべて拒否）",
+        "別の場所での配置の適合を確かめる方法がなかった（ST16 を試す場所に合わせて書き換えた原本と比べる形にし、導入の道具 vgdd-setup.mjs の render-settings・install・doctor を足す）",
+        "前の試行の記録の伏せ字（scrub）が長い入力で極端に遅く（10 万字で約 9.4 秒）、github_pat_・AIza・xox?-・ASIA・JWT・Bearer・全角の ＠ のメールアドレスを伏せられなかった。URL はスキームとホスト（とポート）だけを残すようにした（初めの案は URL を丸ごと残し、クエリの鍵・署名・URL の中のホームのパスを出していた。独立した審査の M1 で直した）",
+        "独立した審査の指摘：導入の道具がパスの途中の段を確かめず、フックのコマンドにシェルの注入ができた（M2）。深い場所・ホームの外の Z3、兄弟から .. で戻るグロブ、~//・~/./・\"$HOME\"/・~名前/ の形を照合しなかった。--only の結果に一部だけの印がなかった。夜間の代行・朝の統合が監査の sandbox に --repo を渡していなかった。kernel-stop.sh・kernel-resume.sh が理由のない --repo を理由として扱った",
+        "再審査：--record が、--impl repo・--repo-name・--z3-name の試験の結果でも既定の Z3 に記録した（審査の途中に、本物の Z3 の conformance.jsonl に1行が書かれた事故）。--impl z3 で、一部・既定と違う名前でなく、書き先と試した写しの Z3 が同じときだけ受ける",
+        "再審査：兄弟を除く規則が、展開すると .. になる形（{..,x}・.?・.*・引用符）を見逃した。.. の規則が、名前に tsub を含むファイルの相対パス（../lib/tsubuyaki.ts）を止めた。~<名前> の形が HEAD~1/… に当たった",
+        "挙動の変更の公開：既定でない場所のプロジェクトでは、p0.4.14 が名前が似ているために止めていた、プロジェクト自身の場所（例 ~/tsubuyaki-other）への、グロブも .. も含まない操作を通すようになった（Z3 に届かないことを審査の差分の試験で確かめた）。既定の配置と停止中では、後が緩い判定の違いはない"
+      ],
+      "found_by": [
+        "legislative",
+        "review"
+      ],
+      "precedents": [
+        "PT1",
+        "PT2",
+        "PT2b",
+        "PT3",
+        "PT4",
+        "PT5",
+        "PT5b",
+        "PT6",
+        "PT7",
+        "PT8",
+        "PT9",
+        "W8",
+        "W9",
+        "W10",
+        "PT10",
+        "PT11",
+        "PT12",
+        "PT13",
+        "PT14",
+        "PT15",
+        "PT16",
+        "PT17",
+        "PT18",
+        "W11",
+        "PT19",
+        "PT20",
+        "PT21",
+        "PT22"
+      ],
+      "tests_total": 591,
+      "prev_failed": 27,
+      "obs": []
+    },
+    {
+      "version": "p0.4.16",
+      "date": "2026-11-14",
+      "title": "設定の層と、入れ子の起動：照合を規範（§11）に合わせ、上の層の設定を読み、AI の役割による claude・codex の CLI の起動を拒む",
+      "fixed": [
+        "設定の照合（ST16）と導入の診断（doctor）が、原本の項目を「含むか」だけを見ていた。原本にない緩める項目（sandbox.excludedCommands・filesystem.allowRead・allowWrite・disabled・network の緩める項目・enableWeaker*・disableAllHooks）を足されても合格だった（SPEC §11 の「足してよいのは拒否の規則と禁止の一覧の項目だけ」に照合が追いついていなかった）。sandbox の節は原本の項目だけ、宛先は原本の部分集合、最上位にフックを止める項目がないことを確かめる",
+        "照合と診断がプロジェクトの .claude/settings.json しか読まず、値の設定を上書きする上の層（<repo>/.claude/settings.local.json、~/.claude/settings.json・settings.local.json）で sandbox.enabled:false・allowUnsandboxedCommands:true・disableAllHooks:true などを書かれても合格のままだった。上の層を読み、弱める値と読めないファイルを不合格、決められない項目（hooks の節など）を注意にする",
+        "照合の規則を1つの部品（settings-check.mjs）に書き、適合性テストと doctor の両方が使う。規則そのものは判例 ST16d・ST16e で、手で書いた設定にかけて確かめる",
+        "フックが拒んでいた CLI の起動は claude … --agent worker|tester だけで、行政の Bash から入れ子の claude（--bare・--settings '{\"disableAllHooks\":true}'・-p）・codex を起動して、フック（証拠の記録・役割の閉じ込め・main への統合の照合）と予算の台帳を外せた。どの役割からも拒む（読む・探す・場所を調べる・文書に書くなど、起動しない扱いは通す）",
+        "設定の原本：git push の強制を後ろに書く形（git push origin --force）が拒否の規則に一致しなかった。claude・codex の起動の形と、ユーザーの ~/.claude の指示・エージェント・スキル・コマンド・規則・出力の形の編集の拒否を足した。フックもユーザーの ~/.claude/CLAUDE.md への書き込みを拒む。Write(...) の規則（37 件。パスの規則として一致しない）のそれぞれに Edit(...) の対があることを判例にした",
+        "文書で確かめた限界（sandbox は Bash だけを制限する、PermissionDenied は auto モードの拒否だけ、信頼を承認していないセッションではフックが保留される、worktree の作業員の相対の規則の基準、agent_type が --agent のメインにも付くことなど）を SPEC §12 に公開し、実機で確かめること R1〜R13 を docs/adoption.md に手順つきで書いた",
+        "原本に拒否の規則を足したので、今の本番の配置は、設定を更新するまで ST16 に通らない（法律を改めたら配置を更新する。p0.4.8 と同じ扱い）"
+      ],
+      "found_by": [
+        "research",
+        "legislative"
+      ],
+      "precedents": [
+        "LN1",
+        "LN2",
+        "ST15b",
+        "ST15c",
+        "ST16b",
+        "ST16c",
+        "ST16d",
+        "ST16e",
+        "PT23"
+      ],
+      "tests_total": 637,
+      "prev_failed": 39,
       "obs": []
     }
   ]

@@ -13,7 +13,7 @@
 #   - 動いているかは、状態の pid（プロセス群）の生死で見る（プロセスの名前で探さない）
 #   - Kernel の停止中は、受け取りも起動もしない
 set -euo pipefail
-REPO="${HOME}/tsubuyaki-worklog/app"; INTERVAL=30; ONCE=0; DRY=0
+REPO="${VGDD_REPO:-${HOME}/tsubuyaki-worklog/app}"; INTERVAL=30; ONCE=0; DRY=0   # p0.4.15：リポジトリは 引数 --repo ＞ 環境変数 VGDD_REPO ＞ 既定
 Z3="${VGDD_Z3_DIR:-${HOME}/tsubuyaki-z3}"
 while [ $# -gt 0 ]; do
   case "$1" in

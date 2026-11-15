@@ -17,7 +17,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 const args = process.argv.slice(2);
 const opt = (k, d) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : d; };
 const Z3 = process.env.VGDD_Z3_DIR || path.join(os.homedir(), "tsubuyaki-z3");
-const REPO = opt("--repo", path.join(os.homedir(), "tsubuyaki-worklog", "app"));
+const REPO = opt("--repo", process.env.VGDD_REPO || path.join(os.homedir(), "tsubuyaki-worklog", "app"));   // p0.4.15：引数 --repo ＞ 環境変数 VGDD_REPO ＞ 既定
 const DATE = opt("--date", new Date(Date.now() + 9 * 3600e3).toISOString().slice(0, 10));
 const OUT = opt("--out", path.join(Z3, "night", "reports"));
 const USE_LOCAL = !args.includes("--no-local-llm");

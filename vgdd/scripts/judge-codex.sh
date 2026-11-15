@@ -36,7 +36,7 @@ while [ $# -gt 0 ]; do
     *) PASSTHRU+=("$1"); shift;;
   esac
 done
-OUT_DIR="${OUT_DIR:-${HOME}/tsubuyaki-z3/evidence/verdicts}"
+OUT_DIR="${OUT_DIR:-${VGDD_Z3_DIR:-${HOME}/tsubuyaki-z3}/evidence/verdicts}"   # p0.4.15：既定の出力先も VGDD_Z3_DIR を見る
 DRY="${DRY:-0}"
 
 # ---- 入力を judge.sh と同じ関数で組み立てる（--emit-input） ------------------------
